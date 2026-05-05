@@ -4,6 +4,7 @@ MVP 0.1 supports the **browser-header** auth flow only. OAuth is deferred —
 ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 ``OAuthCredentials``, which is more UX surface than this MVP wants to expose.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

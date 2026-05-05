@@ -10,6 +10,7 @@ scan time. Reading a snapshot back via ``get_snapshot_items`` therefore
 returns the metadata that was captured then, not whatever the master Track
 row currently says.
 """
+
 from __future__ import annotations
 
 import json
@@ -86,9 +87,7 @@ def _ytmusic_to_record(source: str, item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
-    stmt = select(Track).where(
-        Track.source == source, Track.dedupe_key == rec["dedupe_key"]
-    )
+    stmt = select(Track).where(Track.source == source, Track.dedupe_key == rec["dedupe_key"])
     track = session.scalar(stmt)
     now = _utcnow()
     if track is None:
@@ -100,9 +99,7 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
             album=rec["album"],
             duration_seconds=rec["duration_seconds"],
             thumbnails_json=(
-                json.dumps(rec["thumbnails"], ensure_ascii=False)
-                if rec["thumbnails"]
-                else None
+                json.dumps(rec["thumbnails"], ensure_ascii=False) if rec["thumbnails"] else None
             ),
             canonical_key=rec["canonical_key"],
             dedupe_key=rec["dedupe_key"],
@@ -127,9 +124,7 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
     return track
 
 
-def create_snapshot(
-    session: Session, source: str, items: Iterable[dict[str, Any]]
-) -> Snapshot:
+def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any]]) -> Snapshot:
     """Persist a snapshot of ``items`` from ``source``. Returns the snapshot row."""
     items_list = list(items)
     snapshot = Snapshot(source=source, created_at=_utcnow(), raw_count=len(items_list))
@@ -151,9 +146,7 @@ def create_snapshot(
                 album=rec["album"],
                 duration_seconds=rec["duration_seconds"],
                 thumbnails_json=(
-                    json.dumps(rec["thumbnails"], ensure_ascii=False)
-                    if rec["thumbnails"]
-                    else None
+                    json.dumps(rec["thumbnails"], ensure_ascii=False) if rec["thumbnails"] else None
                 ),
                 canonical_key=rec["canonical_key"],
                 raw_json=json.dumps(rec["raw"], ensure_ascii=False),

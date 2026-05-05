@@ -3,6 +3,7 @@
 Pure-functional. No I/O. Used by snapshot ingestion and (later) the matching
 engine in MVP 0.3.
 """
+
 from __future__ import annotations
 
 import re

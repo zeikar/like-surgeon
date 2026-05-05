@@ -1,4 +1,5 @@
 """Local app configuration: paths, env overrides, on-disk layout."""
+
 from __future__ import annotations
 
 import os

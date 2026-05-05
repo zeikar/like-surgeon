@@ -1,4 +1,5 @@
 """SQLAlchemy ORM models for snapshots, tracks, and snapshot membership."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -48,9 +49,7 @@ class Track(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("source", "dedupe_key", name="uq_track_source_dedupe"),
-    )
+    __table_args__ = (UniqueConstraint("source", "dedupe_key", name="uq_track_source_dedupe"),)
 
 
 class Snapshot(Base):

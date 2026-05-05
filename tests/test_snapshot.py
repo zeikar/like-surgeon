@@ -4,6 +4,7 @@ Pinned: a snapshot must record duplicate identities faithfully — that's the
 whole reason ``SnapshotItem`` only has a unique constraint on
 ``(snapshot_id, position)`` and not on ``(snapshot_id, track_id)``.
 """
+
 from __future__ import annotations
 
 from sqlalchemy.orm import Session

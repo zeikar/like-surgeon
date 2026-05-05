@@ -7,6 +7,7 @@ Reads from ``SnapshotItem`` (point-in-time metadata) — exporting an old
 snapshot returns the metadata captured at scan time, not the master Track's
 current values.
 """
+
 from __future__ import annotations
 
 import json

@@ -1,4 +1,5 @@
 """Pydantic DTOs for serializing tracks/snapshots over CLI/JSON boundaries."""
+
 from __future__ import annotations
 
 import json

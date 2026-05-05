@@ -8,6 +8,7 @@ snapshot's *point-in-time* row, so the "Removed" table shows the metadata
 the user saw in the old snapshot — not whatever the master Track currently
 holds.
 """
+
 from __future__ import annotations
 
 import json
