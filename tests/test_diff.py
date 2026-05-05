@@ -74,3 +74,36 @@ def test_diff_uses_point_in_time_metadata(session: Session):
 
     result = diff_snapshots(session, s1.id, s2.id)
     assert {t.title for t in result.removed} == {"Old Title"}
+
+
+def test_diff_reports_duplicate_count_shrink(session: Session):
+    """Snapshots can carry duplicate rows (Task 6 policy). When the new
+    snapshot has fewer rows for the same track_id than the old one, the
+    surplus old rows must be reported as removed.
+    """
+    same = _item("v1", "Same Song", ["A"])
+    s1 = create_snapshot(session, "ytmusic", [same, same])
+    session.commit()
+    s2 = create_snapshot(session, "ytmusic", [same])
+    session.commit()
+
+    result = diff_snapshots(session, s1.id, s2.id)
+    assert len(result.added) == 0
+    assert len(result.removed) == 1
+    assert result.removed[0].title == "Same Song"
+    assert result.common_count == 1
+
+
+def test_diff_reports_duplicate_count_growth(session: Session):
+    """The reverse direction: a track that gained a duplicate row."""
+    same = _item("v1", "Same Song", ["A"])
+    s1 = create_snapshot(session, "ytmusic", [same])
+    session.commit()
+    s2 = create_snapshot(session, "ytmusic", [same, same])
+    session.commit()
+
+    result = diff_snapshots(session, s1.id, s2.id)
+    assert len(result.added) == 1
+    assert result.added[0].title == "Same Song"
+    assert len(result.removed) == 0
+    assert result.common_count == 1
