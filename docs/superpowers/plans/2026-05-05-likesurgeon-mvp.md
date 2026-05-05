@@ -55,10 +55,17 @@ like-surgeon/
 - Create: `.gitignore`
 - Create: `src/likesurgeon/__init__.py`
 - Create: `tests/__init__.py`
+- Create: `README.md` (minimal stub — Task 11 overwrites it with the real one)
 
 > Note: `tests/conftest.py` is created in Task 4 — its fixture imports from
 > `likesurgeon.db`, which doesn't exist yet. Adding it earlier would break
 > `pytest` collection.
+
+> **Why a stub README now?** `pyproject.toml` declares `readme = "README.md"`,
+> and hatchling's editable build (which `uv sync` performs) validates that
+> file exists *at sync time* and aborts with `OSError: Readme file does not
+> exist: README.md`. So we ship a minimal stub here and Task 11 replaces it
+> with real content.
 
 - [ ] **Step 1: Write `pyproject.toml`**
 
@@ -166,27 +173,38 @@ Empty file:
 ```python
 ```
 
-- [ ] **Step 5: Sync deps with uv**
+- [ ] **Step 5: Write `README.md` stub**
+
+Minimal placeholder so hatchling's editable build doesn't fail at `uv sync`.
+Task 11 overwrites this with the real README.
+
+```markdown
+# like-surgeon
+
+Sync, backup, and repair your YouTube Music liked songs.
+```
+
+- [ ] **Step 6: Sync deps with uv**
 
 Run: `uv sync --extra dev`
 Expected: `Installed N packages` (no errors). Creates `.venv/` and `uv.lock`.
 
-- [ ] **Step 6: Verify ruff passes on the empty package**
+- [ ] **Step 7: Verify ruff passes on the empty package**
 
 Run: `uv run ruff check . && uv run ruff format --check .`
 Expected: `All checks passed!` (formatter may report 0 files reformatted).
 
-- [ ] **Step 7: Verify the package imports**
+- [ ] **Step 8: Verify the package imports**
 
 Run: `uv run python -c "import likesurgeon; print(likesurgeon.__version__)"`
 Expected: `0.1.0`
 
 (We skip running pytest here — it would exit 5 with no tests, which automated runners often treat as failure. First pytest invocation is in Task 3 once the normalize tests exist.)
 
-- [ ] **Step 8: End turn — commit on next turn**
+- [ ] **Step 9: End turn — commit on next turn**
 
 ```bash
-git add pyproject.toml .gitignore src/likesurgeon/__init__.py tests/__init__.py uv.lock
+git add pyproject.toml .gitignore src/likesurgeon/__init__.py tests/__init__.py README.md uv.lock
 git commit -m "chore: bootstrap likesurgeon Python package with uv"
 ```
 
@@ -1895,9 +1913,9 @@ git commit -m "feat(cli): typer commands for init, auth, scan, snapshots, diff, 
 ## Task 11: README
 
 **Files:**
-- Create: `README.md`
+- Modify: `README.md` (overwrite the stub created in Task 1)
 
-- [ ] **Step 1: Write `README.md`**
+- [ ] **Step 1: Overwrite `README.md`**
 
 ```markdown
 # like-surgeon
