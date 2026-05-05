@@ -1673,15 +1673,28 @@ def _fail(msg: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        console.print(f"likesurgeon {__version__}")
+        raise typer.Exit()
+
+
+# ``is_eager=True`` is required: the root ``Typer`` has ``no_args_is_help=True``,
+# which short-circuits with the "Missing command" help text *before* a non-eager
+# callback body runs. An eager option callback fires before that check.
 @app.callback()
 def _root(
     version: Annotated[
-        bool, typer.Option("--version", help="Show version and exit.")
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show version and exit.",
+        ),
     ] = False,
 ) -> None:
-    if version:
-        console.print(f"likesurgeon {__version__}")
-        raise typer.Exit()
+    pass
 
 
 @app.command()
