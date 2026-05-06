@@ -35,11 +35,15 @@ def make_engine(db_path: Path) -> Engine:
 def init_db(engine: Engine) -> None:
     """Create all tables if missing.
 
-    0.2 ships with a breaking schema change vs. 0.1 (source-string rename
-    plus three new SnapshotItem columns added in Task 3). Existing 0.1 DBs
-    must be deleted and rescanned — a deliberate MVP choice; see README's
-    "Upgrading from 0.1" section. Alembic / proper migrations land in 0.3+
-    once there's a real user base to protect.
+    0.2 ships with a breaking schema change vs. 0.1: the YouTube Music source
+    string was renamed, three classifier columns were added to SnapshotItem,
+    Snapshot/Track ``created_at``/``updated_at`` became timezone-aware, and
+    two new tables were introduced for cross-source compare output —
+    ``Diagnosis`` (one row per ``compare-likes`` run) and ``DiagnosisItem``
+    (one row per persisted issue, FK to Diagnosis with cascade). Existing
+    0.1 DBs must be deleted and rescanned — a deliberate MVP choice; see
+    README's "Upgrading from 0.1" section. Alembic / proper migrations land
+    in 0.3+ once there's a real user base to protect.
     """
     Base.metadata.create_all(engine)
 
