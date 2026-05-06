@@ -46,8 +46,8 @@ class Track(Base):
     canonical_key: Mapped[str] = mapped_column(Text, index=True)
     dedupe_key: Mapped[str] = mapped_column(Text)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (UniqueConstraint("source", "dedupe_key", name="uq_track_source_dedupe"),)
 
@@ -59,7 +59,7 @@ class Snapshot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(32), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     raw_count: Mapped[int] = mapped_column(Integer)
 
     items: Mapped[list[SnapshotItem]] = relationship(

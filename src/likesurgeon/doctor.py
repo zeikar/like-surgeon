@@ -23,8 +23,9 @@ class HealthReport:
     last_diff: DiffResult | None
 
 
-def health_summary(session: Session, source: str = "ytmusic") -> HealthReport:
-    total = session.scalar(select(func.count(Snapshot.id))) or 0
+def health_summary(session: Session, source: str = "ytmusic_liked_songs") -> HealthReport:
+    """Summary scoped to ``source``: total count, latest, prev-diff."""
+    total = session.scalar(select(func.count(Snapshot.id)).where(Snapshot.source == source)) or 0
     latest = latest_snapshot(session, source=source)
     if latest is None:
         return HealthReport(
@@ -34,7 +35,6 @@ def health_summary(session: Session, source: str = "ytmusic") -> HealthReport:
             last_diff=None,
         )
 
-    # raw_count == # of SnapshotItem rows by construction (one per scan item).
     count = latest.raw_count
 
     prev_stmt = (

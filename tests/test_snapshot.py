@@ -19,7 +19,7 @@ def _item(video_id: str, title: str, artists: list[str]) -> dict:
 def test_create_snapshot_allows_duplicate_track_within_snapshot(session: Session):
     """Two identical items in one scan → both stored, sharing one master track."""
     duplicated = _item("v1", "Same Song", ["A"])
-    snap = create_snapshot(session, "ytmusic", [duplicated, duplicated])
+    snap = create_snapshot(session, "ytmusic_liked_songs", [duplicated, duplicated])
     session.commit()
 
     assert snap.raw_count == 2

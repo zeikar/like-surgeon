@@ -14,9 +14,9 @@ def test_diff_detects_added_and_removed(session: Session):
     b = _item("v2", "Song B", ["Y"])
     c = _item("v3", "Song C", ["Z"])
 
-    old = create_snapshot(session, "ytmusic", [a, b])
+    old = create_snapshot(session, "ytmusic_liked_songs", [a, b])
     session.commit()
-    new = create_snapshot(session, "ytmusic", [b, c])
+    new = create_snapshot(session, "ytmusic_liked_songs", [b, c])
     session.commit()
 
     result = diff_snapshots(session, old.id, new.id)
@@ -27,9 +27,9 @@ def test_diff_detects_added_and_removed(session: Session):
 
 def test_diff_identical_snapshots_yields_no_changes(session: Session):
     a = _item("v1", "Song A", ["X"])
-    s1 = create_snapshot(session, "ytmusic", [a])
+    s1 = create_snapshot(session, "ytmusic_liked_songs", [a])
     session.commit()
-    s2 = create_snapshot(session, "ytmusic", [a])
+    s2 = create_snapshot(session, "ytmusic_liked_songs", [a])
     session.commit()
 
     result = diff_snapshots(session, s1.id, s2.id)
@@ -47,9 +47,9 @@ def test_diff_falls_back_to_canonical_key_when_video_id_missing(session: Session
     # Same song, different decoration, no video id → upsert should merge them.
     a = {"title": "Song (Official Audio)", "artists": [{"name": "X"}]}
     b = {"title": "song", "artists": [{"name": "x"}]}
-    s1 = create_snapshot(session, "ytmusic", [a])
+    s1 = create_snapshot(session, "ytmusic_liked_songs", [a])
     session.commit()
-    s2 = create_snapshot(session, "ytmusic", [b])
+    s2 = create_snapshot(session, "ytmusic_liked_songs", [b])
     session.commit()
 
     result = diff_snapshots(session, s1.id, s2.id)
@@ -63,13 +63,13 @@ def test_diff_uses_point_in_time_metadata(session: Session):
     latest Track row — even after the same video is re-liked under a new
     title (which overwrites Track.title via upsert).
     """
-    s1 = create_snapshot(session, "ytmusic", [_item("v1", "Old Title", ["A"])])
+    s1 = create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "Old Title", ["A"])])
     session.commit()
-    s2 = create_snapshot(session, "ytmusic", [])
+    s2 = create_snapshot(session, "ytmusic_liked_songs", [])
     session.commit()
     # Re-like the same video with a renamed title — this upsert overwrites
     # the master Track row's title to "New Title".
-    create_snapshot(session, "ytmusic", [_item("v1", "New Title", ["A"])])
+    create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "New Title", ["A"])])
     session.commit()
 
     result = diff_snapshots(session, s1.id, s2.id)
@@ -82,9 +82,9 @@ def test_diff_reports_duplicate_count_shrink(session: Session):
     surplus old rows must be reported as removed.
     """
     same = _item("v1", "Same Song", ["A"])
-    s1 = create_snapshot(session, "ytmusic", [same, same])
+    s1 = create_snapshot(session, "ytmusic_liked_songs", [same, same])
     session.commit()
-    s2 = create_snapshot(session, "ytmusic", [same])
+    s2 = create_snapshot(session, "ytmusic_liked_songs", [same])
     session.commit()
 
     result = diff_snapshots(session, s1.id, s2.id)
@@ -97,9 +97,9 @@ def test_diff_reports_duplicate_count_shrink(session: Session):
 def test_diff_reports_duplicate_count_growth(session: Session):
     """The reverse direction: a track that gained a duplicate row."""
     same = _item("v1", "Same Song", ["A"])
-    s1 = create_snapshot(session, "ytmusic", [same])
+    s1 = create_snapshot(session, "ytmusic_liked_songs", [same])
     session.commit()
-    s2 = create_snapshot(session, "ytmusic", [same, same])
+    s2 = create_snapshot(session, "ytmusic_liked_songs", [same, same])
     session.commit()
 
     result = diff_snapshots(session, s1.id, s2.id)

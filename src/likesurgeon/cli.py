@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
@@ -47,7 +47,7 @@ def _bootstrap() -> tuple[Config, sessionmaker]:
     return cfg, make_session_factory(engine)
 
 
-def _fail(msg: str, code: int = 1) -> None:
+def _fail(msg: str, code: int = 1) -> NoReturn:
     err_console.print(f"[bold red]Error:[/bold red] {msg}")
     raise typer.Exit(code)
 
@@ -117,7 +117,7 @@ def scan_ytmusic(
         _fail(str(e), code=2)
 
     with session_scope(factory) as session:
-        snap = create_snapshot(session, "ytmusic", items)
+        snap = create_snapshot(session, "ytmusic_liked_songs", items)
         console.print(
             f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored ({len(items)} tracks)."
         )
@@ -226,7 +226,7 @@ def doctor() -> None:
     """Print a basic health summary using stored data."""
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        report = health_summary(session, source="ytmusic")
+        report = health_summary(session, source="ytmusic_liked_songs")
 
     console.print(f"[bold]Total snapshots:[/bold] {report.total_snapshots}")
     if report.latest_source is None:

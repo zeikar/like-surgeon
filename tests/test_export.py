@@ -16,13 +16,13 @@ def _item(video_id: str, title: str, artists: list[str]) -> dict:
 
 
 def test_export_returns_snapshot_and_tracks(session: Session):
-    snap = create_snapshot(session, "ytmusic", [_item("v1", "A", ["X"])])
+    snap = create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "A", ["X"])])
     session.commit()
 
     payload = json.loads(export_snapshot_json(session, snap.id))
     assert payload["snapshot"]["id"] == snap.id
     assert payload["snapshot"]["raw_count"] == 1
-    assert payload["snapshot"]["source"] == "ytmusic"
+    assert payload["snapshot"]["source"] == "ytmusic_liked_songs"
     assert len(payload["tracks"]) == 1
     assert payload["tracks"][0]["title"] == "A"
     assert payload["tracks"][0]["video_id"] == "v1"
@@ -34,11 +34,11 @@ def test_export_preserves_point_in_time_metadata(session: Session):
     snapshot's exported title must not change just because the same video
     was later re-liked under a new title.
     """
-    s_old = create_snapshot(session, "ytmusic", [_item("v1", "Old Title", ["A"])])
+    s_old = create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "Old Title", ["A"])])
     session.commit()
     # Same video re-liked with renamed metadata — the upsert overwrites
     # Track.title to "New Title". SnapshotItem of s_old must not move.
-    s_new = create_snapshot(session, "ytmusic", [_item("v1", "New Title", ["A"])])
+    s_new = create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "New Title", ["A"])])
     session.commit()
 
     old_payload = json.loads(export_snapshot_json(session, s_old.id))
