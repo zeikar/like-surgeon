@@ -382,5 +382,99 @@ def compare_likes_cmd() -> None:
     )
 
 
+@app.command()
+def issues(
+    type: Annotated[
+        str | None,
+        typer.Option(
+            "--type",
+            help=(
+                "Filter by issue type "
+                "(possibly_missing_from_ytmusic | possible_pointer_drift | "
+                "ytmusic_only)."
+            ),
+        ),
+    ] = None,
+    min_confidence: Annotated[
+        float,
+        typer.Option(
+            "--min-confidence",
+            help="Hide items with confidence below this (0.0–1.0).",
+        ),
+    ] = 0.0,
+    format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f", help="Output format: 'table' (default) or 'json'."
+        ),
+    ] = "table",
+) -> None:
+    """List issues from the latest diagnosis."""
+    import json as jsonlib
+
+    from .diagnosis import diagnosis_items, latest_diagnosis
+
+    fmt = format.lower()
+    if fmt not in {"table", "json"}:
+        _fail(
+            f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2
+        )
+
+    _, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session)
+        if diag is None:
+            console.print(
+                "[yellow]No diagnosis yet.[/yellow] "
+                "Run [cyan]likesurgeon compare-likes[/cyan] first."
+            )
+            return
+        items = diagnosis_items(session, diag.id)
+
+    if type is not None:
+        items = [it for it in items if it.issue_type == type]
+    items = [it for it in items if it.confidence >= min_confidence]
+
+    if fmt == "json":
+        payload = {
+            "diagnosis_id": diag.id,
+            "items": [
+                {
+                    "id": it.id,
+                    "issue_type": it.issue_type,
+                    "confidence": it.confidence,
+                    "reason": it.reason,
+                    "source_track_id": it.source_track_id,
+                    "related_track_id": it.related_track_id,
+                    "status": it.status,
+                }
+                for it in items
+            ],
+        }
+        print(jsonlib.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    table = Table(title=f"Diagnosis #{diag.id} — issues ({len(items)})")
+    table.add_column("ID", justify="right")
+    table.add_column("Type")
+    table.add_column("Conf", justify="right")
+    table.add_column("Source TID", justify="right")
+    table.add_column("Related TID", justify="right")
+    table.add_column("Reason")
+    for it in items:
+        table.add_row(
+            str(it.id),
+            it.issue_type,
+            f"{it.confidence:.2f}",
+            str(it.source_track_id) if it.source_track_id is not None else "",
+            str(it.related_track_id) if it.related_track_id is not None else "",
+            it.reason,
+        )
+    if not items:
+        console.print("[dim]No issues match the filter.[/dim]")
+        return
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
