@@ -13,6 +13,8 @@ dependencies = [
   "pydantic>=2.7",
   "rapidfuzz>=3.6",
   "sqlalchemy>=2.0",
+  "google-auth-oauthlib>=1.2",
+  "google-api-python-client>=2.120",
 ]
 
 [project.scripts]
