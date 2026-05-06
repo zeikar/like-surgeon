@@ -7,7 +7,11 @@ from typing import Any
 
 import pytest
 
-from likesurgeon.ytmusic_client import AuthFileMissingError, YTMusicClient
+from likesurgeon.ytmusic_client import (
+    AuthFileMissingError,
+    UnexpectedResponseError,
+    YTMusicClient,
+)
 
 
 class _FakeYTMusic:
@@ -43,14 +47,29 @@ def test_fetch_liked_songs_returns_track_list():
     assert client.fake.last_limit == 42
 
 
-def test_fetch_liked_songs_handles_missing_tracks_key():
+def test_fetch_liked_songs_returns_empty_list_for_well_formed_empty_response():
+    """A well-formed dict with an empty list of tracks is fine — that genuinely
+    means 'no liked songs' and is not the same as a malformed response."""
+    client = _FakeClient({"tracks": []})
+    assert client.fetch_liked_songs() == []
+
+
+def test_fetch_liked_songs_raises_when_tracks_key_missing():
     client = _FakeClient({})
-    assert client.fetch_liked_songs() == []
+    with pytest.raises(UnexpectedResponseError, match="missing 'tracks'"):
+        client.fetch_liked_songs()
 
 
-def test_fetch_liked_songs_handles_non_dict_response():
+def test_fetch_liked_songs_raises_when_response_not_dict():
     client = _FakeClient([])
-    assert client.fetch_liked_songs() == []
+    with pytest.raises(UnexpectedResponseError, match="expected a dict"):
+        client.fetch_liked_songs()
+
+
+def test_fetch_liked_songs_raises_when_tracks_not_list():
+    client = _FakeClient({"tracks": "not-a-list"})
+    with pytest.raises(UnexpectedResponseError, match="'tracks' is a str"):
+        client.fetch_liked_songs()
 
 
 def test_missing_auth_raises():

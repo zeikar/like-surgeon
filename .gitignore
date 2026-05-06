@@ -31,5 +31,7 @@ htmlcov/
 *.sqlite
 *.sqlite-journal
 browser.json
-# Not used in 0.1; ignored defensively for any future hand-placed OAuth file.
+# Defensive: ignore credential/token files even if hand-placed at repo root.
 ytmusic-oauth.json
+youtube-oauth-client.json
+youtube-token.json

@@ -1,28 +1,32 @@
 """Snapshot ingestion and retrieval.
 
 This module is the only writer of ``Track`` and ``Snapshot`` rows. Callers
-hand it raw provider dicts (e.g. ytmusicapi output); it normalizes, upserts
-tracks by ``(source, dedupe_key)``, and records snapshot membership.
+hand it raw provider dicts; ``_TRANSLATORS`` dispatches to the source's
+translator, which normalizes the dict into a ``record`` shape that
+``_upsert_track`` and ``create_snapshot`` consume.
 
 **Point-in-time guarantee.** ``Track`` holds the *latest* known metadata
-(overwritten on every scan), but ``SnapshotItem`` freezes the values seen at
-scan time. Reading a snapshot back via ``get_snapshot_items`` therefore
-returns the metadata that was captured then, not whatever the master Track
-row currently says.
+(overwritten on every scan), but ``SnapshotItem`` freezes the values seen
+at scan time — including the music-candidate classifier output for sources
+that aren't guaranteed-music (i.e. youtube_liked_videos).
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from .classify import classify
 from .models import Snapshot, SnapshotItem, Track
 from .normalize import canonical_key
+
+YTMUSIC_LIKED_SONGS = "ytmusic_liked_songs"
+YOUTUBE_LIKED_VIDEOS = "youtube_liked_videos"
 
 
 def _utcnow() -> datetime:
@@ -57,8 +61,8 @@ def _coerce_artists(raw: Any) -> list[str]:
     return out
 
 
-def _ytmusic_to_record(source: str, item: dict[str, Any]) -> dict[str, Any]:
-    """Translate one provider dict to a normalized track record."""
+def _ytmusic_to_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Translate one ytmusicapi liked-song dict to a normalized track record."""
     video_id = item.get("videoId")
     title = str(item.get("title") or "")
     artists = _coerce_artists(item.get("artists"))
@@ -73,7 +77,6 @@ def _ytmusic_to_record(source: str, item: dict[str, Any]) -> dict[str, Any]:
     dedupe = video_id or f"canon:{canon}"
 
     return {
-        "source": source,
         "video_id": video_id,
         "title": title,
         "artists": artists,
@@ -83,7 +86,63 @@ def _ytmusic_to_record(source: str, item: dict[str, Any]) -> dict[str, Any]:
         "canonical_key": canon,
         "dedupe_key": dedupe,
         "raw": item,
+        "is_music_candidate": None,  # ytmusic source: every track is music
+        "music_candidate_score": None,
+        "music_candidate_reason": None,
     }
+
+
+def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Translate one YouTube playlistItems.list entry to a track record.
+
+    The YouTube API shape:
+      {
+        "snippet": {
+            "title": ..., "channelTitle": ..., "description": ...,
+            "thumbnails": {...}, "publishedAt": ...,
+            "resourceId": {"videoId": ...},
+        },
+        "contentDetails": {"videoId": ..., "videoPublishedAt": ...},
+        ...
+      }
+    Channel name maps to ``artists=[channel]`` so cross-source matching can
+    use the same canonical key shape. ``description`` and ``publishedAt``
+    survive in ``raw_json`` but don't get top-level columns.
+    """
+    snippet = item.get("snippet") or {}
+    content_details = item.get("contentDetails") or {}
+
+    video_id = content_details.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+    title = str(snippet.get("title") or "")
+    channel = str(snippet.get("channelTitle") or "").strip()
+    artists = [channel] if channel else []
+    description = snippet.get("description") or ""
+
+    canon = canonical_key(title, artists)
+    dedupe = video_id or f"canon:{canon}"
+
+    classification = classify(title=title, channel=channel, description=description)
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "artists": artists,
+        "album": None,
+        "duration_seconds": None,
+        "thumbnails": (snippet.get("thumbnails") or None),
+        "canonical_key": canon,
+        "dedupe_key": dedupe,
+        "raw": item,
+        "is_music_candidate": classification.is_music_candidate,
+        "music_candidate_score": classification.score,
+        "music_candidate_reason": classification.reason,
+    }
+
+
+_TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    YTMUSIC_LIKED_SONGS: _ytmusic_to_record,
+    YOUTUBE_LIKED_VIDEOS: _youtube_to_record,
+}
 
 
 def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
@@ -126,20 +185,22 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
 
 def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any]]) -> Snapshot:
     """Persist a snapshot of ``items`` from ``source``. Returns the snapshot row."""
+    if source not in _TRANSLATORS:
+        raise ValueError(f"Unknown source {source!r}; expected one of {sorted(_TRANSLATORS)}")
+    translator = _TRANSLATORS[source]
+
     items_list = list(items)
     snapshot = Snapshot(source=source, created_at=_utcnow(), raw_count=len(items_list))
     session.add(snapshot)
     session.flush()
     for position, item in enumerate(items_list):
-        rec = _ytmusic_to_record(source, item)
+        rec = translator(item)
         track = _upsert_track(session, source, rec)
         session.add(
             SnapshotItem(
                 snapshot_id=snapshot.id,
                 track_id=track.id,
                 position=position,
-                # Freeze the values seen at scan time so future Track upserts
-                # don't rewrite this snapshot's metadata.
                 video_id=rec["video_id"],
                 title=rec["title"],
                 artists=json.dumps(rec["artists"], ensure_ascii=False),
@@ -150,6 +211,9 @@ def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any
                 ),
                 canonical_key=rec["canonical_key"],
                 raw_json=json.dumps(rec["raw"], ensure_ascii=False),
+                is_music_candidate=rec["is_music_candidate"],
+                music_candidate_score=rec["music_candidate_score"],
+                music_candidate_reason=rec["music_candidate_reason"],
             )
         )
     session.flush()
@@ -166,11 +230,7 @@ def get_snapshot(session: Session, snapshot_id: int) -> Snapshot | None:
 
 
 def get_snapshot_items(session: Session, snapshot_id: int) -> list[SnapshotItem]:
-    """Return point-in-time snapshot rows in scan order.
-
-    Eager-loads the linked master ``Track`` so DTO conversion can read
-    ``first_seen_at`` / ``last_seen_at`` without N+1 queries.
-    """
+    """Return point-in-time snapshot rows in scan order, with master Track eager-loaded."""
     stmt = (
         select(SnapshotItem)
         .where(SnapshotItem.snapshot_id == snapshot_id)

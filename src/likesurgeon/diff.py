@@ -77,21 +77,36 @@ def diff_snapshots(session: Session, old_id: int, new_id: int) -> DiffResult:
     if get_snapshot(session, new_id) is None:
         raise ValueError(f"Snapshot {new_id} not found")
 
-    old_by_track = _group_by_track(get_snapshot_items(session, old_id))
-    new_by_track = _group_by_track(get_snapshot_items(session, new_id))
+    old_items = get_snapshot_items(session, old_id)
+    new_items = get_snapshot_items(session, new_id)
+    old_by_track = _group_by_track(old_items)
+    new_by_track = _group_by_track(new_items)
 
+    # Walk each snapshot in scan order so ``added`` / ``removed`` come back
+    # deterministic and visually aligned with the user's original ordering.
+    # Track-level ``shared`` is settled separately so multiset surplus on
+    # either side is reported faithfully.
+    common_count = sum(
+        min(len(old_by_track.get(tid, [])), len(new_by_track.get(tid, [])))
+        for tid in set(old_by_track) | set(new_by_track)
+    )
+
+    new_seen: dict[int, int] = {}
     added: list[TrackSummary] = []
-    removed: list[TrackSummary] = []
-    common_count = 0
+    for it in new_items:
+        seen = new_seen.get(it.track_id, 0)
+        # First ``min(old_count, new_count)`` rows of this track are "common";
+        # rows beyond that index are surplus that goes into ``added``.
+        if seen >= len(old_by_track.get(it.track_id, [])):
+            added.append(_summarize(it))
+        new_seen[it.track_id] = seen + 1
 
-    for tid in set(old_by_track) | set(new_by_track):
-        old_rows = old_by_track.get(tid, [])
-        new_rows = new_by_track.get(tid, [])
-        shared = min(len(old_rows), len(new_rows))
-        common_count += shared
-        if len(new_rows) > shared:
-            added.extend(_summarize(it) for it in new_rows[shared:])
-        if len(old_rows) > shared:
-            removed.extend(_summarize(it) for it in old_rows[shared:])
+    old_seen: dict[int, int] = {}
+    removed: list[TrackSummary] = []
+    for it in old_items:
+        seen = old_seen.get(it.track_id, 0)
+        if seen >= len(new_by_track.get(it.track_id, [])):
+            removed.append(_summarize(it))
+        old_seen[it.track_id] = seen + 1
 
     return DiffResult(added=added, removed=removed, common_count=common_count)

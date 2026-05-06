@@ -46,8 +46,8 @@ class Track(Base):
     canonical_key: Mapped[str] = mapped_column(Text, index=True)
     dedupe_key: Mapped[str] = mapped_column(Text)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (UniqueConstraint("source", "dedupe_key", name="uq_track_source_dedupe"),)
 
@@ -59,7 +59,7 @@ class Snapshot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str] = mapped_column(String(32), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     raw_count: Mapped[int] = mapped_column(Integer)
 
     items: Mapped[list[SnapshotItem]] = relationship(
@@ -97,6 +97,13 @@ class SnapshotItem(Base):
     canonical_key: Mapped[str] = mapped_column(Text)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Music-candidate classifier output (Task 2). Populated by sources whose
+    # items aren't guaranteed-music (i.e. youtube_liked_videos). NULL for
+    # ytmusic_liked_songs since those are always music by definition.
+    is_music_candidate: Mapped[bool | None] = mapped_column(nullable=True)
+    music_candidate_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    music_candidate_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     snapshot: Mapped[Snapshot] = relationship(back_populates="items")
     track: Mapped[Track] = relationship()
 
@@ -110,3 +117,54 @@ class SnapshotItem(Base):
         # deterministic and also covers ordered-read queries.
         UniqueConstraint("snapshot_id", "position", name="uq_snapitem_snap_pos"),
     )
+
+
+class Diagnosis(Base):
+    """A persisted ``compare-likes`` run."""
+
+    __tablename__ = "diagnoses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    ytmusic_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    youtube_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+
+    items: Mapped[list[DiagnosisItem]] = relationship(
+        back_populates="diagnosis", cascade="all, delete-orphan"
+    )
+
+
+class DiagnosisItem(Base):
+    """A single finding produced by a ``compare-likes`` run.
+
+    ``issue_type`` is one of:
+      - ``possibly_missing_from_ytmusic`` — music candidate liked on YouTube
+        but with no corresponding YT Music track (the high-priority bucket).
+      - ``possible_pointer_drift`` — fuzzy match between sources, neither
+        ``video_id`` nor ``canonical_key`` exact.
+      - ``ytmusic_only`` — YT Music has it but no YT like (informational —
+        often just "user never liked it on YouTube").
+    """
+
+    __tablename__ = "diagnosis_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    diagnosis_id: Mapped[int] = mapped_column(
+        ForeignKey("diagnoses.id", ondelete="CASCADE"), index=True
+    )
+    issue_type: Mapped[str] = mapped_column(String(64), index=True)
+    confidence: Mapped[float] = mapped_column()  # SQLAlchemy maps Python float -> SQLite REAL
+    reason: Mapped[str] = mapped_column(Text)
+    source_track_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tracks.id", ondelete="SET NULL"), nullable=True
+    )
+    related_track_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tracks.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="open")
+
+    diagnosis: Mapped[Diagnosis] = relationship(back_populates="items")
