@@ -35,6 +35,7 @@ def health_summary(session: Session, source: str = "ytmusic_liked_songs") -> Hea
             last_diff=None,
         )
 
+    # raw_count == # of SnapshotItem rows by construction (one per scan item).
     count = latest.raw_count
 
     prev_stmt = (
