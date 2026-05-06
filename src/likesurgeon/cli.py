@@ -323,5 +323,64 @@ def doctor() -> None:
         )
 
 
+@app.command("compare-likes")
+def compare_likes_cmd() -> None:
+    """Compare latest YouTube Music vs. YouTube liked-videos snapshots."""
+    from .compare import CompareInput, compare_likes
+    from .diagnosis import DiagnosisInput, create_diagnosis
+    from .snapshot import get_snapshot_items, latest_snapshot
+
+    _, factory = _bootstrap()
+    with session_scope(factory) as session:
+        ytm_snap = latest_snapshot(session, source="ytmusic_liked_songs")
+        yt_snap = latest_snapshot(session, source="youtube_liked_videos")
+        if ytm_snap is None or yt_snap is None:
+            missing: list[str] = []
+            if ytm_snap is None:
+                missing.append("[cyan]likesurgeon scan ytmusic[/cyan]")
+            if yt_snap is None:
+                missing.append("[cyan]likesurgeon scan youtube-likes[/cyan]")
+            _fail(
+                "Need both a ytmusic_liked_songs and a youtube_liked_videos "
+                f"snapshot first. Run: {', '.join(missing)}.",
+                code=2,
+            )
+
+        ytm_items = get_snapshot_items(session, ytm_snap.id)
+        yt_items = get_snapshot_items(session, yt_snap.id)
+
+        result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
+        diag = create_diagnosis(
+            session,
+            DiagnosisInput(
+                ytmusic_snapshot_id=ytm_snap.id,
+                youtube_snapshot_id=yt_snap.id,
+                result=result,
+            ),
+        )
+
+    console.print(f"[green]✓[/green] Diagnosis [bold]#{diag.id}[/bold] saved.")
+    table = Table(title="compare-likes summary")
+    table.add_column("Bucket")
+    table.add_column("Count", justify="right")
+    table.add_row("YouTube Music liked songs", str(result.ytmusic_count))
+    table.add_row("YouTube liked videos (total)", str(result.youtube_total_count))
+    table.add_row("YouTube liked videos (music-like)", str(result.youtube_music_count))
+    table.add_row("Matched (any stage)", str(len(result.matched)))
+    table.add_row(
+        "Possibly missing from YT Music",
+        str(len(result.possibly_missing_from_ytmusic)),
+    )
+    table.add_row(
+        "YT Music only (not liked on YouTube)",
+        str(len(result.ytmusic_only_likes)),
+    )
+    table.add_row("Pointer-drift candidates", str(len(result.pointer_drift_candidates)))
+    console.print(table)
+    console.print(
+        "Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown."
+    )
+
+
 if __name__ == "__main__":
     app()
