@@ -104,6 +104,45 @@ def auth_ytmusic() -> None:
     )
 
 
+@auth_app.command("youtube")
+def auth_youtube() -> None:
+    """Set up OAuth for YouTube Data API access."""
+    cfg = Config.load()
+    cfg.ensure_app_dir()
+    secrets_path = cfg.youtube_oauth_client_path
+    token_path = cfg.youtube_token_path
+
+    console.print("[bold]YouTube OAuth setup[/bold]")
+    if not secrets_path.exists():
+        console.print(
+            "1. Open [cyan]https://console.cloud.google.com/[/cyan] and create "
+            "(or pick) a project.\n"
+            "2. Enable [bold]YouTube Data API v3[/bold] for the project.\n"
+            "3. APIs & Services → OAuth consent screen → External, add yourself "
+            "as a test user.\n"
+            "4. Credentials → Create credentials → OAuth client ID → "
+            "[bold]Desktop app[/bold] → download the JSON.\n"
+            f"5. Save it as [cyan]{secrets_path}[/cyan].\n"
+            "6. Re-run [cyan]uv run likesurgeon auth youtube[/cyan]."
+        )
+        return
+
+    from .youtube_client import YouTubeClient
+
+    client = YouTubeClient(
+        client_secrets_path=secrets_path,
+        token_path=token_path,
+    )
+    console.print(
+        "[dim]Opening browser for Google consent…[/dim] "
+        "(this will block until you approve and the local server captures the redirect)."
+    )
+    client.authorize()
+    console.print(
+        f"[green]✓[/green] Authorized. Token saved to [cyan]{token_path}[/cyan]."
+    )
+
+
 @scan_app.command("ytmusic")
 def scan_ytmusic(
     limit: Annotated[int, typer.Option(help="Maximum number of liked songs to fetch.")] = 5000,
@@ -120,6 +159,42 @@ def scan_ytmusic(
         snap = create_snapshot(session, "ytmusic_liked_songs", items)
         console.print(
             f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored ({len(items)} tracks)."
+        )
+
+
+@scan_app.command("youtube-likes")
+def scan_youtube_likes(
+    limit: Annotated[
+        int, typer.Option(help="Maximum number of liked videos to fetch.")
+    ] = 5000,
+) -> None:
+    """Fetch YouTube liked videos (LL playlist) and store a snapshot."""
+    from .youtube_client import (
+        AuthorizationRequiredError,
+        ClientSecretsMissingError,
+        YouTubeClient,
+    )
+
+    cfg, factory = _bootstrap()
+    client = YouTubeClient(
+        client_secrets_path=cfg.youtube_oauth_client_path,
+        token_path=cfg.youtube_token_path,
+    )
+    try:
+        items = client.fetch_liked_videos(limit=limit)
+    except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
+        _fail(str(e), code=2)
+
+    with session_scope(factory) as session:
+        snap = create_snapshot(session, "youtube_liked_videos", items)
+        # Quick music-candidate count for the post-scan summary.
+        from .snapshot import get_snapshot_items
+
+        scan_items = get_snapshot_items(session, snap.id)
+        music_like = sum(1 for it in scan_items if it.is_music_candidate)
+        console.print(
+            f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored "
+            f"({len(items)} videos, [bold]{music_like}[/bold] music-like)."
         )
 
 
