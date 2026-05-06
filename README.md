@@ -21,7 +21,8 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | Milestone   | Scope                                                                |
 |-------------|----------------------------------------------------------------------|
 | 0.1         | Read-only YouTube Music liked-songs scanner + local snapshots         |
-| **0.2**     | YouTube Data API + classifier + cross-source compare/issues (this)    |
+| 0.2         | YouTube Data API + classifier + cross-source compare/issues           |
+| **0.2.1**   | Auth/UX polish (next): migrate YT Music auth from browser-header to ytmusicapi OAuth (Device Authorization Grant, reusing the existing GCP project with a new "TVs and Limited Input" client); detect 0.1→0.2 schema mismatch on `init` and emit a friendly error instead of a raw SQLAlchemy traceback; convert ytmusicapi's stale-auth `KeyError` (logged-out response) into a clean `AuthFileMissingError` |
 | 0.3         | Matching engine for missing / "ghost" / pointer-drift tracks          |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
