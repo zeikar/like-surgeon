@@ -17,6 +17,15 @@ class AuthFileMissingError(FileNotFoundError):
     """Raised when no usable auth file exists yet."""
 
 
+class UnexpectedResponseError(RuntimeError):
+    """Raised when ytmusicapi returns a payload we can't safely interpret.
+
+    Surfacing this as an error (rather than silently returning ``[]``) keeps
+    a 0-track snapshot from masquerading as a successful scan — that would
+    make the next diff report every prior song as removed.
+    """
+
+
 class YTMusicClient:
     """Resolves the browser-header auth file and proxies calls.
 
@@ -38,10 +47,32 @@ class YTMusicClient:
         )
 
     def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Fetch up to ``limit`` liked songs. Returns the raw track dicts."""
+        """Fetch up to ``limit`` liked songs. Returns the raw track dicts.
+
+        Raises ``UnexpectedResponseError`` if ytmusicapi returns anything
+        other than a ``dict`` containing a list under ``"tracks"``. We'd
+        rather surface "ytmusicapi behavior changed, please check" than
+        silently store an empty snapshot that wipes the user's diff history.
+        An *empty but well-formed* response (``{"tracks": []}``) is fine —
+        that genuinely means "no liked songs."
+        """
         client = self._build()
         result = client.get_liked_songs(limit=limit)
-        if isinstance(result, dict):
-            tracks = result.get("tracks", [])
-            return list(tracks) if isinstance(tracks, list) else []
-        return []
+        if not isinstance(result, dict):
+            raise UnexpectedResponseError(
+                f"ytmusicapi.get_liked_songs returned a {type(result).__name__}, "
+                "expected a dict. The library's response shape may have changed; "
+                "see https://github.com/sigma67/ytmusicapi/issues."
+            )
+        if "tracks" not in result:
+            raise UnexpectedResponseError(
+                "ytmusicapi.get_liked_songs response missing 'tracks' key. "
+                f"Got keys: {sorted(result)}."
+            )
+        tracks = result["tracks"]
+        if not isinstance(tracks, list):
+            raise UnexpectedResponseError(
+                f"ytmusicapi.get_liked_songs 'tracks' is a "
+                f"{type(tracks).__name__}, expected a list."
+            )
+        return list(tracks)

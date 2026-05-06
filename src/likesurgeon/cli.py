@@ -17,7 +17,7 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .snapshot import create_snapshot, list_snapshots
-from .ytmusic_client import AuthFileMissingError, YTMusicClient
+from .ytmusic_client import AuthFileMissingError, UnexpectedResponseError, YTMusicClient
 
 # All option/argument metadata is attached via ``Annotated[...]`` rather than
 # ``typer.Option(...)`` defaults so that ruff's ``B008`` (function call in
@@ -150,7 +150,7 @@ def scan_ytmusic(
     client = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
     try:
         items = client.fetch_liked_songs(limit=limit)
-    except AuthFileMissingError as e:
+    except (AuthFileMissingError, UnexpectedResponseError) as e:
         _fail(str(e), code=2)
 
     with session_scope(factory) as session:
