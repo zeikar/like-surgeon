@@ -298,28 +298,53 @@ def export(
 
 @app.command()
 def doctor() -> None:
-    """Print a basic health summary using stored data."""
+    """Multi-source health summary using stored data."""
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        report = health_summary(session, source="ytmusic_liked_songs")
+        report = health_summary(session)
 
-    console.print(f"[bold]Total snapshots:[/bold] {report.total_snapshots}")
-    if report.latest_source is None:
-        console.print(
-            "[yellow]No snapshots yet.[/yellow] "
-            "Run [cyan]likesurgeon scan ytmusic[/cyan] to capture your liked songs."
+    def _render_source(label: str, sh) -> None:
+        if sh.latest_count is None:
+            console.print(
+                f"[yellow]{label}:[/yellow] no snapshots yet "
+                "(run the matching scan command first)."
+            )
+            return
+        line = (
+            f"[bold]{label}:[/bold] {sh.latest_count} items "
+            f"({sh.snapshot_count} snapshots)"
         )
-        return
-    console.print(f"[bold]Latest source:[/bold] {report.latest_source}")
-    console.print(f"[bold]Latest liked songs count:[/bold] {report.latest_count}")
-    if report.last_diff is None:
-        console.print("[dim]No previous snapshot to compare against yet.[/dim]")
-    else:
+        if sh.last_diff is not None:
+            line += (
+                f"  · vs prev: +{len(sh.last_diff.added)} / "
+                f"-{len(sh.last_diff.removed)} / common {sh.last_diff.common_count}"
+            )
+        console.print(line)
+
+    console.print("[bold]like-surgeon doctor[/bold]")
+    _render_source("YouTube Music liked songs", report.ytmusic)
+    _render_source("YouTube liked videos", report.youtube)
+
+    if report.latest_diagnosis is None:
         console.print(
-            f"[bold]Compared to previous:[/bold] "
-            f"+{len(report.last_diff.added)} added, "
-            f"-{len(report.last_diff.removed)} removed, "
-            f"{report.last_diff.common_count} common."
+            "[dim]No diagnosis yet — run [cyan]likesurgeon compare-likes[/cyan].[/dim]"
+        )
+    else:
+        d = report.latest_diagnosis
+        console.print(
+            f"[bold]Latest diagnosis #{d.diagnosis_id}:[/bold] "
+            f"{d.possibly_missing_from_ytmusic} possibly missing from YT Music · "
+            f"{d.pointer_drift} pointer drift · "
+            f"{d.ytmusic_only} YT Music only"
+        )
+
+    if report.match_rate_percent is None:
+        console.print("[dim]Match-rate health score: N/A (no music candidates).[/dim]")
+    else:
+        score = report.match_rate_percent
+        color = "green" if score >= 80 else "yellow" if score >= 50 else "red"
+        console.print(
+            f"[bold]Match-rate health score:[/bold] [{color}]{score:.1f}%[/{color}]"
         )
 
 
