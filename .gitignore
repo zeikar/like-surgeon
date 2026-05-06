@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenv / uv
+.venv/
+.python-version
+
+# Tooling
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local app data (in case anyone runs `likesurgeon init` from inside the repo)
+.like-surgeon/
+*.sqlite
+*.sqlite-journal
+browser.json
+# Not used in 0.1; ignored defensively for any future hand-placed OAuth file.
+ytmusic-oauth.json
