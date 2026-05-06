@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+from google.auth.exceptions import RefreshError
 
 from likesurgeon.youtube_client import (
     AuthorizationRequiredError,
@@ -149,3 +151,68 @@ def test_service_without_token_raises():
     # _service is what fetch_liked_videos calls internally.
     with pytest.raises(AuthorizationRequiredError):
         c._service()
+
+
+def test_load_token_returns_none_on_corrupt_json(tmp_path: Path) -> None:
+    """A partial / mangled token file should look like 'no token' to callers
+    instead of crashing the CLI with a stack trace from google-auth."""
+    token_path = tmp_path / "youtube-token.json"
+    token_path.write_text("{not valid json", encoding="utf-8")
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c._load_token() is None
+    # _service rides on _load_token returning None; verify the wrapper
+    # surfaces our own exception rather than leaking ValueError.
+    with pytest.raises(AuthorizationRequiredError):
+        c._service()
+
+
+class _FakeRefreshFailingCreds:
+    """Minimal Credentials stand-in whose ``refresh`` always blows up.
+
+    Exposes only the attributes ``_service`` reads — keeps the test
+    isolated from google-auth internals.
+    """
+
+    valid = False
+    expired = True
+    refresh_token = "rt"
+
+    def refresh(self, _request: Any) -> None:
+        raise RefreshError("token revoked")
+
+
+def test_service_raises_authorization_required_when_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(c, "_load_token", lambda: _FakeRefreshFailingCreds())
+    with pytest.raises(AuthorizationRequiredError, match="refresh failed"):
+        c._service()
+
+
+def test_authorize_raises_authorization_required_when_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """authorize() with an expired token whose refresh blows up should
+    surface AuthorizationRequiredError, not a google-auth RefreshError."""
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(c, "_load_token", lambda: _FakeRefreshFailingCreds())
+    with pytest.raises(AuthorizationRequiredError, match="refresh failed"):
+        c.authorize()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode")
+def test_save_token_chmods_to_user_only(tmp_path: Path) -> None:
+    """Persisted token files contain refresh credentials — must not be
+    world/group readable on shared machines."""
+    token_path = tmp_path / "youtube-token.json"
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+
+    class _ToJson:
+        def to_json(self) -> str:
+            return '{"token": "abc"}'
+
+    c._save_token(_ToJson())  # type: ignore[arg-type]
+    assert token_path.exists()
+    mode = token_path.stat().st_mode & 0o777
+    assert mode == 0o600

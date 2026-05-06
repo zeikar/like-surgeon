@@ -1,10 +1,10 @@
 """Thin wrapper around google-api-python-client for YouTube Data API v3.
 
 The wrapper exists so that:
-  * tests can subclass and override ``_service`` / ``_authorize`` to inject a
-    fake API client.
+  * tests can subclass and override ``_service`` / ``_load_token`` to inject
+    a fake API client or canned credentials.
   * the CLI gets two clear exceptions (client-secrets missing vs. token
-    missing/invalid) instead of leaking google-auth internals.
+    missing/invalid/corrupt) instead of leaking google-auth internals.
 
 OAuth flow: the user creates an OAuth 2.0 client of type "Desktop app" in
 Google Cloud Console and downloads the JSON to
@@ -16,9 +16,12 @@ silently refresh that token.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -54,7 +57,7 @@ class YouTubeClient:
         if creds is not None and creds.valid:
             return
         if creds is not None and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            self._refresh_or_raise(creds)
             self._save_token(creds)
             return
         if self._client_secrets_path is None or not self._client_secrets_path.exists():
@@ -67,15 +70,45 @@ class YouTubeClient:
         self._save_token(creds)
 
     def _load_token(self) -> Credentials | None:
+        """Read the persisted token. Treats corrupt/partial JSON as "no token".
+
+        A corrupt token file shouldn't crash the CLI with a stack trace —
+        the natural recovery is to re-run ``auth youtube``, which is exactly
+        what the surrounding callers do when this returns ``None``.
+        """
         if self._token_path is None or not self._token_path.exists():
             return None
-        return Credentials.from_authorized_user_file(str(self._token_path), SCOPES)
+        try:
+            return Credentials.from_authorized_user_file(str(self._token_path), SCOPES)
+        except (ValueError, OSError):
+            return None
 
     def _save_token(self, creds: Credentials) -> None:
         if self._token_path is None:
             return
         self._token_path.parent.mkdir(parents=True, exist_ok=True)
         self._token_path.write_text(creds.to_json(), encoding="utf-8")
+        # Refresh tokens are credentials — narrow file mode on POSIX so they
+        # aren't accidentally readable by other users sharing this machine.
+        if sys.platform != "win32":
+            os.chmod(self._token_path, 0o600)
+
+    def _refresh_or_raise(self, creds: Credentials) -> None:
+        """Refresh ``creds`` in place; re-raise google-auth failures as ours.
+
+        ``creds.refresh`` raises ``RefreshError`` when the refresh token is
+        revoked/expired and may surface transport errors on network issues.
+        Either way the user-facing recovery is identical: re-run
+        ``auth youtube``. Surfacing one named exception keeps the CLI from
+        leaking google-auth tracebacks.
+        """
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            raise AuthorizationRequiredError(
+                "YouTube token refresh failed (token may have been revoked). "
+                "Re-run `likesurgeon auth youtube` to re-consent."
+            ) from exc
 
     def _service(self) -> Any:
         """Return an authorized Data API resource. Raises if not authorized."""
@@ -88,7 +121,7 @@ class YouTubeClient:
             )
         if not creds.valid:
             if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                self._refresh_or_raise(creds)
                 self._save_token(creds)
             else:
                 raise AuthorizationRequiredError(
