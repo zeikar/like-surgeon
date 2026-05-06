@@ -112,10 +112,7 @@ def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
     snippet = item.get("snippet") or {}
     content_details = item.get("contentDetails") or {}
 
-    video_id = (
-        content_details.get("videoId")
-        or (snippet.get("resourceId") or {}).get("videoId")
-    )
+    video_id = content_details.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
     title = str(snippet.get("title") or "")
     channel = str(snippet.get("channelTitle") or "").strip()
     artists = [channel] if channel else []
@@ -149,9 +146,7 @@ _TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 
 
 def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
-    stmt = select(Track).where(
-        Track.source == source, Track.dedupe_key == rec["dedupe_key"]
-    )
+    stmt = select(Track).where(Track.source == source, Track.dedupe_key == rec["dedupe_key"])
     track = session.scalar(stmt)
     now = _utcnow()
     if track is None:
@@ -163,9 +158,7 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
             album=rec["album"],
             duration_seconds=rec["duration_seconds"],
             thumbnails_json=(
-                json.dumps(rec["thumbnails"], ensure_ascii=False)
-                if rec["thumbnails"]
-                else None
+                json.dumps(rec["thumbnails"], ensure_ascii=False) if rec["thumbnails"] else None
             ),
             canonical_key=rec["canonical_key"],
             dedupe_key=rec["dedupe_key"],
@@ -190,14 +183,10 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
     return track
 
 
-def create_snapshot(
-    session: Session, source: str, items: Iterable[dict[str, Any]]
-) -> Snapshot:
+def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any]]) -> Snapshot:
     """Persist a snapshot of ``items`` from ``source``. Returns the snapshot row."""
     if source not in _TRANSLATORS:
-        raise ValueError(
-            f"Unknown source {source!r}; expected one of {sorted(_TRANSLATORS)}"
-        )
+        raise ValueError(f"Unknown source {source!r}; expected one of {sorted(_TRANSLATORS)}")
     translator = _TRANSLATORS[source]
 
     items_list = list(items)
@@ -218,9 +207,7 @@ def create_snapshot(
                 album=rec["album"],
                 duration_seconds=rec["duration_seconds"],
                 thumbnails_json=(
-                    json.dumps(rec["thumbnails"], ensure_ascii=False)
-                    if rec["thumbnails"]
-                    else None
+                    json.dumps(rec["thumbnails"], ensure_ascii=False) if rec["thumbnails"] else None
                 ),
                 canonical_key=rec["canonical_key"],
                 raw_json=json.dumps(rec["raw"], ensure_ascii=False),

@@ -62,9 +62,7 @@ class YouTubeClient:
                 "No YouTube OAuth client_secrets file found. "
                 "Run `likesurgeon auth youtube` and follow the printed instructions."
             )
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(self._client_secrets_path), SCOPES
-        )
+        flow = InstalledAppFlow.from_client_secrets_file(str(self._client_secrets_path), SCOPES)
         creds = flow.run_local_server(port=0)
         self._save_token(creds)
 
@@ -113,11 +111,7 @@ class YouTubeClient:
         """
         resp = service.channels().list(part="contentDetails", mine=True).execute()
         for item in resp.get("items") or []:
-            likes = (
-                (item.get("contentDetails") or {})
-                .get("relatedPlaylists", {})
-                .get("likes")
-            )
+            likes = (item.get("contentDetails") or {}).get("relatedPlaylists", {}).get("likes")
             if likes:
                 return likes
         return LIKED_VIDEOS_FALLBACK_PLAYLIST_ID

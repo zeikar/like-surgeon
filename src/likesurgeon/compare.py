@@ -151,9 +151,7 @@ def compare_likes(inp: CompareInput) -> CompareResult:
     def _take_first_unused(candidates: list[int]) -> int | None:
         return next((i for i in candidates if i not in used_ytm_idx), None)
 
-    def _record_match(
-        yt_idx: int, ytm_idx: int, kind: MatchKind, confidence: float
-    ) -> None:
+    def _record_match(yt_idx: int, ytm_idx: int, kind: MatchKind, confidence: float) -> None:
         ytm = inp.ytmusic[ytm_idx]
         yt = inp.youtube[yt_idx]
         matched.append(
@@ -222,14 +220,10 @@ def compare_likes(inp: CompareInput) -> CompareResult:
 
     # Build unmatched lists at row level — surplus rows survive intact.
     possibly_missing = [
-        _to_unmatched(yt)
-        for yt_idx, yt in youtube_music
-        if yt_idx not in used_yt_idx
+        _to_unmatched(yt) for yt_idx, yt in youtube_music if yt_idx not in used_yt_idx
     ]
     ytmusic_only = [
-        _to_unmatched(ytm)
-        for ytm_idx, ytm in enumerate(inp.ytmusic)
-        if ytm_idx not in used_ytm_idx
+        _to_unmatched(ytm) for ytm_idx, ytm in enumerate(inp.ytmusic) if ytm_idx not in used_ytm_idx
     ]
     pointer_drift = [m for m in matched if m.kind is MatchKind.FUZZY]
 

@@ -77,15 +77,7 @@ class _FakeClient(YouTubeClient):
         super().__init__(client_secrets_path=None, token_path=None)
         self._fake_pi = _FakePlaylistItems(pages)
         self._fake_channels = _FakeChannels(
-            {
-                "items": [
-                    {
-                        "contentDetails": {
-                            "relatedPlaylists": {"likes": likes_playlist_id}
-                        }
-                    }
-                ]
-            }
+            {"items": [{"contentDetails": {"relatedPlaylists": {"likes": likes_playlist_id}}}]}
         )
 
     def _service(self) -> Any:  # type: ignore[override]

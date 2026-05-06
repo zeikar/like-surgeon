@@ -138,9 +138,7 @@ def auth_youtube() -> None:
         "(this will block until you approve and the local server captures the redirect)."
     )
     client.authorize()
-    console.print(
-        f"[green]✓[/green] Authorized. Token saved to [cyan]{token_path}[/cyan]."
-    )
+    console.print(f"[green]✓[/green] Authorized. Token saved to [cyan]{token_path}[/cyan].")
 
 
 @scan_app.command("ytmusic")
@@ -164,9 +162,7 @@ def scan_ytmusic(
 
 @scan_app.command("youtube-likes")
 def scan_youtube_likes(
-    limit: Annotated[
-        int, typer.Option(help="Maximum number of liked videos to fetch.")
-    ] = 5000,
+    limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
 ) -> None:
     """Fetch YouTube liked videos (LL playlist) and store a snapshot."""
     from .youtube_client import (
@@ -306,14 +302,10 @@ def doctor() -> None:
     def _render_source(label: str, sh) -> None:
         if sh.latest_count is None:
             console.print(
-                f"[yellow]{label}:[/yellow] no snapshots yet "
-                "(run the matching scan command first)."
+                f"[yellow]{label}:[/yellow] no snapshots yet (run the matching scan command first)."
             )
             return
-        line = (
-            f"[bold]{label}:[/bold] {sh.latest_count} items "
-            f"({sh.snapshot_count} snapshots)"
-        )
+        line = f"[bold]{label}:[/bold] {sh.latest_count} items ({sh.snapshot_count} snapshots)"
         if sh.last_diff is not None:
             line += (
                 f"  · vs prev: +{len(sh.last_diff.added)} / "
@@ -326,9 +318,7 @@ def doctor() -> None:
     _render_source("YouTube liked videos", report.youtube)
 
     if report.latest_diagnosis is None:
-        console.print(
-            "[dim]No diagnosis yet — run [cyan]likesurgeon compare-likes[/cyan].[/dim]"
-        )
+        console.print("[dim]No diagnosis yet — run [cyan]likesurgeon compare-likes[/cyan].[/dim]")
     else:
         d = report.latest_diagnosis
         console.print(
@@ -343,9 +333,7 @@ def doctor() -> None:
     else:
         score = report.match_rate_percent
         color = "green" if score >= 80 else "yellow" if score >= 50 else "red"
-        console.print(
-            f"[bold]Match-rate health score:[/bold] [{color}]{score:.1f}%[/{color}]"
-        )
+        console.print(f"[bold]Match-rate health score:[/bold] [{color}]{score:.1f}%[/{color}]")
 
 
 @app.command("compare-likes")
@@ -402,9 +390,7 @@ def compare_likes_cmd() -> None:
     )
     table.add_row("Pointer-drift candidates", str(len(result.pointer_drift_candidates)))
     console.print(table)
-    console.print(
-        "Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown."
-    )
+    console.print("Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown.")
 
 
 @app.command()
@@ -429,9 +415,7 @@ def issues(
     ] = 0.0,
     format: Annotated[
         str,
-        typer.Option(
-            "--format", "-f", help="Output format: 'table' (default) or 'json'."
-        ),
+        typer.Option("--format", "-f", help="Output format: 'table' (default) or 'json'."),
     ] = "table",
 ) -> None:
     """List issues from the latest diagnosis."""
@@ -441,9 +425,7 @@ def issues(
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
-        _fail(
-            f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2
-        )
+        _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:

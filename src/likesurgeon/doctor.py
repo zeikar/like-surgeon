@@ -48,10 +48,7 @@ class MultiSourceHealthReport:
 
 def _source_health(session: Session, source: str) -> SourceHealth:
     snapshot_count = (
-        session.scalar(
-            select(func.count(Snapshot.id)).where(Snapshot.source == source)
-        )
-        or 0
+        session.scalar(select(func.count(Snapshot.id)).where(Snapshot.source == source)) or 0
     )
     latest = latest_snapshot(session, source=source)
     if latest is None:

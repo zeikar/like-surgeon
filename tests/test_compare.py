@@ -68,9 +68,7 @@ def test_fuzzy_match_when_neither_video_id_nor_canonical_match():
     """RapidFuzz fallback for slight misspellings / decoration."""
     ytm = [_ytm(1, "vm", "Imagine", ["John Lennon"])]
     yt = [_yt(2, "vy", "Imagine - John Lennon", ["RandomChannel"])]
-    res = compare_likes(
-        CompareInput(ytmusic=ytm, youtube=yt, fuzzy_threshold=80)
-    )
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt, fuzzy_threshold=80))
     assert len(res.matched) == 1
     assert res.matched[0].kind is MatchKind.FUZZY
     assert res.matched[0].confidence >= 0.8
@@ -100,9 +98,7 @@ def test_pointer_drift_candidates_collect_fuzzy_matches():
     """Fuzzy matches should also surface as pointer_drift_candidates."""
     ytm = [_ytm(1, "vm", "Imagine", ["John Lennon"])]
     yt = [_yt(2, "vy", "Imagine - John Lennon", ["RandomChannel"])]
-    res = compare_likes(
-        CompareInput(ytmusic=ytm, youtube=yt, fuzzy_threshold=80)
-    )
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt, fuzzy_threshold=80))
     assert len(res.pointer_drift_candidates) == 1
     assert res.pointer_drift_candidates[0].ytmusic_track_id == 1
 

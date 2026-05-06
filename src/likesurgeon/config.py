@@ -27,9 +27,7 @@ class Config:
     @classmethod
     def load(cls) -> Config:
         env = os.environ.get(ENV_HOME)
-        app_dir = (
-            Path(env).expanduser() if env else Path.home() / DEFAULT_APP_DIR_NAME
-        )
+        app_dir = Path(env).expanduser() if env else Path.home() / DEFAULT_APP_DIR_NAME
         return cls(
             app_dir=app_dir,
             db_path=app_dir / DEFAULT_DB_FILENAME,

@@ -40,9 +40,7 @@ _CHANNEL_TOPIC_RE = re.compile(r"\s-\s*topic\s*$", re.IGNORECASE)
 _ARTIST_DASH_TITLE_RE = re.compile(r"^[^-\n]{2,}\s+-\s+[^-\n]{2,}$")
 
 # Description boilerplate that YouTube's auto-generated music videos always include.
-_DESCRIPTION_PROVIDED_RE = re.compile(
-    r"provided to youtube by", re.IGNORECASE
-)
+_DESCRIPTION_PROVIDED_RE = re.compile(r"provided to youtube by", re.IGNORECASE)
 
 # Strong negative signals that override most positive signals.
 _NEGATIVE_SIGNALS: tuple[tuple[str, int, str], ...] = (
@@ -122,9 +120,7 @@ def classify(
         reasons.append("negative: " + ", ".join(neg_labels))
 
     is_music = (
-        score >= _POSITIVE_THRESHOLD
-        and bool(pos_labels or extra_labels)
-        and not (neg_score >= 3)
+        score >= _POSITIVE_THRESHOLD and bool(pos_labels or extra_labels) and not (neg_score >= 3)
     )
     reason = " | ".join(reasons) if reasons else "no signals"
     return Classification(is_music_candidate=is_music, score=score, reason=reason)

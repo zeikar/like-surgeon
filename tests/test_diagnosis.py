@@ -132,9 +132,7 @@ def test_latest_diagnosis_orders_by_recency(session: Session):
     yt_snap = create_snapshot(session, "youtube_liked_videos", [])
     session.commit()
 
-    empty = CompareResult(
-        ytmusic_count=0, youtube_total_count=0, youtube_music_count=0
-    )
+    empty = CompareResult(ytmusic_count=0, youtube_total_count=0, youtube_music_count=0)
     inp = DiagnosisInput(
         ytmusic_snapshot_id=ytm_snap.id,
         youtube_snapshot_id=yt_snap.id,

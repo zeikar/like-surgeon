@@ -106,9 +106,7 @@ def _unmatched_reason(item: UnmatchedItem) -> str:
 
 
 def latest_diagnosis(session: Session) -> Diagnosis | None:
-    stmt = (
-        select(Diagnosis).order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc()).limit(1)
-    )
+    stmt = select(Diagnosis).order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc()).limit(1)
     return session.scalar(stmt)
 
 
