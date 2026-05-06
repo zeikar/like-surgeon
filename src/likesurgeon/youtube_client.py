@@ -51,15 +51,25 @@ class YouTubeClient:
     def authorize(self) -> None:
         """Run the InstalledApp flow once, persist the resulting token JSON.
 
-        Idempotent: if a usable token already exists, this is a no-op.
+        Idempotent: if a usable token already exists, this is a no-op. If a
+        token exists but its refresh fails (revoked/expired), the method
+        falls through to the consent flow rather than raising — recovering
+        from a broken token is exactly the user-facing purpose of
+        ``auth youtube``, so making them re-run the command would be
+        circular. ``_service`` keeps the strict behavior because callers
+        there have no consent flow to fall back on.
         """
         creds = self._load_token()
         if creds is not None and creds.valid:
             return
         if creds is not None and creds.expired and creds.refresh_token:
-            self._refresh_or_raise(creds)
-            self._save_token(creds)
-            return
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                pass
+            else:
+                self._save_token(creds)
+                return
         if self._client_secrets_path is None or not self._client_secrets_path.exists():
             raise ClientSecretsMissingError(
                 "No YouTube OAuth client_secrets file found. "
@@ -93,25 +103,14 @@ class YouTubeClient:
         if sys.platform != "win32":
             os.chmod(self._token_path, 0o600)
 
-    def _refresh_or_raise(self, creds: Credentials) -> None:
-        """Refresh ``creds`` in place; re-raise google-auth failures as ours.
-
-        ``creds.refresh`` raises ``RefreshError`` when the refresh token is
-        revoked/expired and may surface transport errors on network issues.
-        Either way the user-facing recovery is identical: re-run
-        ``auth youtube``. Surfacing one named exception keeps the CLI from
-        leaking google-auth tracebacks.
-        """
-        try:
-            creds.refresh(Request())
-        except RefreshError as exc:
-            raise AuthorizationRequiredError(
-                "YouTube token refresh failed (token may have been revoked). "
-                "Re-run `likesurgeon auth youtube` to re-consent."
-            ) from exc
-
     def _service(self) -> Any:
-        """Return an authorized Data API resource. Raises if not authorized."""
+        """Return an authorized Data API resource. Raises if not authorized.
+
+        ``creds.refresh`` can raise ``RefreshError`` when the refresh token
+        is revoked or expired. Re-raise as ``AuthorizationRequiredError``
+        so the CLI prints a guidance message instead of a google-auth
+        traceback; the user's recovery is to re-run ``auth youtube``.
+        """
         creds = self._load_token()
         if creds is None:
             raise AuthorizationRequiredError(
@@ -121,7 +120,13 @@ class YouTubeClient:
             )
         if not creds.valid:
             if creds.expired and creds.refresh_token:
-                self._refresh_or_raise(creds)
+                try:
+                    creds.refresh(Request())
+                except RefreshError as exc:
+                    raise AuthorizationRequiredError(
+                        "YouTube token refresh failed (token may have been revoked). "
+                        "Re-run `likesurgeon auth youtube` to re-consent."
+                    ) from exc
                 self._save_token(creds)
             else:
                 raise AuthorizationRequiredError(

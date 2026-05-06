@@ -190,14 +190,17 @@ def test_service_raises_authorization_required_when_refresh_fails(
         c._service()
 
 
-def test_authorize_raises_authorization_required_when_refresh_fails(
+def test_authorize_falls_through_to_consent_when_refresh_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """authorize() with an expired token whose refresh blows up should
-    surface AuthorizationRequiredError, not a google-auth RefreshError."""
+    """authorize() is the recovery command, so a revoked refresh token
+    must NOT raise — it should fall through to the consent flow. With no
+    client_secrets file configured here, that fall-through ends in
+    ClientSecretsMissingError, which proves we got past the refresh step
+    instead of bailing on RefreshError."""
     c = YouTubeClient(client_secrets_path=None, token_path=None)
     monkeypatch.setattr(c, "_load_token", lambda: _FakeRefreshFailingCreds())
-    with pytest.raises(AuthorizationRequiredError, match="refresh failed"):
+    with pytest.raises(ClientSecretsMissingError):
         c.authorize()
 
 
