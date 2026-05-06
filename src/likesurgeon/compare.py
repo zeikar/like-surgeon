@@ -107,7 +107,8 @@ class CompareResult:
     possibly_missing_from_ytmusic: list[UnmatchedItem] = field(default_factory=list)
     # YT Music tracks with no corresponding YT video. Lower priority — most
     # users don't mirror every YT Music like to YouTube. Surfaced for
-    # completeness; ``issues --type ytmusic_only_likes`` filters these out.
+    # completeness; ``issues --type ytmusic_only`` filters these out (the
+    # persisted ``DiagnosisItem.issue_type`` value is ``ytmusic_only``).
     ytmusic_only_likes: list[UnmatchedItem] = field(default_factory=list)
     # Subset of ``matched``: rows that matched only via fuzzy stage.
     pointer_drift_candidates: list[Match] = field(default_factory=list)
