@@ -76,3 +76,46 @@ def test_missing_auth_raises():
     client = YTMusicClient(browser_path=Path("/nope/browser.json"))
     with pytest.raises(AuthFileMissingError):
         client.fetch_liked_songs()
+
+
+def test_fetch_liked_songs_wraps_parse_keyerror_as_unexpected_response() -> None:
+    """ytmusicapi raises a deeply-nested KeyError when the response is a
+    logged-out page. Surface as our own error with re-auth guidance."""
+
+    class _RaisingFake:
+        def get_liked_songs(self, limit: int) -> Any:
+            raise KeyError(
+                "Unable to find 'twoColumnBrowseResultsRenderer' using path [...] on {...}"
+            )
+
+    class _Client(YTMusicClient):
+        def __init__(self) -> None:
+            super().__init__(browser_path=None)
+
+        def _build(self) -> Any:
+            return _RaisingFake()
+
+    with pytest.raises(UnexpectedResponseError, match="auth ytmusic") as exc_info:
+        _Client().fetch_liked_songs()
+    assert isinstance(exc_info.value.__cause__, KeyError)
+
+
+def test_fetch_liked_songs_wraps_parse_indexerror_as_unexpected_response() -> None:
+    """ytmusicapi's navigation.nav re-raises both KeyError and IndexError
+    depending on whether the missing path element is a key or a list index.
+    A logged-out response can trigger either. The boundary must catch both."""
+
+    class _RaisingFake:
+        def get_liked_songs(self, limit: int) -> Any:
+            raise IndexError("Unable to find '0' using path [..., 0] on {...}")
+
+    class _Client(YTMusicClient):
+        def __init__(self) -> None:
+            super().__init__(browser_path=None)
+
+        def _build(self) -> Any:
+            return _RaisingFake()
+
+    with pytest.raises(UnexpectedResponseError, match="auth ytmusic") as exc_info:
+        _Client().fetch_liked_songs()
+    assert isinstance(exc_info.value.__cause__, IndexError)

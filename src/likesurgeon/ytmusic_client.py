@@ -57,7 +57,24 @@ class YTMusicClient:
         that genuinely means "no liked songs."
         """
         client = self._build()
-        result = client.get_liked_songs(limit=limit)
+        try:
+            result = client.get_liked_songs(limit=limit)
+        except (KeyError, IndexError) as exc:
+            # ytmusicapi's response parser (`ytmusicapi.navigation.nav`) re-raises
+            # whichever of KeyError / IndexError it caught — string keys vs. list
+            # indices in the navigation path. Both surface from the same failure
+            # mode (logged-out / shape-changed response), so we catch both rather
+            # than try to fingerprint the cause at this boundary. Recovery is
+            # identical for either.
+            raise UnexpectedResponseError(
+                "ytmusicapi failed to parse the liked-songs response. "
+                "This usually means your ytmusicapi auth file is stale "
+                "(browser-header cookies expired, or the YouTube session "
+                "was signed out elsewhere), but it could also mean ytmusicapi's "
+                "expected response shape has changed upstream. First try "
+                "`likesurgeon auth ytmusic` to refresh; if that doesn't fix "
+                "it, file an issue and include the original error."
+            ) from exc
         if not isinstance(result, dict):
             raise UnexpectedResponseError(
                 f"ytmusicapi.get_liked_songs returned a {type(result).__name__}, "
