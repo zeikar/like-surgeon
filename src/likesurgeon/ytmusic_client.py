@@ -105,8 +105,16 @@ def _cookies_to_browser_json(cookies: Iterable[Any]) -> dict[str, str]:
     """
     from ytmusicapi.helpers import get_authorization
 
-    cookie_list = [c for c in cookies if _cookie_valid_for_music_youtube(c)]
+    raw = list(cookies)
+    cookie_list = [c for c in raw if _cookie_valid_for_music_youtube(c)]
     if not cookie_list:
+        if raw:
+            raise CookieExtractionError(
+                "Cookies were found in the browser, but none are valid for "
+                "music.youtube.com (e.g. only `accounts.youtube.com` or "
+                "third-party cookies). Sign into music.youtube.com in that "
+                "browser, then retry."
+            )
         raise CookieExtractionError(
             "No youtube.com cookies found in the browser. "
             "Make sure you're logged into music.youtube.com in that browser, "

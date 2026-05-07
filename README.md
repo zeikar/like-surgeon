@@ -23,7 +23,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | 0.1         | Read-only YouTube Music liked-songs scanner + local snapshots         |
 | 0.2         | YouTube Data API + classifier + cross-source compare/issues           |
 | 0.2.1       | Explored ytmusicapi OAuth (Device Code) to escape browser-header cookie staleness — abandoned: ytmusicapi 1.12 + Google's current backend reject every non-TV `clientName` for OAuth-issued tokens, and the TV clients return YouTube-shape responses ytmusicapi can't parse. Notes archived at [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md). Salvaged: `fetch_liked_songs` parse-error boundary so stale auth surfaces as a clean re-auth hint instead of a ytmusicapi traceback. |
-| **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
+| **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
 | 0.3         | Matching engine for missing / "ghost" / pointer-drift tracks          |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
@@ -58,10 +58,10 @@ Creates `~/.like-surgeon/` and the SQLite database at `~/.like-surgeon/like-surg
 uv run likesurgeon auth ytmusic --from-browser chrome
 ```
 
-Replace `chrome` with whichever browser you're signed into music.youtube.com on
-(supported lowercase names: `chromium`, `firefox`, `edge`, `brave`, `safari`,
-`opera`, `opera_gx`, `librewolf`, `vivaldi`, `arc`, `w3m`, `lynx`). The command
-reads cookies from that browser's local store and writes
+Replace `chrome` above with whichever browser you're signed into music.youtube.com
+on. Supported lowercase names (13 total): `chrome`, `chromium`, `firefox`, `edge`,
+`brave`, `safari`, `opera`, `opera_gx`, `librewolf`, `vivaldi`, `arc`, `w3m`,
+`lynx`. The command reads cookies from that browser's local store and writes
 `~/.like-surgeon/browser.json` (POSIX mode `0o600`) — no DevTools copy-paste
 required.
 

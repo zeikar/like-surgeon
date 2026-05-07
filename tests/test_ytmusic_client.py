@@ -126,13 +126,17 @@ def test_fetch_liked_songs_wraps_parse_indexerror_as_unexpected_response() -> No
 class _StubCookie:
     """Minimal duck-typed stand-in for browser_cookie3's Cookie objects.
 
-    Only ``.name`` and ``.value`` are read by ``_cookies_to_browser_json``.
-    Keeping the stub here means tests don't depend on importing
-    ``browser_cookie3`` (which would prompt for keychain access on macOS
-    when CI runs against a real Chrome profile). Now also exposes
-    ``.domain`` so tests can model cross-domain cookies that
-    browser_cookie3's substring filter would return; existing tests get
-    the safe default ``.youtube.com``.
+    Only ``.name``, ``.value``, and ``.domain`` are read by
+    ``_cookies_to_browser_json``. The pure-builder tests use this stub so
+    they don't have to instantiate browser_cookie3's own Cookie class
+    (which would touch the OS cookie store / macOS Keychain). The
+    wrapper tests below still ``import browser_cookie3`` to monkeypatch
+    its top-level functions, but they hand this stub class to those
+    monkeypatches rather than constructing real Cookie objects.
+
+    ``.domain`` defaults to ``.youtube.com`` so existing tests pass the
+    domain-match filter without per-test boilerplate; foreign-domain
+    tests override it explicitly.
     """
 
     def __init__(
@@ -222,14 +226,16 @@ def test_cookies_to_browser_json_drops_foreign_domains() -> None:
 
 def test_cookies_to_browser_json_rejects_when_only_foreign_cookies() -> None:
     """If browser_cookie3 returns only cookies that don't match
-    music.youtube.com (e.g. all from a typosquatted domain), treat that
-    as 'no usable cookies' and surface the same friendly error."""
+    music.youtube.com (e.g. all from a typosquatted domain), surface a
+    distinct error noting the cookies were filtered — the empty-input
+    message ('No youtube.com cookies') would mislead the user into
+    thinking the browser DB read failed."""
     from likesurgeon.ytmusic_client import (
         CookieExtractionError,
         _cookies_to_browser_json,
     )
 
-    with pytest.raises(CookieExtractionError, match="No youtube.com"):
+    with pytest.raises(CookieExtractionError, match="none are valid for"):
         _cookies_to_browser_json([_StubCookie("__Secure-3PAPISID", "x", domain="notyoutube.com")])
 
 

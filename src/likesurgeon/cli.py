@@ -18,6 +18,7 @@ from .doctor import health_summary
 from .export import export_snapshot_json
 from .snapshot import create_snapshot, list_snapshots
 from .ytmusic_client import (
+    SUPPORTED_BROWSERS,
     AuthFileMissingError,
     CookieExtractionError,
     UnexpectedResponseError,
@@ -99,9 +100,8 @@ def auth_ytmusic(
             help=(
                 "Auto-extract cookies from this browser instead of running "
                 "the manual ytmusicapi paste flow. Supported (lowercase): "
-                "chrome, chromium, firefox, edge, brave, safari, opera, "
-                "opera_gx, librewolf, vivaldi, arc, w3m, lynx. Requires you "
-                "to be logged into music.youtube.com in that browser."
+                f"{', '.join(SUPPORTED_BROWSERS)}. Requires you to be logged "
+                "into music.youtube.com in that browser."
             ),
         ),
     ] = None,
