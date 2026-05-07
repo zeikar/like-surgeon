@@ -23,7 +23,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | 0.1         | Read-only YouTube Music liked-songs scanner + local snapshots         |
 | 0.2         | YouTube Data API + classifier + cross-source compare/issues           |
 | 0.2.1       | Explored ytmusicapi OAuth (Device Code) to escape browser-header cookie staleness — abandoned: ytmusicapi 1.12 + Google's current backend reject every non-TV `clientName` for OAuth-issued tokens, and the TV clients return YouTube-shape responses ytmusicapi can't parse. Notes archived at [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md). Salvaged: `fetch_liked_songs` parse-error boundary so stale auth surfaces as a clean re-auth hint instead of a ytmusicapi traceback. |
-| **0.2.2**   | Next: cookie-import auth via `browser-cookie3` — pull live YT Music cookies from the user's logged-in browser at scan time, sidestepping both manual `browser.json` paste and OAuth's clientName mismatch. Falls back to the TVHTML5 path documented in 0.2.1 notes if cookie extraction is unavailable. |
+| **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
 | 0.3         | Matching engine for missing / "ghost" / pointer-drift tracks          |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
@@ -52,13 +52,41 @@ Creates `~/.like-surgeon/` and the SQLite database at `~/.like-surgeon/like-surg
 
 ### 2. Authenticate
 
-**YouTube Music** (browser-header flow):
+**YouTube Music** (browser-header flow, auto-extracted from your browser):
+
+```bash
+uv run likesurgeon auth ytmusic --from-browser chrome
+```
+
+Replace `chrome` with whichever browser you're signed into music.youtube.com on
+(supported lowercase names: `chromium`, `firefox`, `edge`, `brave`, `safari`,
+`opera`, `opera_gx`, `librewolf`, `vivaldi`, `arc`, `w3m`, `lynx`). The command
+reads cookies from that browser's local store and writes
+`~/.like-surgeon/browser.json` (POSIX mode `0o600`) — no DevTools copy-paste
+required.
+
+> **macOS quirk.** Chrome (and Chromium-family browsers) on macOS encrypt
+> their cookie store with a Keychain entry; the first run prompts you to
+> allow `python` (or `Terminal`) to access it. Firefox usually avoids that
+> prompt because it stores cookies in plain SQLite. Safari may still be
+> blocked by macOS privacy settings — if extraction fails, give Terminal
+> (or your IDE) **Full Disk Access** in System Settings → Privacy &
+> Security and retry.
+
+If `--from-browser` doesn't work in your environment (sandboxed browser,
+headless server, locked DB), fall back to the manual flow:
 
 ```bash
 uv run likesurgeon auth ytmusic
 ```
 
-This prints the exact `ytmusicapi browser` setup steps and the destination file path.
+This prints the four-step `ytmusicapi browser` paste recipe.
+
+> **Treat `~/.like-surgeon/browser.json` like a session token.** It contains
+> live YouTube Music cookies — anyone who reads the file can act as you on
+> music.youtube.com until those cookies rotate. The tool stores it with
+> POSIX mode `0o600` (owner read/write only). Don't commit it, share it,
+> or leave it in shared filesystems.
 
 **YouTube Data API** (Google OAuth, desktop client):
 

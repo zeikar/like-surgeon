@@ -15,6 +15,7 @@ dependencies = [
   "sqlalchemy>=2.0",
   "google-auth-oauthlib>=1.2",
   "google-api-python-client>=2.120",
+  "browser-cookie3>=0.20.1",
 ]
 
 [project.scripts]

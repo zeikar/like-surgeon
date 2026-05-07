@@ -7,6 +7,10 @@ ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +28,123 @@ class UnexpectedResponseError(RuntimeError):
     a 0-track snapshot from masquerading as a successful scan — that would
     make the next diff report every prior song as removed.
     """
+
+
+class CookieExtractionError(RuntimeError):
+    """Raised when we can't pull usable YouTube cookies from a browser.
+
+    Covers both "browser DB unreadable" (sandboxed, locked, decrypt failure)
+    and "DB was readable but the user wasn't actually logged in" (no
+    ``__Secure-3PAPISID`` cookie). Recovery is identical: log into
+    music.youtube.com in the named browser and retry.
+    """
+
+
+# Browsers `browser_cookie3` 0.20.1 exposes as lowercase top-level functions.
+# Listed explicitly so an unsupported value gives a friendly error instead
+# of a generic AttributeError on the underlying lookup. Verified via probe;
+# includes text-mode browsers (`w3m`, `lynx`) for completeness even though
+# they're unlikely to have a usable music.youtube.com session.
+SUPPORTED_BROWSERS = (
+    "chrome",
+    "chromium",
+    "firefox",
+    "edge",
+    "brave",
+    "safari",
+    "opera",
+    "opera_gx",
+    "librewolf",
+    "vivaldi",
+    "arc",
+    "w3m",
+    "lynx",
+)
+
+
+_YTM_ORIGIN = "https://music.youtube.com"
+
+
+def _cookies_to_browser_json(cookies: Iterable[Any]) -> dict[str, str]:
+    """Build a ytmusicapi-compatible browser.json header dict from cookies.
+
+    Pure function — no I/O. Each cookie object must expose ``.name`` and
+    ``.value`` (the public surface of both ``browser_cookie3``'s Cookie and
+    the test stub). Validates that ``__Secure-3PAPISID`` is present, since
+    ytmusicapi's ``sapisid_from_cookie`` reads exactly that name to build
+    the per-request SAPISIDHASH.
+
+    Also embeds an ``Authorization: SAPISIDHASH …`` header. ytmusicapi's
+    ``determine_auth_type`` reads this *at YTMusic init time* to classify
+    the file as ``AuthType.BROWSER`` — without it the file is treated as
+    OAuth and the constructor errors out for missing ``oauth_credentials``.
+    The hash is regenerated dynamically on every real request, so the
+    value persisted to disk is only used for type detection.
+    """
+    from ytmusicapi.helpers import get_authorization
+
+    cookie_list = list(cookies)
+    if not cookie_list:
+        raise CookieExtractionError(
+            "No youtube.com cookies found in the browser. "
+            "Make sure you're logged into music.youtube.com in that browser, "
+            "then retry."
+        )
+    by_name = {c.name: c.value for c in cookie_list}
+    if "__Secure-3PAPISID" not in by_name:
+        raise CookieExtractionError(
+            "Missing `__Secure-3PAPISID` cookie — that's what ytmusicapi "
+            "hashes for the Authorization header. Are you actually signed in "
+            "on that browser? (Sign-out wipes this cookie.)"
+        )
+    cookie_header = "; ".join(f"{name}={value}" for name, value in by_name.items())
+    authorization = get_authorization(f"{by_name['__Secure-3PAPISID']} {_YTM_ORIGIN}")
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Content-Type": "application/json",
+        "X-Goog-AuthUser": "0",
+        "x-origin": _YTM_ORIGIN,
+        "Authorization": authorization,
+        "Cookie": cookie_header,
+    }
+
+
+def extract_youtube_cookies(browser: str) -> list[Any]:
+    """Read youtube.com cookies from the user's named browser DB.
+
+    Wraps ``browser_cookie3.<browser>(domain_name="youtube.com")``. The
+    ``domain_name`` filter substring-matches both ``.youtube.com`` and
+    ``.music.youtube.com``, which is what ytmusicapi needs.
+
+    Raises ``CookieExtractionError`` for unsupported browser names or any
+    failure pulling the cookies. ``browser_cookie3`` calls into
+    platform-specific decrypt code (DPAPI on Windows, libsecret/Keychain on
+    Linux/macOS) and not all failures consolidate into ``BrowserCookieError``
+    — we've seen ``OSError``, ``RuntimeError``, ``sqlite3.OperationalError``
+    leak through in the wild. Catch broadly at this system boundary so the
+    CLI gets one named exception regardless of which OS path failed.
+    """
+    if browser not in SUPPORTED_BROWSERS:
+        raise CookieExtractionError(
+            f"Unsupported browser: {browser!r}. Choose from: " + ", ".join(SUPPORTED_BROWSERS)
+        )
+    import browser_cookie3
+
+    extractor = getattr(browser_cookie3, browser)
+    try:
+        jar = extractor(domain_name="youtube.com")
+    except Exception as exc:  # noqa: BLE001 — system-boundary catch (see docstring)
+        raise CookieExtractionError(
+            f"Failed to read {browser} cookies: {type(exc).__name__}: {exc}. "
+            f"Make sure {browser} is installed, you're logged into "
+            "music.youtube.com, and the browser DB isn't locked by a running "
+            "instance (especially on Windows)."
+        ) from exc
+    return list(jar)
 
 
 class YTMusicClient:
@@ -93,3 +214,18 @@ class YTMusicClient:
                 f"{type(tracks).__name__}, expected a list."
             )
         return list(tracks)
+
+
+def write_browser_json_from_browser(browser: str, target: Path) -> None:
+    """Read youtube.com cookies from ``browser``, build a ytmusicapi-compatible
+    ``browser.json``, and write it to ``target`` (chmod 0o600 on POSIX).
+
+    Replaces the user-facing manual flow ``ytmusicapi browser`` for users who
+    are already logged into music.youtube.com in a supported browser.
+    """
+    cookies = extract_youtube_cookies(browser)
+    headers = _cookies_to_browser_json(cookies)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(headers, indent=2), encoding="utf-8")
+    if sys.platform != "win32":
+        os.chmod(target, 0o600)
