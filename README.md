@@ -22,7 +22,8 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 |-------------|----------------------------------------------------------------------|
 | 0.1         | Read-only YouTube Music liked-songs scanner + local snapshots         |
 | 0.2         | YouTube Data API + classifier + cross-source compare/issues           |
-| **0.2.1**   | Auth/UX polish (next): migrate YT Music auth from browser-header to ytmusicapi OAuth (Device Authorization Grant, reusing the existing GCP project with a new "TVs and Limited Input" client); detect 0.1→0.2 schema mismatch on `init` and emit a friendly error instead of a raw SQLAlchemy traceback; convert ytmusicapi's stale-auth `KeyError` (logged-out response) into a clean `AuthFileMissingError` |
+| 0.2.1       | Explored ytmusicapi OAuth (Device Code) to escape browser-header cookie staleness — abandoned: ytmusicapi 1.12 + Google's current backend reject every non-TV `clientName` for OAuth-issued tokens, and the TV clients return YouTube-shape responses ytmusicapi can't parse. Notes archived at [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md). Salvaged: `fetch_liked_songs` parse-error boundary so stale auth surfaces as a clean re-auth hint instead of a ytmusicapi traceback. |
+| **0.2.2**   | Next: cookie-import auth via `browser-cookie3` — pull live YT Music cookies from the user's logged-in browser at scan time, sidestepping both manual `browser.json` paste and OAuth's clientName mismatch. Falls back to the TVHTML5 path documented in 0.2.1 notes if cookie extraction is unavailable. |
 | 0.3         | Matching engine for missing / "ghost" / pointer-drift tracks          |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
