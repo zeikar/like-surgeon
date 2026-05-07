@@ -7,9 +7,11 @@ ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,26 @@ SUPPORTED_BROWSERS = (
 
 
 _YTM_ORIGIN = "https://music.youtube.com"
+_YTM_HOST = "music.youtube.com"
+
+
+def _cookie_valid_for_music_youtube(cookie: Any) -> bool:
+    """Whether a cookie's domain attribute would be sent on a request to
+    https://music.youtube.com.
+
+    `browser_cookie3` filters by a SQL `LIKE '%youtube.com%'` substring, so
+    cookies from `notyoutube.com`, `youtube.com.evil`, or sibling
+    subdomains (`accounts.youtube.com`, `studio.youtube.com`) can sneak
+    through. Real browsers use full domain-matching: domain D matches host
+    H iff `H == D` or `H` endswith `"." + D` (after stripping the leading
+    dot from D, which only signals "include subdomains"). Apply that rule
+    here so an unrelated `__Secure-3PAPISID` from a typosquatted host
+    can't satisfy our validator.
+    """
+    domain = (getattr(cookie, "domain", "") or "").lstrip(".")
+    if not domain:
+        return False
+    return domain == _YTM_HOST or _YTM_HOST.endswith("." + domain)
 
 
 def _cookies_to_browser_json(cookies: Iterable[Any]) -> dict[str, str]:
@@ -83,7 +105,7 @@ def _cookies_to_browser_json(cookies: Iterable[Any]) -> dict[str, str]:
     """
     from ytmusicapi.helpers import get_authorization
 
-    cookie_list = list(cookies)
+    cookie_list = [c for c in cookies if _cookie_valid_for_music_youtube(c)]
     if not cookie_list:
         raise CookieExtractionError(
             "No youtube.com cookies found in the browser. "
@@ -218,14 +240,31 @@ class YTMusicClient:
 
 def write_browser_json_from_browser(browser: str, target: Path) -> None:
     """Read youtube.com cookies from ``browser``, build a ytmusicapi-compatible
-    ``browser.json``, and write it to ``target`` (chmod 0o600 on POSIX).
+    ``browser.json``, and write it to ``target`` atomically (mode ``0o600`` on
+    POSIX from creation; falls back to ``Path.write_text`` on Windows where
+    POSIX mode bits don't apply).
 
-    Replaces the user-facing manual flow ``ytmusicapi browser`` for users who
-    are already logged into music.youtube.com in a supported browser.
+    On POSIX we write to a sibling temp file in ``target.parent`` and then
+    ``os.replace`` it into place. ``tempfile.mkstemp`` creates the temp file
+    with mode ``0o600`` from inception, and rename(2) preserves that mode
+    onto ``target`` — so the fresh secret never lives on disk at a more
+    permissive mode, even when ``target`` already existed at e.g. ``0o644``
+    from an older version of this code. Same-directory rename is required
+    for atomicity (cross-filesystem rename isn't atomic).
     """
     cookies = extract_youtube_cookies(browser)
     headers = _cookies_to_browser_json(cookies)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(headers, indent=2), encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(target, 0o600)
+    payload = json.dumps(headers, indent=2)
+    if sys.platform == "win32":
+        target.write_text(payload, encoding="utf-8")
+        return
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".browser.", suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_name, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
