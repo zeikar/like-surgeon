@@ -17,7 +17,14 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .snapshot import create_snapshot, list_snapshots
-from .ytmusic_client import AuthFileMissingError, UnexpectedResponseError, YTMusicClient
+from .ytmusic_client import (
+    SUPPORTED_BROWSERS,
+    AuthFileMissingError,
+    CookieExtractionError,
+    UnexpectedResponseError,
+    YTMusicClient,
+    write_browser_json_from_browser,
+)
 
 # All option/argument metadata is attached via ``Annotated[...]`` rather than
 # ``typer.Option(...)`` defaults so that ruff's ``B008`` (function call in
@@ -85,16 +92,47 @@ def init() -> None:
 
 
 @auth_app.command("ytmusic")
-def auth_ytmusic() -> None:
-    """Print instructions for setting up ytmusicapi browser-header auth.
-
-    OAuth is intentionally not supported in MVP 0.1 — see README roadmap.
-    """
+def auth_ytmusic(
+    from_browser: Annotated[
+        str | None,
+        typer.Option(
+            "--from-browser",
+            help=(
+                "Auto-extract cookies from this browser instead of running "
+                "the manual ytmusicapi paste flow. Supported (lowercase): "
+                f"{', '.join(SUPPORTED_BROWSERS)}. Requires you to be logged "
+                "into music.youtube.com in that browser."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Set up ytmusicapi browser-header auth for YouTube Music."""
     cfg = Config.load()
     cfg.ensure_app_dir()
     target = cfg.ytmusic_browser_path
+
+    if from_browser is not None:
+        # Normalize so `Chrome`, ` chrome `, and `CHROME` all dispatch the same
+        # way — `SUPPORTED_BROWSERS` is lowercase by design.
+        normalized = from_browser.strip().lower()
+        try:
+            write_browser_json_from_browser(normalized, target)
+        except CookieExtractionError as e:
+            _fail(str(e), code=2)
+        console.print(
+            f"[green]✓[/green] browser.json written to [cyan]{target}[/cyan].\n"
+            "[dim]Verify with: [/dim]"
+            "[cyan]uv run likesurgeon scan ytmusic --limit 1[/cyan]"
+        )
+        return
+
     console.print("[bold]YouTube Music browser-header setup[/bold]")
     console.print(
+        "Tip: skip the manual paste with "
+        "[cyan]uv run likesurgeon auth ytmusic --from-browser chrome[/cyan] "
+        "(or firefox / edge / etc.) if you're logged into music.youtube.com "
+        "in that browser.\n\n"
+        "Manual flow:\n"
         "1. Open YouTube Music in your browser and sign in.\n"
         "2. Open DevTools → Network → find an authenticated POST request to "
         "[cyan]/youtubei/v1/browse[/cyan] and copy its raw request headers.\n"
