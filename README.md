@@ -159,8 +159,11 @@ Re-scanning is fast (a 5000-like library is ~5 seconds for ytmusicapi and ~100 q
 ```bash
 uv run ruff check .
 uv run ruff format .
-uv run pytest
+uv run pytest               # unit suite; live e2e is deselected by default
+uv run pytest -m live       # opt-in: needs a logged-in music.youtube.com session
 ```
+
+The `live` test extracts cookies from a real browser, writes `browser.json`, and round-trips a `fetch_liked_songs` call against `music.youtube.com`. Set `LIKESURGEON_LIVE_BROWSER=firefox` (or any other supported name) to point it at a browser other than `chrome`.
 
 ## License
 
