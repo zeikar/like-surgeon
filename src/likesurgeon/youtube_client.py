@@ -78,7 +78,7 @@ def _is_quota_exceeded(exc: Any) -> bool:
         return False
     try:
         payload = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, TypeError):
         return False
     if not isinstance(payload, dict):
         return False
@@ -286,7 +286,6 @@ class YouTubeClient:
         from googleapiclient.errors import HttpError
 
         attempts: list[float] = [0.0, *self._RETRY_SLEEPS]
-        last_exc: Exception | None = None
         for delay in attempts:
             if delay:
                 time.sleep(delay)
@@ -299,22 +298,17 @@ class YouTubeClient:
                 if status == 404:
                     return "404"
                 if status is not None and 500 <= status < 600:
-                    last_exc = e
                     continue
                 # Non-retryable HTTP error (e.g. 401 auth, 400 bad request).
-                last_exc = e
                 break
-            except Exception as e:  # noqa: BLE001 — system-boundary catch
+            except Exception:  # noqa: BLE001 — system-boundary catch
                 # Transport-level error (timeout, socket reset, DNS failure,
                 # etc.). Per spec, retry just like 5xx — bounded by the
                 # `_RETRY_SLEEPS` budget so it can't spin indefinitely.
-                last_exc = e
                 continue
-        # Exhausted retries or non-retryable error.
-        if last_exc is not None and isinstance(last_exc, HttpError):
-            status = getattr(last_exc.resp, "status", None)
-            if status == 404:
-                return "404"
+        # All retries exhausted (5xx/transport) or hit a non-retryable HTTP
+        # error (e.g. 401 auth, 400 bad request). 404 is handled in-loop
+        # with an immediate `return "404"`, so it never reaches this point.
         return "failed"
 
     def fetch_video_statuses(self, video_ids: list[str]) -> dict[str, VideoStatus]:
