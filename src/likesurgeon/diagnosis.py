@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .compare import CompareResult, Match, UnmatchedItem
-from .models import Diagnosis, DiagnosisItem
+from .drift import DriftFinding
+from .models import Diagnosis, DiagnosisItem, SnapshotItem
 
 ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC = "possibly_missing_from_ytmusic"
 ISSUE_POINTER_DRIFT = "possible_pointer_drift"
@@ -109,7 +109,7 @@ def _unmatched_reason(item: UnmatchedItem) -> str:
 
 
 def build_unavailable_video_items(
-    diagnosis_id: int, snapshot_items: list[Any]
+    diagnosis_id: int, snapshot_items: list[SnapshotItem]
 ) -> list[DiagnosisItem]:
     """Build DiagnosisItem rows for SnapshotItems with is_available=False.
 
@@ -137,8 +137,8 @@ def build_unavailable_video_items(
 
 def build_metadata_drift_items(
     diagnosis_id: int,
-    findings: list[Any],
-    curr_items: list[Any],
+    findings: list[DriftFinding],
+    curr_items: list[SnapshotItem],
 ) -> list[DiagnosisItem]:
     """Build DiagnosisItem rows from DriftFinding objects.
 

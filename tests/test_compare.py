@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from likesurgeon.compare import (
     CompareInput,
     MatchKind,
@@ -338,3 +340,31 @@ def test_compare_likes_drift_silently_skips_when_only_one_snapshot(session) -> N
         .all()
     )
     assert rows == []
+
+
+def test_compare_likes_fails_when_a_source_has_no_snapshot(session) -> None:
+    """If either source has zero snapshots, _compare_and_persist must exit
+    with code 2 instead of building an empty diagnosis."""
+    import typer
+
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.snapshot import create_snapshot
+
+    # Only the YT Music side has a snapshot; YouTube side has none.
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+
+    with pytest.raises((typer.Exit, SystemExit)) as exc_info:
+        _compare_and_persist(session)
+
+    code = getattr(exc_info.value, "exit_code", None) or getattr(exc_info.value, "code", None)
+    assert code == 2
