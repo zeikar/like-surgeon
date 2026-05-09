@@ -61,6 +61,18 @@ def _fail(msg: str, code: int = 1) -> NoReturn:
     raise typer.Exit(code)
 
 
+def _resolve_region(cli_region: str | None, config_region: str | None) -> str | None:
+    """Pick the region to use for this scan.
+
+    Precedence: CLI flag > config.json > None. Both inputs are
+    pre-validated upstream (Config.load and the Typer parser callback
+    both call ``_validate_region`` and raise ``InvalidRegionError`` on
+    bad shape), so this helper sees only ``None`` or a valid alpha-2
+    code.
+    """
+    return cli_region or config_region
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"likesurgeon {__version__}")
