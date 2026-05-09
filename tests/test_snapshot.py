@@ -198,3 +198,59 @@ def test_create_snapshot_ytmusic_translator_leaves_columns_null(session) -> None
     rows = get_snapshot_items(session, snap.id)
     assert rows[0].is_available is None
     assert rows[0].unavailable_reason is None
+
+
+def test_latest_snapshots_for_source_returns_most_recent_first(session) -> None:
+    """Helper returns up to `limit` snapshots of the given source ordered
+    most-recent first."""
+    from likesurgeon.snapshot import create_snapshot, latest_snapshots_for_source
+
+    yt_items = [
+        {
+            "snippet": {"title": "T", "channelTitle": "C", "resourceId": {"videoId": "v1"}},
+            "contentDetails": {"videoId": "v1"},
+        }
+    ]
+    create_snapshot(session, "youtube_liked_videos", yt_items)
+    snap_b = create_snapshot(session, "youtube_liked_videos", yt_items)
+    snap_c = create_snapshot(session, "youtube_liked_videos", yt_items)
+
+    out = latest_snapshots_for_source(session, "youtube_liked_videos", limit=2)
+    assert [s.id for s in out] == [snap_c.id, snap_b.id]
+
+
+def test_latest_snapshots_for_source_filters_by_source(session) -> None:
+    """Only snapshots of the requested source are returned."""
+    from likesurgeon.snapshot import create_snapshot, latest_snapshots_for_source
+
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {"title": "Y", "channelTitle": "C", "resourceId": {"videoId": "v"}},
+                "contentDetails": {"videoId": "v"},
+            }
+        ],
+    )
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+
+    out = latest_snapshots_for_source(session, "ytmusic_liked_songs", limit=5)
+    assert len(out) == 1
+    assert out[0].source == "ytmusic_liked_songs"
+
+
+def test_latest_snapshots_for_source_returns_empty_when_no_snapshots(session) -> None:
+    from likesurgeon.snapshot import latest_snapshots_for_source
+
+    assert latest_snapshots_for_source(session, "youtube_liked_videos", limit=2) == []

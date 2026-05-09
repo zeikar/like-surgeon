@@ -255,3 +255,18 @@ def latest_snapshot(session: Session, source: str | None = None) -> Snapshot | N
         stmt = stmt.where(Snapshot.source == source)
     stmt = stmt.order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1)
     return session.scalar(stmt)
+
+
+def latest_snapshots_for_source(session: Session, source: str, *, limit: int = 2) -> list[Snapshot]:
+    """Return up to ``limit`` most-recent snapshots for ``source``,
+    most-recent first. Used by drift detection in `compare-likes` to
+    pull the (latest, previous) pair per source. Returns ``[]`` when the
+    source has no snapshots; returns a 1-list when only one exists.
+    """
+    stmt = (
+        select(Snapshot)
+        .where(Snapshot.source == source)
+        .order_by(Snapshot.created_at.desc(), Snapshot.id.desc())
+        .limit(limit)
+    )
+    return list(session.scalars(stmt).all())
