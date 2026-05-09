@@ -202,11 +202,18 @@ def scan_ytmusic(
 def scan_youtube_likes(
     limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
 ) -> None:
-    """Fetch YouTube liked videos (LL playlist) and store a snapshot."""
+    """Fetch YouTube liked videos (LL playlist) and store a snapshot.
+
+    Also runs a per-video availability check (`videos.list?part=status`) and
+    persists the result as `SnapshotItem.is_available` / `unavailable_reason`
+    so `compare-likes` can surface ghost videos. See spec "Status mapping
+    pipeline".
+    """
     from .youtube_client import (
         AuthorizationRequiredError,
         ClientSecretsMissingError,
         YouTubeClient,
+        attach_video_statuses,
     )
 
     cfg, factory = _bootstrap()
@@ -219,16 +226,30 @@ def scan_youtube_likes(
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
 
+    # Stage 1 + 2 + injection. attach_video_statuses mutates items in place
+    # so they can be passed straight to create_snapshot below.
+    video_ids: list[str] = []
+    for it in items:
+        snippet = it.get("snippet") or {}
+        content = it.get("contentDetails") or {}
+        vid = content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+        if vid:
+            video_ids.append(vid)
+
+    statuses = client.fetch_video_statuses(video_ids)
+    attach_video_statuses(items, statuses)
+
     with session_scope(factory) as session:
         snap = create_snapshot(session, "youtube_liked_videos", items)
-        # Quick music-candidate count for the post-scan summary.
         from .snapshot import get_snapshot_items
 
         scan_items = get_snapshot_items(session, snap.id)
         music_like = sum(1 for it in scan_items if it.is_music_candidate)
+        unavailable = sum(1 for it in scan_items if it.is_available is False)
         console.print(
             f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored "
-            f"({len(items)} videos, [bold]{music_like}[/bold] music-like)."
+            f"({len(items)} videos, [bold]{music_like}[/bold] music-like, "
+            f"[bold]{unavailable}[/bold] unavailable)."
         )
 
 

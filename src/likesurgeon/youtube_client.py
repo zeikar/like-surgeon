@@ -105,6 +105,51 @@ def _classify_status(status: dict[str, Any]) -> VideoStatus:
     return VideoStatus(is_available=True, reason=None)
 
 
+def disambiguate_video_status(status: VideoStatus, *, snippet_title: str) -> VideoStatus:
+    """Stage-2 disambiguator for `missing_from_videos_list` placeholders.
+
+    Non-placeholder statuses pass through unchanged. The placeholder is
+    rewritten using the `playlistItems.list` snippet title YouTube returns
+    when the caller can't access a referenced video — `"Private video"` and
+    `"Deleted video"` are documented placeholders; anything else falls
+    through to the conservative `"unavailable"` reason.
+    """
+    if status.reason != "missing_from_videos_list":
+        return status
+    title = (snippet_title or "").strip()
+    if title == "Private video":
+        return VideoStatus(is_available=False, reason="private")
+    if title == "Deleted video":
+        return VideoStatus(is_available=False, reason="deleted")
+    return VideoStatus(is_available=False, reason="unavailable")
+
+
+def attach_video_statuses(items: list[dict[str, Any]], statuses: dict[str, VideoStatus]) -> None:
+    """Mutate raw `playlistItems.list` entries in place: stage-2 disambiguate
+    `missing_from_videos_list` placeholders against snippet titles, then
+    inject the final status onto each item as `_likesurgeon_video_status`
+    *primitive dict* (NOT the VideoStatus dataclass — see spec
+    "Persistence" for why; the snapshot ingestion runs `json.dumps` on
+    `rec["raw"]` and would crash on a dataclass instance).
+
+    Items missing `video_id` are skipped (rare YT data quirk; nothing to
+    look up in `statuses` for them). The function does not return; it
+    mutates `items` so they can be passed straight to `create_snapshot`.
+    """
+    for it in items:
+        snippet = it.get("snippet") or {}
+        content = it.get("contentDetails") or {}
+        vid = content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+        if not vid:
+            continue
+        title = str(snippet.get("title") or "")
+        final = disambiguate_video_status(statuses[vid], snippet_title=title)
+        it["_likesurgeon_video_status"] = {
+            "is_available": final.is_available,
+            "reason": final.reason,
+        }
+
+
 class YouTubeClient:
     def __init__(
         self,

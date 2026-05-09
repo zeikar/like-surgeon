@@ -549,3 +549,81 @@ class _FakeResp:
     def __init__(self, status: int) -> None:
         self.status = status
         self.reason = "fail"  # set so str(HttpError) doesn't blow up if printed
+
+
+def test_disambiguate_status_via_snippet_title_private() -> None:
+    from likesurgeon.youtube_client import VideoStatus, disambiguate_video_status
+
+    placeholder = VideoStatus(is_available=False, reason="missing_from_videos_list")
+    out = disambiguate_video_status(placeholder, snippet_title="Private video")
+    assert out == VideoStatus(is_available=False, reason="private")
+
+
+def test_disambiguate_status_via_snippet_title_deleted() -> None:
+    from likesurgeon.youtube_client import VideoStatus, disambiguate_video_status
+
+    placeholder = VideoStatus(is_available=False, reason="missing_from_videos_list")
+    out = disambiguate_video_status(placeholder, snippet_title="Deleted video")
+    assert out == VideoStatus(is_available=False, reason="deleted")
+
+
+def test_disambiguate_status_falls_through_to_unavailable() -> None:
+    """Region-restricted, age-gated, weird API state → conservative
+    'unavailable' rather than misclassifying."""
+    from likesurgeon.youtube_client import VideoStatus, disambiguate_video_status
+
+    placeholder = VideoStatus(is_available=False, reason="missing_from_videos_list")
+    out = disambiguate_video_status(placeholder, snippet_title="K-pop hit (region-locked)")
+    assert out == VideoStatus(is_available=False, reason="unavailable")
+
+
+def test_disambiguate_status_passes_through_non_placeholder() -> None:
+    """Non-placeholder VideoStatus is returned unchanged — disambiguation
+    only applies to the missing-from-response case."""
+    from likesurgeon.youtube_client import VideoStatus, disambiguate_video_status
+
+    available = VideoStatus(is_available=True, reason=None)
+    rejected = VideoStatus(is_available=False, reason="rejected")
+    failed = VideoStatus(is_available=None, reason="status_check_failed")
+    assert disambiguate_video_status(available, snippet_title="anything") == available
+    assert disambiguate_video_status(rejected, snippet_title="Private video") == rejected
+    assert disambiguate_video_status(failed, snippet_title="Deleted video") == failed
+
+
+def test_attach_video_statuses_injects_disambiguated_dict() -> None:
+    """End-to-end of stage-2 + injection: placeholder + 'Private video'
+    title → injected dict says private; available status passes through."""
+    from likesurgeon.youtube_client import VideoStatus, attach_video_statuses
+
+    items = [
+        {
+            "snippet": {"title": "Private video", "resourceId": {"videoId": "p1"}},
+            "contentDetails": {"videoId": "p1"},
+        },
+        {
+            "snippet": {"title": "Real Title", "resourceId": {"videoId": "ok"}},
+            "contentDetails": {"videoId": "ok"},
+        },
+        {
+            "snippet": {"title": "no id"},  # missing video_id — skipped
+            "contentDetails": {},
+        },
+    ]
+    statuses = {
+        "p1": VideoStatus(is_available=False, reason="missing_from_videos_list"),
+        "ok": VideoStatus(is_available=True, reason=None),
+    }
+    attach_video_statuses(items, statuses)
+
+    # Injected as PRIMITIVE DICT (not VideoStatus dataclass) so json.dumps
+    # over rec["raw"] in snapshot ingestion can't crash.
+    assert items[0]["_likesurgeon_video_status"] == {
+        "is_available": False,
+        "reason": "private",
+    }
+    assert items[1]["_likesurgeon_video_status"] == {
+        "is_available": True,
+        "reason": None,
+    }
+    # Item without a video_id had nothing to inject.
+    assert "_likesurgeon_video_status" not in items[2]
