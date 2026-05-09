@@ -368,3 +368,50 @@ def test_compare_likes_fails_when_a_source_has_no_snapshot(session) -> None:
 
     code = getattr(exc_info.value, "exit_code", None) or getattr(exc_info.value, "code", None)
     assert code == 2
+
+
+def test_compare_likes_no_ghost_findings_for_pre_0_3_data(session) -> None:
+    """Pre-0.3 snapshots have `is_available=None` (unknown). The ghost
+    finder must produce zero findings for them, not flag every row.
+    Regression guard: a code change that flipped the predicate to
+    `is not True` would mis-classify all legacy data as ghosts."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+    # YouTube snapshot WITHOUT `_likesurgeon_video_status` — translator
+    # leaves both columns NULL, mirroring a 0.2 snapshot.
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Legacy",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "v1"},
+                },
+                "contentDetails": {"videoId": "v1"},
+            }
+        ],
+    )
+
+    diagnosis_id = _compare_and_persist(session).diagnosis_id
+    rows = (
+        session.query(DiagnosisItem)
+        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_UNAVAILABLE_VIDEO)
+        .all()
+    )
+    assert rows == []

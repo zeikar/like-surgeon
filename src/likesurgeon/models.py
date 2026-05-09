@@ -155,6 +155,11 @@ class DiagnosisItem(Base):
         ``video_id`` nor ``canonical_key`` exact.
       - ``ytmusic_only`` — YT Music has it but no YT like (informational —
         often just "user never liked it on YouTube").
+      - ``unavailable_video`` — the underlying YouTube video is no longer
+        playable (deleted/private/unavailable), detected at scan time via
+        ``videos.list``.
+      - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
+        of one source with meaningfully different title or artists.
     """
 
     __tablename__ = "diagnosis_items"
