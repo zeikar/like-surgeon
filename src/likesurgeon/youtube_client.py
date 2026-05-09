@@ -321,7 +321,7 @@ class YouTubeClient:
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
 
     def _videos_list(self, *, ids: list[str]) -> dict[str, Any]:
-        """Thin wrapper around `videos.list?part=status&id=<ids>`.
+        """Thin wrapper around `videos.list?part=status,contentDetails&id=<ids>`.
 
         Split out so tests can monkeypatch this single seam without faking
         the entire `googleapiclient` discovery surface. Production callers
@@ -383,7 +383,7 @@ class YouTubeClient:
     def fetch_video_statuses(
         self, video_ids: list[str], *, user_region: str | None = None
     ) -> dict[str, VideoStatus]:
-        """Stage-1 status check via batched `videos.list?part=status`.
+        """Stage-1 status check via batched `videos.list?part=status,contentDetails`.
 
         Returns one entry per input ID. See spec "Status mapping pipeline"
         and "Batch failure policy" for the full semantics.
