@@ -167,6 +167,10 @@ uv run pytest -m live       # opt-in: needs a logged-in music.youtube.com sessio
 
 The `live` test extracts cookies from a real browser, writes `browser.json`, and round-trips a `fetch_liked_songs` call against `music.youtube.com`. Set `LIKESURGEON_LIVE_BROWSER=firefox` (or any other supported name) to point it at a browser other than `chrome`.
 
+For deeper context:
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system overview, module responsibilities, DB schema, key design decisions.
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — test strategy, auth setup details, debugging tips, release process.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

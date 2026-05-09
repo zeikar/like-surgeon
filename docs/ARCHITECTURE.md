@@ -1,0 +1,104 @@
+# Architecture
+
+likesurgeon is a local-first, read-only scanner that diagnoses inconsistencies between your YouTube Music likes and your YouTube liked videos. No server, no destructive actions, no third-party data flow.
+
+## System overview
+
+```
+┌──────────────┐         ┌──────────────┐
+│ YouTube Music│         │ YouTube Data │
+│ (ytmusicapi) │         │   API v3     │
+└──────┬───────┘         └──────┬───────┘
+       │ scan ytmusic           │ scan youtube-likes
+       ▼                        ▼
+   ┌──────────────────────────────────┐
+   │  ~/.like-surgeon/                │
+   │   ├─ like-surgeon.sqlite (state) │
+   │   ├─ browser.json     (auth)     │
+   │   ├─ youtube-token.json (auth)   │
+   │   └─ config.json      (settings) │
+   └──────────────────────────────────┘
+                  │
+                  ▼ compare-likes
+       ┌────────────────────┐
+       │ Diagnosis +        │
+       │ DiagnosisItem rows │
+       └────────────────────┘
+                  │
+                  ▼ issues / doctor
+            user-facing output
+```
+
+Two providers feed into one local SQLite database. Every snapshot is point-in-time and immutable. `compare-likes` is the only computation that crosses sources; everything else is per-source or read-only.
+
+## Data flow
+
+1. **Auth** — `auth ytmusic` writes `browser.json` from a logged-in browser cookie store. `auth youtube` runs the OAuth Desktop-app consent flow and persists `youtube-token.json`.
+2. **Scan** — `scan ytmusic` / `scan youtube-likes` fetch the user's likes, translate provider dicts via per-source translators in [src/likesurgeon/snapshot.py](../src/likesurgeon/snapshot.py), upsert `Track` rows (deduplicated by `(source, dedupe_key)`), and write a fresh `Snapshot` plus N `SnapshotItem` rows. Each snapshot is independent — old ones are never mutated.
+3. **Compare** — `compare-likes` loads the latest snapshot from each source, runs the three-stage matcher (`video_id` → `canonical_key` → RapidFuzz fuzzy), classifies findings into buckets, and persists the run as a `Diagnosis` plus per-finding `DiagnosisItem` rows.
+4. **Inspect** — `issues`, `doctor`, `diff`, and `export` all read from local DB only. No outbound network.
+
+## Modules
+
+| Module | Responsibility | Notes |
+|---|---|---|
+| [`cli.py`](../src/likesurgeon/cli.py) | Typer entrypoints, command wiring, output formatting | Read-only except for local DB writes |
+| [`config.py`](../src/likesurgeon/config.py) | App-dir paths, env overrides, region validation, `config.json` loader | `Config` is a frozen dataclass; `_validate_region` enforces `^[A-Z]{2}$` |
+| [`db.py`](../src/likesurgeon/db.py) | SQLAlchemy engine, session factory, schema init | `init_db` creates tables on first run; no migrations |
+| [`models.py`](../src/likesurgeon/models.py) | ORM tables: `Track`, `Snapshot`, `SnapshotItem`, `Diagnosis`, `DiagnosisItem` | See "Database schema" below |
+| [`ytmusic_client.py`](../src/likesurgeon/ytmusic_client.py) | Browser-header auth + ytmusicapi wrapper | Cookie extraction via [browser-cookie3](https://pypi.org/project/browser-cookie3/) |
+| [`youtube_client.py`](../src/likesurgeon/youtube_client.py) | OAuth + YouTube Data API v3 wrapper | `_videos_list` fetches `part=status,contentDetails` for ghost detection |
+| [`snapshot.py`](../src/likesurgeon/snapshot.py) | Translator dispatch + `Track`/`Snapshot`/`SnapshotItem` writer | Only writer of `Track` rows |
+| [`classify.py`](../src/likesurgeon/classify.py) | Music-candidate heuristic for YouTube videos | Pure-functional |
+| [`normalize.py`](../src/likesurgeon/normalize.py) | Canonical-key generation (lowercase, strip decorations) | Pure-functional |
+| [`compare.py`](../src/likesurgeon/compare.py) | Three-stage cross-source matcher → `CompareResult` | Pure-functional, multiset semantics |
+| [`drift.py`](../src/likesurgeon/drift.py) | Snapshot-pair metadata-drift detector | Same-source, two snapshots |
+| [`diagnosis.py`](../src/likesurgeon/diagnosis.py) | `CompareResult` → `Diagnosis` + `DiagnosisItem` row writer | |
+| [`diff.py`](../src/likesurgeon/diff.py) | Two-snapshot membership diff (added / removed / shared) | Identity = `track_id` |
+| [`export.py`](../src/likesurgeon/export.py) | Snapshot → JSON (other formats are future plug-ins) | |
+| [`doctor.py`](../src/likesurgeon/doctor.py) | Health summary across snapshots + latest diagnosis | Read-only |
+| [`dtos.py`](../src/likesurgeon/dtos.py) | Pydantic DTOs for CLI/JSON serialization | |
+
+## Database schema
+
+Five tables, all SQLite-backed at `~/.like-surgeon/like-surgeon.sqlite`:
+
+- **`tracks`** — deduplicated identity per source. PK `id`. UNIQUE `(source, dedupe_key)` where `dedupe_key` is `video_id` when present, else `canon:<canonical_key>`. Holds the *latest* known metadata for an identity (overwritten on each scan).
+- **`snapshots`** — point-in-time scan capture. `(source, created_at, raw_count)`. Immutable.
+- **`snapshot_items`** — membership rows linking `snapshot_id` × `track_id` × `position`. **Holds frozen point-in-time metadata**: title, artists, album, duration, etc. as the provider returned them at scan time. This is what makes `export <snapshot_id>` faithful even after a future re-credit.
+  - `is_music_candidate` / `music_candidate_score` / `music_candidate_reason` — populated for YouTube rows only (ytmusic is always music).
+  - `is_available` / `unavailable_reason` — ghost detection result, populated for YouTube rows only. Reasons: `deleted`, `rejected`, `region_blocked` (0.3.1+).
+- **`diagnoses`** — one row per `compare-likes` run. References both source snapshots.
+- **`diagnosis_items`** — findings: `issue_type` ∈ {`possibly_missing_from_ytmusic`, `possible_pointer_drift`, `ytmusic_only`, `unavailable_video`, `metadata_drift`}, plus `confidence`, `reason`, optional `source_track_id` / `related_track_id`.
+
+**No migration framework.** During the 0.x series the schema can change between releases — drop `~/.like-surgeon/like-surgeon.sqlite` and re-scan if you upgrade across a breaking change. The DB only holds derived data; no original-source state is lost.
+
+## Key design decisions
+
+**Why ghost detection runs at scan time, not compare time.** `videos.list?part=status,contentDetails` is cheap (1 quota unit per 50-video batch) and the ghost reason is point-in-time data that belongs frozen on `SnapshotItem`. Doing it at compare time would either re-issue the API call or read potentially stale `Track` rows; neither matches the snapshot guarantee.
+
+**Why region validation fails fast (and where).** A `config.json` with `{"region": "KOREA"}` would silently misclassify every video with a non-empty `regionRestriction.allowed` list as `region_blocked`. To prevent that, [`_validate_region`](../src/likesurgeon/config.py) enforces `^[A-Z]{2}$` and raises `InvalidRegionError` at three layers:
+1. `Config.load()` (config-time) — caught in `_safe_config_load` → `_fail(code=2)`
+2. Typer `_parse_region_flag` callback (`--region` CLI arg) — converted to `BadParameter` (exit 2)
+3. The CLI prints a one-time warning when no region is configured at all
+
+The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid codes pass through (known limitation, low real-world impact).
+
+**Why `--region` is one-off, never persisted.** A CLI flag is for experiments. Persisting it would make scans non-reproducible across invocations and add an opaque "where did this come from" question. If you want it permanent, write it to `config.json`.
+
+**Why `Track` is mutable but `SnapshotItem` is frozen.** `Track` is identity (does this video exist on this provider?), so it makes sense for the row to track the latest title / album / duration. `SnapshotItem` is history (what did this look like when I scanned?), and the whole point of "backup" is that a re-credit on the provider doesn't rewrite your archive.
+
+**Why `compare.py` is pure-functional.** Cross-source matching is the most complex logic in the codebase. Keeping it I/O-free means it's exhaustively unit-testable with lightweight stand-in items (no DB, no fixtures), which is exactly what `tests/test_compare.py` does.
+
+**Why two YouTube clients.** YouTube Music has no official public API; `ytmusicapi` is community-maintained and uses browser-cookie auth. YouTube Data API v3 is official, OAuth-based, quota-bounded. The two clients have different failure modes (cookie staleness vs. token refresh vs. quota), so they live in separate modules with provider-specific exception types.
+
+## Roadmap context
+
+- **0.1**: read-only YT Music scanner + snapshots
+- **0.2**: YouTube Data API + classifier + cross-source `compare-likes` / `issues`
+- **0.2.1**: ytmusicapi OAuth exploration — abandoned (see `docs/notes/ytmusic-oauth-tvhtml5-fallback.md`)
+- **0.2.2**: `--from-browser` cookie extraction (no more DevTools paste)
+- **0.3**: matching engine (three-stage, multiset semantics, ghost detection, drift)
+- **0.3.1**: region-aware ghost detection (`regionRestriction` + `config.json`)
+- **0.4**: write actions for cross-source like sync (planned, source-of-truth = YouTube)
+- **1.0**: local web UI / Electron app
