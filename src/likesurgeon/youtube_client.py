@@ -135,6 +135,13 @@ def attach_video_statuses(items: list[dict[str, Any]], statuses: dict[str, Video
     Items missing `video_id` are skipped (rare YT data quirk; nothing to
     look up in `statuses` for them). The function does not return; it
     mutates `items` so they can be passed straight to `create_snapshot`.
+
+    Precondition: ``statuses`` MUST contain a key for every item whose
+    ``video_id`` is non-empty. ``fetch_video_statuses`` guarantees this
+    when it's fed the same video_ids the caller derived from ``items``.
+    A missing key here will raise ``KeyError`` rather than silently drop
+    the augmentation — that's intentional, since silent drops would let
+    a partially-augmented snapshot reach the DB.
     """
     for it in items:
         snippet = it.get("snippet") or {}
