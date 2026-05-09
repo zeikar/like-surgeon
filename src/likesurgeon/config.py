@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,31 @@ YTMUSIC_BROWSER_FILENAME = "browser.json"
 YOUTUBE_OAUTH_CLIENT_FILENAME = "youtube-oauth-client.json"
 YOUTUBE_TOKEN_FILENAME = "youtube-token.json"
 ENV_HOME = "LIKE_SURGEON_HOME"
+CONFIG_FILENAME = "config.json"
+
+_REGION_PATTERN = re.compile(r"^[A-Z]{2}$")
+
+
+class InvalidRegionError(ValueError):
+    """Raised when a region value is not ISO 3166-1 alpha-2 (^[A-Z]{2}$).
+
+    Surfaced fail-fast at config load and CLI flag parse so a typo (e.g.
+    ``KOREA``, ``kr\\nx``, an empty string after trim) can't silently
+    disable region detection — that would let a user think they were
+    checking region-blocks while every video skipped the check.
+    """
+
+
+def _validate_region(value: str) -> str:
+    """Normalize-then-validate. Strips, uppercases, then enforces the
+    strict alpha-2 shape. Raises ``InvalidRegionError`` on any failure.
+    """
+    norm = value.strip().upper()
+    if not _REGION_PATTERN.match(norm):
+        raise InvalidRegionError(
+            f"region must be an ISO 3166-1 alpha-2 country code (e.g. 'KR'), got {value!r}"
+        )
+    return norm
 
 
 @dataclass(frozen=True)
