@@ -1,7 +1,9 @@
 # YT Music OAuth → TVHTML5 fallback (research note)
 
-**Status:** observed, not implemented. Park here for revival if a future cookie-based
-fallback (e.g. `browser-cookie3` extraction → ytmusicapi `browser` auth) also fails.
+**Status:** archived historical probe, not implemented. The browser-cookie3
+extraction path mentioned below as the "next-planned approach" shipped in
+0.2.2 and is now the primary auth flow. Park this note for revival only
+if cookie extraction collapses across all supported browsers.
 
 **Date observed:** 2026-05-07
 
@@ -98,18 +100,28 @@ Information loss vs ytmusicapi's web shape:
 
 ## When to revisit
 
-Consider this fallback if the next planned approach hits a wall:
+The `browser-cookie3` extraction path described in option 1 below shipped
+in 0.2.2 ([`auth ytmusic --from-browser`](../../src/likesurgeon/ytmusic_client.py)) and
+is the working primary flow as of 0.3.1. This TVHTML5 fallback only
+becomes relevant if cookie extraction collapses across every supported
+browser — not a near-term concern.
 
 1. **`browser-cookie3` cookie extraction → ytmusicapi `browser` auth.** Pulls
    live cookies from the user's logged-in browser each scan, sidestepping
    manual `browser.json` setup *and* OAuth's clientName mismatch. Adds
    `browser-cookie3` dep but reuses ytmusicapi's mature data-path parser.
+   **Shipped in 0.2.2.**
 2. If (1) breaks because the user can't grant filesystem access to a
    browser cookie store (sandboxed environment, headless server, etc.) or
    the browser DB schema flips, this TVHTML5 path is the next-cleanest
    option that keeps OAuth.
 
 ## Reproduction script
+
+> **Note:** the script imports `load_oauth_credentials` from
+> `likesurgeon.ytmusic_client`, which was removed when the OAuth path was
+> abandoned. To rerun, restore that helper from git history (around the
+> 0.2.1 explorations) or rewrite to construct `OAuthCredentials` inline.
 
 ```python
 import time, requests

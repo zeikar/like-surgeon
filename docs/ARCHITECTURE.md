@@ -44,7 +44,7 @@ Two providers feed into one local SQLite database. Every snapshot is point-in-ti
 |---|---|---|
 | [`cli.py`](../src/likesurgeon/cli.py) | Typer entrypoints, command wiring, output formatting | Read-only except for local DB writes |
 | [`config.py`](../src/likesurgeon/config.py) | App-dir paths, env overrides, region validation, `config.json` loader | `Config` is a frozen dataclass; `_validate_region` enforces `^[A-Z]{2}$` |
-| [`db.py`](../src/likesurgeon/db.py) | SQLAlchemy engine, session factory, schema init | `init_db` creates tables on first run; no migrations |
+| [`db.py`](../src/likesurgeon/db.py) | SQLAlchemy engine, session factory, schema init | `init_db` creates tables on first run; `_migrate_in_place` adds new nullable columns idempotently on every engine build |
 | [`models.py`](../src/likesurgeon/models.py) | ORM tables: `Track`, `Snapshot`, `SnapshotItem`, `Diagnosis`, `DiagnosisItem` | See "Database schema" below |
 | [`ytmusic_client.py`](../src/likesurgeon/ytmusic_client.py) | Browser-header auth + ytmusicapi wrapper | Cookie extraction via [browser-cookie3](https://pypi.org/project/browser-cookie3/) |
 | [`youtube_client.py`](../src/likesurgeon/youtube_client.py) | OAuth + YouTube Data API v3 wrapper | `_videos_list` fetches `part=status,contentDetails` for ghost detection |
@@ -71,7 +71,7 @@ Five tables, all SQLite-backed at `~/.like-surgeon/like-surgeon.sqlite`:
 - **`diagnoses`** — one row per `compare-likes` run. References both source snapshots.
 - **`diagnosis_items`** — findings: `issue_type` ∈ {`possibly_missing_from_ytmusic`, `possible_pointer_drift`, `ytmusic_only`, `unavailable_video`, `metadata_drift`}, plus `confidence`, `reason`, optional `source_track_id` / `related_track_id`.
 
-**No migration framework.** During the 0.x series the schema can change between releases — drop `~/.like-surgeon/like-surgeon.sqlite` and re-scan if you upgrade across a breaking change. The DB only holds derived data; no original-source state is lost.
+**Lightweight in-place migration only.** [`_migrate_in_place`](../src/likesurgeon/db.py) (called from `make_engine` on every CLI run) idempotently issues `ALTER TABLE ... ADD COLUMN` for nullable columns added after a table was first created — that's how 0.3's `is_available` / `unavailable_reason` reach pre-0.3 DBs without forcing a re-scan. There is no Alembic-style framework, so any **breaking** change during 0.x (renamed columns, type changes, FK reshuffles) requires dropping `~/.like-surgeon/like-surgeon.sqlite` and re-scanning. The DB only holds derived data; no original-source state is lost.
 
 ## Key design decisions
 

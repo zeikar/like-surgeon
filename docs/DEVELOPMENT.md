@@ -27,13 +27,14 @@ uv run ruff format .
 
 Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<module>.py`. Three flavors:
 
-- **Unit** — pure-functional modules (`classify`, `normalize`, `compare`, `drift`, `diff`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network.
-- **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_doctor`, `test_export` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
+- **Unit** — pure-functional modules (`classify`, `normalize`, `compare`, `drift`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network.
+- **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
   ```python
   @pytest.fixture
   def session() -> Iterator[Session]:
       """In-memory SQLite session, schema initialized."""
   ```
+  `diff_snapshots` takes a `Session` and reads snapshot/items rows directly, so it lives with the integration tier rather than the pure modules above.
 - **CLI wiring** — `test_cli` uses Typer's `CliRunner` against a `tmp_path` home (`LIKE_SURGEON_HOME` env override) and monkeypatched fakes for `YouTubeClient` / `YTMusicClient`. The pattern: replace the provider class on the module the command imports it from, then assert the captured kwargs.
 - **Live** — `test_ytmusic_client_live.py` is opt-in (`@pytest.mark.live`), deselected by default via `pyproject.toml`. Set `LIKESURGEON_LIVE_BROWSER=firefox` to point at a non-default browser:
   ```bash
@@ -111,7 +112,9 @@ So you can comfortably re-scan dozens of times per day. If you hit the quota, th
 
 ### Schema lifecycle
 
-`init_db(engine)` (called from `_bootstrap`) creates all tables on first run. **No migration framework.** During the 0.x series, schema changes between releases may require dropping the local DB:
+`init_db(engine)` (called from `_bootstrap`) creates all tables on first run. There is no Alembic-style migration framework, but `make_engine` calls [`_migrate_in_place`](../src/likesurgeon/db.py) on every connection, which idempotently issues `ALTER TABLE ... ADD COLUMN` for nullable columns introduced after a table was first created (e.g. `snapshot_items.is_available` / `unavailable_reason` from 0.3). Existing rows aren't rewritten — the new columns just default to NULL.
+
+This handles **additive** changes only. For breaking schema changes (renamed columns, type changes, FK reshuffles) during the 0.x series, drop the DB and re-scan:
 
 ```bash
 rm ~/.like-surgeon/like-surgeon.sqlite
@@ -150,8 +153,10 @@ For larger lookups (`Track.id.in_(...)`), the CLI batches into chunks of 500 to 
 
 ```bash
 uv run likesurgeon scan youtube-likes --limit 50
-uv run likesurgeon scan ytmusic           # no --limit; ytmusic returns the full list
+uv run likesurgeon scan ytmusic --limit 50
 ```
+
+Both default to `--limit 5000`.
 
 Use small limits for quick iteration when working on classification, ghost detection, or matching changes.
 
@@ -190,7 +195,7 @@ git push -u origin feat/<short-name>
 gh pr create --base main --title "..." --body "..."
 ```
 
-CI is GitHub Actions running `pytest -q` + `ruff check` + `ruff format --check` on the default suite (live tests skipped). PR descriptions follow the pattern in recent merged PRs (Summary + Test plan).
+CI is GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) running `ruff check`, `ruff format --check`, and `pytest` on Ubuntu / Python 3.13 for every push to main and every PR. Live tests stay deselected (the runner has no logged-in browser). PR descriptions follow the pattern in recent merged PRs (Summary + Test plan).
 
 ## Release process
 
