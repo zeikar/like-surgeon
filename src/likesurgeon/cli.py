@@ -557,7 +557,10 @@ def issues(
     """List issues from the latest diagnosis."""
     import json as jsonlib
 
+    from sqlalchemy import select
+
     from .diagnosis import diagnosis_items, latest_diagnosis
+    from .models import Track
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
@@ -574,9 +577,28 @@ def issues(
             return
         items = diagnosis_items(session, diag.id)
 
-    if type is not None:
-        items = [it for it in items if it.issue_type == type]
-    items = [it for it in items if it.confidence >= min_confidence]
+        if type is not None:
+            items = [it for it in items if it.issue_type == type]
+        items = [it for it in items if it.confidence >= min_confidence]
+
+        # Bulk-fetch the Tracks referenced by the filtered items so we can
+        # surface video_id alongside the internal track_id PKs. Done before
+        # leaving the session so the lookup can use the same connection.
+        track_ids: set[int] = {
+            tid
+            for it in items
+            for tid in (it.source_track_id, it.related_track_id)
+            if tid is not None
+        }
+        video_id_by_track: dict[int, str | None] = {}
+        if track_ids:
+            rows = session.scalars(select(Track).where(Track.id.in_(track_ids))).all()
+            video_id_by_track = {t.id: t.video_id for t in rows}
+
+    def _vid(track_id: int | None) -> str | None:
+        if track_id is None:
+            return None
+        return video_id_by_track.get(track_id)
 
     if fmt == "json":
         payload = {
@@ -588,7 +610,9 @@ def issues(
                     "confidence": it.confidence,
                     "reason": it.reason,
                     "source_track_id": it.source_track_id,
+                    "source_video_id": _vid(it.source_track_id),
                     "related_track_id": it.related_track_id,
+                    "related_video_id": _vid(it.related_track_id),
                     "status": it.status,
                 }
                 for it in items
@@ -601,16 +625,16 @@ def issues(
     table.add_column("ID", justify="right")
     table.add_column("Type")
     table.add_column("Conf", justify="right")
-    table.add_column("Source TID", justify="right")
-    table.add_column("Related TID", justify="right")
+    table.add_column("Source VID")
+    table.add_column("Related VID")
     table.add_column("Reason")
     for it in items:
         table.add_row(
             str(it.id),
             it.issue_type,
             f"{it.confidence:.2f}",
-            str(it.source_track_id) if it.source_track_id is not None else "",
-            str(it.related_track_id) if it.related_track_id is not None else "",
+            _vid(it.source_track_id) or "",
+            _vid(it.related_track_id) or "",
             it.reason,
         )
     if not items:
