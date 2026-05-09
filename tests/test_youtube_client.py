@@ -346,3 +346,206 @@ def test_fetch_video_statuses_batches_by_50(monkeypatch) -> None:
     assert len(calls) == 3
     assert [len(c) for c in calls] == [50, 50, 20]
     assert set(out.keys()) == set(video_ids)
+
+
+def test_fetch_video_statuses_retries_on_5xx(monkeypatch) -> None:
+    """5xx → retry. Two failures then success → all IDs return real statuses,
+    no `status_check_failed`."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    attempts = {"n": 0}
+
+    def fake(*, ids: list[str]) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            from googleapiclient.errors import HttpError
+
+            raise HttpError(_FakeResp(503), b"server")
+        return {
+            "items": [
+                {"id": vid, "status": {"uploadStatus": "processed", "privacyStatus": "public"}}
+                for vid in ids
+            ]
+        }
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))  # zero-delay test
+
+    out = client.fetch_video_statuses(["a", "b"])
+    assert out["a"] == VideoStatus(is_available=True, reason=None)
+    assert out["b"] == VideoStatus(is_available=True, reason=None)
+    assert attempts["n"] == 3
+
+
+def test_fetch_video_statuses_marks_batch_failed_after_retry_exhaustion(
+    monkeypatch,
+) -> None:
+    """Persistent 5xx → batch items get status_check_failed, scan continues."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def always_5xx(*, ids: list[str]) -> dict:
+        from googleapiclient.errors import HttpError
+
+        raise HttpError(_FakeResp(503), b"down")
+
+    monkeypatch.setattr(client, "_videos_list", always_5xx)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a", "b"])
+    assert out["a"] == VideoStatus(is_available=None, reason="status_check_failed")
+    assert out["b"] == VideoStatus(is_available=None, reason="status_check_failed")
+
+
+def test_fetch_video_statuses_quota_exceeded_short_circuits_remaining(
+    monkeypatch,
+) -> None:
+    """403 quotaExceeded → bail entire status-check phase. First batch's
+    items are real, remaining batches' items get status_check_failed."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    seen: list[list[str]] = []
+
+    # Realistic Google API quota body — matches what `videos.list` returns
+    # when the daily quota is exhausted. The HTTP `reason` header is just
+    # "Forbidden"; the `quotaExceeded` reason lives inside the JSON body.
+    quota_body = (
+        b'{"error":{"code":403,"errors":[{"reason":"quotaExceeded","domain":"youtube.quota"}]}}'
+    )
+
+    def fake(*, ids: list[str]) -> dict:
+        seen.append(list(ids))
+        if len(seen) == 1:
+            return {
+                "items": [
+                    {"id": vid, "status": {"uploadStatus": "processed", "privacyStatus": "public"}}
+                    for vid in ids
+                ]
+            }
+        from googleapiclient.errors import HttpError
+
+        raise HttpError(_FakeResp(403), quota_body)
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_STATUS_BATCH_SIZE", 2)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a", "b", "c", "d"])
+    assert out["a"] == VideoStatus(is_available=True, reason=None)
+    assert out["b"] == VideoStatus(is_available=True, reason=None)
+    assert out["c"] == VideoStatus(is_available=None, reason="status_check_failed")
+    assert out["d"] == VideoStatus(is_available=None, reason="status_check_failed")
+    # Only the first failing batch is attempted (no retries on quota).
+    assert len(seen) == 2
+
+
+def test_fetch_video_statuses_retries_on_transport_error(monkeypatch) -> None:
+    """Per spec 'Network error / HTTP 5xx': non-HttpError transport
+    failures (TimeoutError, ConnectionResetError, etc.) retry just like
+    5xx. Two failures then success → all IDs return real statuses, no
+    `status_check_failed`."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    attempts = {"n": 0}
+
+    def fake(*, ids: list[str]) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise TimeoutError("network down")
+        return {
+            "items": [
+                {"id": vid, "status": {"uploadStatus": "processed", "privacyStatus": "public"}}
+                for vid in ids
+            ]
+        }
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a", "b"])
+    assert out["a"] == VideoStatus(is_available=True, reason=None)
+    assert out["b"] == VideoStatus(is_available=True, reason=None)
+    assert attempts["n"] == 3
+
+
+def test_fetch_video_statuses_403_with_unexpected_body_falls_through_to_failed(
+    monkeypatch,
+) -> None:
+    """403 whose body isn't the documented `{"error": {"errors": [...]}}`
+    shape (e.g. plain string body, JSON with `error` as a non-dict, errors
+    list of non-dicts) must NOT crash _is_quota_exceeded — it falls through
+    to the generic `status_check_failed` path so one weird response can't
+    abort the whole scan."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        from googleapiclient.errors import HttpError
+
+        # Malformed: `error` is a string, not the expected dict.
+        raise HttpError(_FakeResp(403), b'{"error": "Forbidden"}')
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a", "b"])
+    assert out["a"] == VideoStatus(is_available=None, reason="status_check_failed")
+    assert out["b"] == VideoStatus(is_available=None, reason="status_check_failed")
+
+
+def test_fetch_video_statuses_404_batch_size_one_treats_as_deleted(
+    monkeypatch,
+) -> None:
+    """404 videoNotFound on a 1-ID batch → that ID is deleted."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        from googleapiclient.errors import HttpError
+
+        raise HttpError(_FakeResp(404), b"not found")
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_STATUS_BATCH_SIZE", 1)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["bogus"])
+    assert out["bogus"] == VideoStatus(is_available=False, reason="deleted")
+
+
+def test_fetch_video_statuses_404_multi_id_batch_marks_all_failed(
+    monkeypatch,
+) -> None:
+    """404 on a >1-ID batch is undocumented but defensive — mark whole
+    batch status_check_failed without binary-splitting."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        from googleapiclient.errors import HttpError
+
+        raise HttpError(_FakeResp(404), b"weird")
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_STATUS_BATCH_SIZE", 5)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a", "b", "c"])
+    for v in ("a", "b", "c"):
+        assert out[v] == VideoStatus(is_available=None, reason="status_check_failed")
+
+
+# Tiny test helper: mimics googleapiclient.errors.HttpError's resp object.
+# Only `.status` is read by the production retry/quota logic — the actual
+# error reason now lives in the HTTP body bytes (see _is_quota_exceeded).
+class _FakeResp:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.reason = "fail"  # set so str(HttpError) doesn't blow up if printed

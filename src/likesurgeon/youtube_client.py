@@ -53,6 +53,45 @@ class VideoStatus:
     reason: str | None
 
 
+def _is_quota_exceeded(exc: Any) -> bool:
+    """Detect Google API quota exhaustion from the JSON error body.
+
+    The HTTP-level `e.resp.reason` is just "Forbidden" for any 403, so we
+    parse `e.content` (bytes) instead — the body's `error.errors[].reason`
+    field is what carries `quotaExceeded` / `dailyLimitExceeded` /
+    `rateLimitExceeded`.
+
+    Defensive at every shape boundary: non-403 responses, missing bodies,
+    non-UTF-8 bytes, malformed JSON, or any payload whose shape doesn't
+    precisely match `{"error": {"errors": [{"reason": ...}, ...]}}` all
+    return False rather than raising. We'd rather mis-classify an
+    edge-case 403 as a non-quota failure (and let it fall through the
+    retry/`failed` path) than abort the entire scan because Google
+    returned a body we didn't predict.
+    """
+    import json
+
+    if getattr(getattr(exc, "resp", None), "status", None) != 403:
+        return False
+    content = getattr(exc, "content", None)
+    if not content:
+        return False
+    try:
+        payload = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return False
+    errors = err.get("errors")
+    if not isinstance(errors, list):
+        return False
+    quota_reasons = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"}
+    return any(isinstance(e, dict) and e.get("reason") in quota_reasons for e in errors)
+
+
 def _classify_status(status: dict[str, Any]) -> VideoStatus:
     """Stage-1 status mapping for a present video resource. See spec
     "Status mapping pipeline" for the full rules. privacyStatus is
@@ -210,6 +249,7 @@ class YouTubeClient:
         return items[:limit]
 
     _STATUS_BATCH_SIZE = 50
+    _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
 
     def _videos_list(self, *, ids: list[str]) -> dict[str, Any]:
         """Thin wrapper around `videos.list?part=status&id=<ids>`.
@@ -227,24 +267,90 @@ class YouTubeClient:
         service = self._service()
         return service.videos().list(part="status", id=",".join(ids)).execute()
 
+    def _videos_list_with_retry(self, *, ids: list[str]) -> dict[str, Any] | str:
+        """Call `_videos_list` with retry on transport errors AND HTTP 5xx
+        (the spec's "Network error / HTTP 5xx" bucket). Returns the
+        response dict on success, or a string sentinel on failure:
+        ``"quota"`` / ``"404"`` / ``"failed"``. The caller maps each
+        sentinel to the right policy.
+
+        Quota and 404 short-circuit (no retry — same condition would
+        repeat). 5xx and arbitrary non-HttpError exceptions (timeouts,
+        socket resets, urllib3 connection errors) are retried; the retry
+        budget is bounded by ``_RETRY_SLEEPS``, so a true programming bug
+        that raises a non-HTTP exception will eventually fall through to
+        ``"failed"`` rather than loop forever.
+        """
+        import time
+
+        from googleapiclient.errors import HttpError
+
+        attempts: list[float] = [0.0, *self._RETRY_SLEEPS]
+        last_exc: Exception | None = None
+        for delay in attempts:
+            if delay:
+                time.sleep(delay)
+            try:
+                return self._videos_list(ids=ids)
+            except HttpError as e:
+                status = getattr(e.resp, "status", None)
+                if _is_quota_exceeded(e):
+                    return "quota"
+                if status == 404:
+                    return "404"
+                if status is not None and 500 <= status < 600:
+                    last_exc = e
+                    continue
+                # Non-retryable HTTP error (e.g. 401 auth, 400 bad request).
+                last_exc = e
+                break
+            except Exception as e:  # noqa: BLE001 — system-boundary catch
+                # Transport-level error (timeout, socket reset, DNS failure,
+                # etc.). Per spec, retry just like 5xx — bounded by the
+                # `_RETRY_SLEEPS` budget so it can't spin indefinitely.
+                last_exc = e
+                continue
+        # Exhausted retries or non-retryable error.
+        if last_exc is not None and isinstance(last_exc, HttpError):
+            status = getattr(last_exc.resp, "status", None)
+            if status == 404:
+                return "404"
+        return "failed"
+
     def fetch_video_statuses(self, video_ids: list[str]) -> dict[str, VideoStatus]:
         """Stage-1 status check via batched `videos.list?part=status`.
 
-        Returns one entry per input ID. IDs missing from the API response
-        get the placeholder ``VideoStatus(is_available=False,
-        reason='missing_from_videos_list')`` — this function takes only
-        video IDs and has no access to ``playlistItems.list`` snippet
-        titles, so it cannot distinguish "made private" from "deleted"
-        from "region-restricted". The scan command resolves the
-        placeholder into a final reason. The placeholder must never reach
-        the database.
-
-        Batch failure handling lands in Task 3.
+        Returns one entry per input ID. See spec "Status mapping pipeline"
+        and "Batch failure policy" for the full semantics.
         """
         out: dict[str, VideoStatus] = {}
+        bail_remaining = False
         for start in range(0, len(video_ids), self._STATUS_BATCH_SIZE):
             chunk = video_ids[start : start + self._STATUS_BATCH_SIZE]
-            resp = self._videos_list(ids=chunk)
+            if bail_remaining:
+                for vid in chunk:
+                    out[vid] = VideoStatus(is_available=None, reason="status_check_failed")
+                continue
+
+            resp = self._videos_list_with_retry(ids=chunk)
+            if resp == "quota":
+                bail_remaining = True
+                for vid in chunk:
+                    out[vid] = VideoStatus(is_available=None, reason="status_check_failed")
+                continue
+            if resp == "404":
+                if len(chunk) == 1:
+                    out[chunk[0]] = VideoStatus(is_available=False, reason="deleted")
+                else:
+                    for vid in chunk:
+                        out[vid] = VideoStatus(is_available=None, reason="status_check_failed")
+                continue
+            if resp == "failed":
+                for vid in chunk:
+                    out[vid] = VideoStatus(is_available=None, reason="status_check_failed")
+                continue
+            # Success — `resp` is the dict.
+            assert isinstance(resp, dict)
             seen: set[str] = set()
             for item in resp.get("items", []):
                 vid = item["id"]
