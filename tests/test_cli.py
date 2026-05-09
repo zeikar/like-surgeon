@@ -198,3 +198,43 @@ def test_bootstrap_converts_invalid_region_to_fail(
     combined = out + err
     assert "KOREA" in combined
     assert "ISO 3166-1 alpha-2" in combined
+
+
+def test_auth_ytmusic_converts_invalid_region_to_fail(
+    fake_home: Path,
+) -> None:
+    """`auth ytmusic` must use the same fail-fast catch as `_bootstrap`.
+    A typo in config.json's region must NOT print a traceback when the
+    user runs auth setup."""
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KOREA"}))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "ytmusic"])
+
+    assert result.exit_code == 2
+    assert "KOREA" in result.output
+    assert "ISO 3166-1 alpha-2" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_auth_youtube_converts_invalid_region_to_fail(
+    fake_home: Path,
+) -> None:
+    """`auth youtube` must use the same fail-fast catch as `_bootstrap`."""
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KOREA"}))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "youtube"])
+
+    assert result.exit_code == 2
+    assert "KOREA" in result.output
+    assert "ISO 3166-1 alpha-2" in result.output
+    assert "Traceback" not in result.output

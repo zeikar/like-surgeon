@@ -47,19 +47,24 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def _bootstrap() -> tuple[Config, sessionmaker]:
-    """Resolve config, ensure app dir + schema, return a session factory.
+def _safe_config_load() -> Config:
+    """Wrap ``Config.load`` so a ``config.json`` typo on the ``region``
+    key fails fast with a friendly exit-2 instead of a traceback.
 
-    InvalidRegionError raised by ``Config.load`` (when ``config.json``
-    holds a non-alpha-2 region value) is caught here and converted to a
-    friendly ``_fail(code=2)`` so the user never sees a traceback for a
-    config typo. CLI flag validation lives elsewhere in the Typer
-    callback ``_parse_region_flag``.
+    Used by every CLI entrypoint that reads config — ``_bootstrap`` for
+    DB-backed commands plus the ``auth`` setup commands that don't need
+    a session. CLI flag validation lives elsewhere in the Typer callback
+    ``_parse_region_flag``.
     """
     try:
-        cfg = Config.load()
+        return Config.load()
     except InvalidRegionError as e:
         _fail(str(e), code=2)
+
+
+def _bootstrap() -> tuple[Config, sessionmaker]:
+    """Resolve config, ensure app dir + schema, return a session factory."""
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     engine = make_engine(cfg.db_path)
     init_db(engine)
@@ -143,7 +148,7 @@ def auth_ytmusic(
     ] = None,
 ) -> None:
     """Set up ytmusicapi browser-header auth for YouTube Music."""
-    cfg = Config.load()
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     target = cfg.ytmusic_browser_path
 
@@ -181,7 +186,7 @@ def auth_ytmusic(
 @auth_app.command("youtube")
 def auth_youtube() -> None:
     """Set up OAuth for YouTube Data API access."""
-    cfg = Config.load()
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     secrets_path = cfg.youtube_oauth_client_path
     token_path = cfg.youtube_token_path
