@@ -627,3 +627,86 @@ def test_attach_video_statuses_injects_disambiguated_dict() -> None:
     }
     # Item without a video_id had nothing to inject.
     assert "_likesurgeon_video_status" not in items[2]
+
+
+def test_classify_status_region_blocked_in_blocked_list() -> None:
+    """user_region appears in regionRestriction.blocked → region_blocked."""
+    from likesurgeon.youtube_client import VideoStatus, _classify_status
+
+    status = {"uploadStatus": "processed", "privacyStatus": "public"}
+    content = {"regionRestriction": {"blocked": ["KR", "JP"]}}
+    assert _classify_status(status, content, "KR") == VideoStatus(
+        is_available=False, reason="region_blocked"
+    )
+
+
+def test_classify_status_region_blocked_via_allowed_whitelist() -> None:
+    """allowed list is a whitelist — user_region not in it → region_blocked."""
+    from likesurgeon.youtube_client import VideoStatus, _classify_status
+
+    status = {"uploadStatus": "processed", "privacyStatus": "public"}
+    content = {"regionRestriction": {"allowed": ["JP"]}}
+    assert _classify_status(status, content, "KR") == VideoStatus(
+        is_available=False, reason="region_blocked"
+    )
+
+
+def test_classify_status_region_allowed_when_in_allowed_list() -> None:
+    """user_region in allowed list → available."""
+    from likesurgeon.youtube_client import VideoStatus, _classify_status
+
+    status = {"uploadStatus": "processed", "privacyStatus": "public"}
+    content = {"regionRestriction": {"allowed": ["KR", "JP"]}}
+    assert _classify_status(status, content, "KR") == VideoStatus(is_available=True, reason=None)
+
+
+def test_classify_status_no_region_skips_check() -> None:
+    """user_region=None preserves 0.3 behavior — region restriction ignored."""
+    from likesurgeon.youtube_client import VideoStatus, _classify_status
+
+    status = {"uploadStatus": "processed", "privacyStatus": "public"}
+    content = {"regionRestriction": {"blocked": ["KR"]}}
+    assert _classify_status(status, content, None) == VideoStatus(is_available=True, reason=None)
+
+
+def test_classify_status_deleted_takes_precedence_over_region() -> None:
+    """uploadStatus=deleted is absolute — region check never runs."""
+    from likesurgeon.youtube_client import VideoStatus, _classify_status
+
+    status = {"uploadStatus": "deleted", "privacyStatus": "public"}
+    content = {"regionRestriction": {"blocked": ["KR"]}}
+    assert _classify_status(status, content, "KR") == VideoStatus(
+        is_available=False, reason="deleted"
+    )
+
+
+def test_fetch_video_statuses_passes_region_through(monkeypatch) -> None:
+    """fetch_video_statuses receives user_region kwarg and threads it to
+    classification — KR blocked items get region_blocked, JP-allowed get
+    available, in the same response."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        return {
+            "items": [
+                {
+                    "id": "v_kr_blocked",
+                    "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+                    "contentDetails": {"regionRestriction": {"blocked": ["KR"]}},
+                },
+                {
+                    "id": "v_kr_allowed",
+                    "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+                    "contentDetails": {"regionRestriction": {"allowed": ["KR"]}},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["v_kr_blocked", "v_kr_allowed"], user_region="KR")
+    assert out["v_kr_blocked"] == VideoStatus(is_available=False, reason="region_blocked")
+    assert out["v_kr_allowed"] == VideoStatus(is_available=True, reason=None)

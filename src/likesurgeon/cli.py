@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
 from .compare import CompareInput, CompareResult, compare_likes
-from .config import Config
+from .config import Config, InvalidRegionError, _validate_region
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diff import diff_snapshots
 from .doctor import health_summary
@@ -47,9 +47,24 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _safe_config_load() -> Config:
+    """Wrap ``Config.load`` so a ``config.json`` typo on the ``region``
+    key fails fast with a friendly exit-2 instead of a traceback.
+
+    Used by every CLI entrypoint that reads config — ``_bootstrap`` for
+    DB-backed commands plus the ``auth`` setup commands that don't need
+    a session. CLI flag validation lives elsewhere in the Typer callback
+    ``_parse_region_flag``.
+    """
+    try:
+        return Config.load()
+    except InvalidRegionError as e:
+        _fail(str(e), code=2)
+
+
 def _bootstrap() -> tuple[Config, sessionmaker]:
     """Resolve config, ensure app dir + schema, return a session factory."""
-    cfg = Config.load()
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     engine = make_engine(cfg.db_path)
     init_db(engine)
@@ -59,6 +74,57 @@ def _bootstrap() -> tuple[Config, sessionmaker]:
 def _fail(msg: str, code: int = 1) -> NoReturn:
     err_console.print(f"[bold red]Error:[/bold red] {msg}")
     raise typer.Exit(code)
+
+
+_TRACK_LOOKUP_BATCH_SIZE = 500
+
+
+def _video_ids_for_tracks(session: Session, track_ids: set[int]) -> dict[int, str | None]:
+    """Map ``track_ids`` to their ``Track.video_id`` values.
+
+    Issues the lookup in batches of ``_TRACK_LOOKUP_BATCH_SIZE`` so the
+    IN(...) clause never exceeds SQLite's ``SQLITE_MAX_VARIABLE_NUMBER``
+    (which can be as low as 999 on older builds). The default 500 keeps
+    each query well under that ceiling on every supported sqlite.
+    """
+    from sqlalchemy import select
+
+    from .models import Track
+
+    if not track_ids:
+        return {}
+    out: dict[int, str | None] = {}
+    ids = list(track_ids)
+    for start in range(0, len(ids), _TRACK_LOOKUP_BATCH_SIZE):
+        chunk = ids[start : start + _TRACK_LOOKUP_BATCH_SIZE]
+        rows = session.scalars(select(Track).where(Track.id.in_(chunk))).all()
+        for t in rows:
+            out[t.id] = t.video_id
+    return out
+
+
+def _resolve_region(cli_region: str | None, config_region: str | None) -> str | None:
+    """Pick the region to use for this scan.
+
+    Precedence: CLI flag > config.json > None. Both inputs are
+    pre-validated upstream (Config.load and the Typer parser callback
+    both call ``_validate_region`` and raise ``InvalidRegionError`` on
+    bad shape), so this helper sees only ``None`` or a valid alpha-2
+    code.
+    """
+    return cli_region or config_region
+
+
+def _parse_region_flag(value: str | None) -> str | None:
+    """Typer callback for ``--region``: validates the alpha-2 shape and
+    raises ``typer.BadParameter`` (exit 2) on bad input so the failure
+    surfaces before any API call."""
+    if value is None:
+        return None
+    try:
+        return _validate_region(value)
+    except InvalidRegionError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _version_callback(value: bool) -> None:
@@ -109,7 +175,7 @@ def auth_ytmusic(
     ] = None,
 ) -> None:
     """Set up ytmusicapi browser-header auth for YouTube Music."""
-    cfg = Config.load()
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     target = cfg.ytmusic_browser_path
 
@@ -147,7 +213,7 @@ def auth_ytmusic(
 @auth_app.command("youtube")
 def auth_youtube() -> None:
     """Set up OAuth for YouTube Data API access."""
-    cfg = Config.load()
+    cfg = _safe_config_load()
     cfg.ensure_app_dir()
     secrets_path = cfg.youtube_oauth_client_path
     token_path = cfg.youtube_token_path
@@ -203,13 +269,25 @@ def scan_ytmusic(
 @scan_app.command("youtube-likes")
 def scan_youtube_likes(
     limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
+    region: Annotated[
+        str | None,
+        typer.Option(
+            "--region",
+            callback=_parse_region_flag,
+            help=(
+                "ISO 3166-1 alpha-2 country code for region-block detection. "
+                "Overrides config.json for this scan only; never written to disk."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Fetch YouTube liked videos (LL playlist) and store a snapshot.
 
-    Also runs a per-video availability check (`videos.list?part=status`) and
-    persists the result as `SnapshotItem.is_available` / `unavailable_reason`
-    so `compare-likes` can surface ghost videos. See spec "Status mapping
-    pipeline".
+    Also runs a per-video availability check (`videos.list?part=status,contentDetails`)
+    and persists the result as `SnapshotItem.is_available` /
+    `unavailable_reason` so `compare-likes` can surface ghost videos.
+    Region-aware detection runs when ``region`` is provided either via
+    ``--region`` or ``config.json``.
     """
     from .youtube_client import (
         AuthorizationRequiredError,
@@ -219,6 +297,14 @@ def scan_youtube_likes(
     )
 
     cfg, factory = _bootstrap()
+    user_region = _resolve_region(region, cfg.region)
+    if user_region is None:
+        console.print(
+            "[yellow]⚠[/yellow] No region configured — region-blocked videos won't "
+            "be detected as ghosts. Set [cyan]region[/cyan] in "
+            "[cyan]~/.like-surgeon/config.json[/cyan] or pass [cyan]--region <ISO-code>[/cyan]."
+        )
+
     client = YouTubeClient(
         client_secrets_path=cfg.youtube_oauth_client_path,
         token_path=cfg.youtube_token_path,
@@ -228,8 +314,6 @@ def scan_youtube_likes(
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
 
-    # Stage 1 + 2 + injection. attach_video_statuses mutates items in place
-    # so they can be passed straight to create_snapshot below.
     video_ids: list[str] = []
     for it in items:
         snippet = it.get("snippet") or {}
@@ -238,7 +322,7 @@ def scan_youtube_likes(
         if vid:
             video_ids.append(vid)
 
-    statuses = client.fetch_video_statuses(video_ids)
+    statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
 
     with session_scope(factory) as session:
@@ -574,9 +658,26 @@ def issues(
             return
         items = diagnosis_items(session, diag.id)
 
-    if type is not None:
-        items = [it for it in items if it.issue_type == type]
-    items = [it for it in items if it.confidence >= min_confidence]
+        if type is not None:
+            items = [it for it in items if it.issue_type == type]
+        items = [it for it in items if it.confidence >= min_confidence]
+
+        # Bulk-fetch the Tracks referenced by the filtered items so we
+        # can surface video_id alongside the internal track_id PKs.
+        # Done before leaving the session so the lookup can use the
+        # same connection.
+        track_ids: set[int] = {
+            tid
+            for it in items
+            for tid in (it.source_track_id, it.related_track_id)
+            if tid is not None
+        }
+        video_id_by_track = _video_ids_for_tracks(session, track_ids)
+
+    def _vid(track_id: int | None) -> str | None:
+        if track_id is None:
+            return None
+        return video_id_by_track.get(track_id)
 
     if fmt == "json":
         payload = {
@@ -588,7 +689,9 @@ def issues(
                     "confidence": it.confidence,
                     "reason": it.reason,
                     "source_track_id": it.source_track_id,
+                    "source_video_id": _vid(it.source_track_id),
                     "related_track_id": it.related_track_id,
+                    "related_video_id": _vid(it.related_track_id),
                     "status": it.status,
                 }
                 for it in items
@@ -601,16 +704,16 @@ def issues(
     table.add_column("ID", justify="right")
     table.add_column("Type")
     table.add_column("Conf", justify="right")
-    table.add_column("Source TID", justify="right")
-    table.add_column("Related TID", justify="right")
+    table.add_column("Source VID")
+    table.add_column("Related VID")
     table.add_column("Reason")
     for it in items:
         table.add_row(
             str(it.id),
             it.issue_type,
             f"{it.confidence:.2f}",
-            str(it.source_track_id) if it.source_track_id is not None else "",
-            str(it.related_track_id) if it.related_track_id is not None else "",
+            _vid(it.source_track_id) or "",
+            _vid(it.related_track_id) or "",
             it.reason,
         )
     if not items:

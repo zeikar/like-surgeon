@@ -92,16 +92,33 @@ def _is_quota_exceeded(exc: Any) -> bool:
     return any(isinstance(e, dict) and e.get("reason") in quota_reasons for e in errors)
 
 
-def _classify_status(status: dict[str, Any]) -> VideoStatus:
-    """Stage-1 status mapping for a present video resource. See spec
-    "Status mapping pipeline" for the full rules. privacyStatus is
-    deliberately NOT consulted: a returned private video means the caller
-    is the owner (or has explicit access), so it's playable."""
+def _classify_status(
+    status: dict[str, Any],
+    content_details: dict[str, Any],
+    user_region: str | None,
+) -> VideoStatus:
+    """Stage-1 status mapping for a present video resource.
+
+    Region check runs only when ``user_region`` is provided; otherwise
+    the function preserves 0.3 behavior (status-only). ``uploadStatus``
+    'rejected'/'deleted' overrides region restriction because those are
+    absolute, not user-region-relative. privacyStatus is deliberately
+    NOT consulted: a returned private video means the caller is the
+    owner (or has explicit access), so it's playable.
+    """
     upload = status.get("uploadStatus")
     if upload == "rejected":
         return VideoStatus(is_available=False, reason="rejected")
     if upload == "deleted":
         return VideoStatus(is_available=False, reason="deleted")
+    if user_region:
+        rr = content_details.get("regionRestriction") or {}
+        blocked = rr.get("blocked") or []
+        allowed = rr.get("allowed") or []
+        if user_region in blocked:
+            return VideoStatus(is_available=False, reason="region_blocked")
+        if allowed and user_region not in allowed:
+            return VideoStatus(is_available=False, reason="region_blocked")
     return VideoStatus(is_available=True, reason=None)
 
 
@@ -304,7 +321,7 @@ class YouTubeClient:
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
 
     def _videos_list(self, *, ids: list[str]) -> dict[str, Any]:
-        """Thin wrapper around `videos.list?part=status&id=<ids>`.
+        """Thin wrapper around `videos.list?part=status,contentDetails&id=<ids>`.
 
         Split out so tests can monkeypatch this single seam without faking
         the entire `googleapiclient` discovery surface. Production callers
@@ -317,7 +334,7 @@ class YouTubeClient:
         anyway.
         """
         service = self._service()
-        return service.videos().list(part="status", id=",".join(ids)).execute()
+        return service.videos().list(part="status,contentDetails", id=",".join(ids)).execute()
 
     def _videos_list_with_retry(self, *, ids: list[str]) -> dict[str, Any] | str:
         """Call `_videos_list` with retry on transport errors AND HTTP 5xx
@@ -363,8 +380,10 @@ class YouTubeClient:
         # with an immediate `return "404"`, so it never reaches this point.
         return "failed"
 
-    def fetch_video_statuses(self, video_ids: list[str]) -> dict[str, VideoStatus]:
-        """Stage-1 status check via batched `videos.list?part=status`.
+    def fetch_video_statuses(
+        self, video_ids: list[str], *, user_region: str | None = None
+    ) -> dict[str, VideoStatus]:
+        """Stage-1 status check via batched `videos.list?part=status,contentDetails`.
 
         Returns one entry per input ID. See spec "Status mapping pipeline"
         and "Batch failure policy" for the full semantics.
@@ -401,7 +420,11 @@ class YouTubeClient:
             for item in resp.get("items", []):
                 vid = item["id"]
                 seen.add(vid)
-                out[vid] = _classify_status(item.get("status") or {})
+                out[vid] = _classify_status(
+                    item.get("status") or {},
+                    item.get("contentDetails") or {},
+                    user_region,
+                )
             for vid in chunk:
                 if vid not in seen:
                     out[vid] = VideoStatus(is_available=False, reason="missing_from_videos_list")

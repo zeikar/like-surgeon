@@ -2,7 +2,7 @@
 
 > Sync, backup, and repair your YouTube Music liked songs.
 
-**Status:** MVP 0.3 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis, ghost detection, and metadata drift. Local-first. No server, no destructive actions.
+**Status:** MVP 0.3.1 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis, region-aware ghost detection, and metadata drift. Local-first. No server, no destructive actions.
 
 ## What it does today
 
@@ -11,7 +11,7 @@
 - Diffs any two snapshots, exports any snapshot to JSON.
 - Classifies YouTube liked videos as music-candidate / not via heuristics (channel ends with `- Topic`, "Provided to YouTube by …", "Official Music Video", "Lyric Video", `artist - title`, etc.; negatives like `vlog`, `tutorial`, `gameplay`).
 - `compare-likes` does a three-stage match (`video_id` → `canonical_key` → RapidFuzz fuzzy on `title | artists`) and persists findings as a `Diagnosis` plus per-finding `DiagnosisItem` rows.
-- Detects ghost YouTube likes (deleted, made private, unavailable) at scan time, and metadata drift (title or artists list changes) between snapshots — both surface through `compare-likes` and `issues`.
+- Detects ghost YouTube likes (deleted, made private, region-blocked, unavailable) at scan time, and metadata drift (title or artists list changes) between snapshots — both surface through `compare-likes` and `issues`. Region-blocked detection requires setting an [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) country code (e.g. `KR`) in `~/.like-surgeon/config.json`.
 - `issues` lists the latest diagnosis with type/confidence filters and JSON output.
 - `doctor` is now multi-source: counts per source, latest diagnosis summary, and a match-rate health score.
 
@@ -26,6 +26,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | 0.2.1       | Explored ytmusicapi OAuth (Device Code) to escape browser-header cookie staleness — abandoned: ytmusicapi 1.12 + Google's current backend reject every non-TV `clientName` for OAuth-issued tokens, and the TV clients return YouTube-shape responses ytmusicapi can't parse. Notes archived at [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md). Salvaged: `fetch_liked_songs` parse-error boundary so stale auth surfaces as a clean re-auth hint instead of a ytmusicapi traceback. |
 | **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
 | **0.3**     | Matching engine: ghost YouTube likes (deleted/private/unavailable, detected at `scan youtube-likes` time via `videos.list`) and metadata drift (snapshot-pair title/artists comparison via [RapidFuzz](https://github.com/maxbachmann/RapidFuzz)). Both surface as new `issue_type` rows on `compare-likes`; no new commands. |
+| **0.3.1**   | Region-aware ghost detection: `videos.list?part=status,contentDetails` checks `regionRestriction` against the user's configured ISO 3166-1 alpha-2 region (`config.json` or `--region` flag). Region-blocked videos surface as `unavailable_video` findings with `unavailable_reason="region_blocked"`. No new commands, quota cost unchanged. |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
 
@@ -99,6 +100,16 @@ The first run prints a 6-step setup walkthrough that ends with you placing a `yo
 
 ### 3. Scan
 
+**Optional but recommended: configure your region.** Region-blocked videos only get classified as ghosts when likesurgeon knows your region. Create `~/.like-surgeon/config.json`:
+
+```json
+{
+  "region": "KR"
+}
+```
+
+Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) code for your country. Without this, `scan youtube-likes` prints a one-time warning and falls back to status-only ghost detection (the 0.3 behavior).
+
 ```bash
 uv run likesurgeon scan ytmusic                 # YT Music likes
 uv run likesurgeon scan youtube-likes           # YouTube LL playlist
@@ -131,7 +142,7 @@ uv run likesurgeon issues --min-confidence 0.7 --format json
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
-- **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status` for ghost detection); the default daily quota is 10000. Re-scanning a few times a day is fine.
+- **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status,contentDetails` for ghost detection — `contentDetails` adds the `regionRestriction` field needed in 0.3.1, but `videos.list` is 1 unit/call regardless of `part=` selection); the default daily quota is 10000. Re-scanning a few times a day is fine.
 - **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — nothing is mutated on the user's behalf.
 
 ## Local layout
@@ -141,7 +152,8 @@ uv run likesurgeon issues --min-confidence 0.7 --format json
 ├── like-surgeon.sqlite        # all snapshots, tracks, diagnoses
 ├── browser.json               # ytmusicapi browser-header auth
 ├── youtube-oauth-client.json  # downloaded Google OAuth client (Desktop app)
-└── youtube-token.json         # persisted refresh token (created on first auth)
+├── youtube-token.json         # persisted refresh token (created on first auth)
+└── config.json                # optional user settings (e.g. {"region": "KR"})
 ```
 
 ## Development
