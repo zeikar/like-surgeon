@@ -386,7 +386,9 @@ def doctor() -> None:
             f"[bold]Latest diagnosis #{d.diagnosis_id}:[/bold] "
             f"{d.possibly_missing_from_ytmusic} possibly missing from YT Music · "
             f"{d.pointer_drift} pointer drift · "
-            f"{d.ytmusic_only} YT Music only"
+            f"{d.ytmusic_only} YT Music only · "
+            f"{d.unavailable_videos} unavailable videos · "
+            f"{d.metadata_drift} metadata drift"
         )
 
     if report.match_rate_percent is None:
@@ -534,9 +536,9 @@ def issues(
         typer.Option(
             "--type",
             help=(
-                "Filter by issue type "
-                "(possibly_missing_from_ytmusic | possible_pointer_drift | "
-                "ytmusic_only)."
+                "Filter findings by issue type. One of: "
+                "possibly_missing_from_ytmusic | possible_pointer_drift | "
+                "ytmusic_only | unavailable_video | metadata_drift."
             ),
         ),
     ] = None,

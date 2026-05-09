@@ -132,3 +132,60 @@ def test_doctor_match_rate_scores_diagnosis(session: Session):
     assert 49 <= report.match_rate_percent <= 51  # ~50%
     assert report.latest_diagnosis is not None
     assert report.latest_diagnosis.possibly_missing_from_ytmusic == 1
+
+
+def test_doctor_summary_counts_new_issue_types(session) -> None:
+    """`unavailable_videos` and `metadata_drift` counts come from the
+    DiagnosisSummary aggregation alongside the existing types."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.doctor import health_summary
+    from likesurgeon.snapshot import create_snapshot
+
+    # YT Music snapshot.
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+    # Two YT snapshots: first establishes prev, second adds a ghost AND a drift.
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Original",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "v"},
+                },
+                "contentDetails": {"videoId": "v"},
+            },
+        ],
+    )
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "New Title Entirely Different",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "v"},
+                },
+                "contentDetails": {"videoId": "v"},
+                "_likesurgeon_video_status": {"is_available": False, "reason": "deleted"},
+            },
+        ],
+    )
+
+    _compare_and_persist(session)
+    report = health_summary(session)
+    assert report.latest_diagnosis is not None
+    assert report.latest_diagnosis.unavailable_videos >= 1
+    assert report.latest_diagnosis.metadata_drift >= 1
