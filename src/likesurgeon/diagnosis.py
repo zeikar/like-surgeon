@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,6 +14,8 @@ from .models import Diagnosis, DiagnosisItem
 ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC = "possibly_missing_from_ytmusic"
 ISSUE_POINTER_DRIFT = "possible_pointer_drift"
 ISSUE_YTMUSIC_ONLY = "ytmusic_only"
+ISSUE_UNAVAILABLE_VIDEO = "unavailable_video"
+ISSUE_METADATA_DRIFT = "metadata_drift"
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,76 @@ def _match_item(
 def _unmatched_reason(item: UnmatchedItem) -> str:
     artists = ", ".join(item.artists) if item.artists else "(no artists)"
     return f"'{item.title}' by {artists}"
+
+
+def build_unavailable_video_items(
+    diagnosis_id: int, snapshot_items: list[Any]
+) -> list[DiagnosisItem]:
+    """Build DiagnosisItem rows for SnapshotItems with is_available=False.
+
+    ``confidence=1.0`` because availability is a fact, not a probability —
+    using a lower confidence would let ``--min-confidence`` filters hide
+    real ghosts.
+    """
+    out: list[DiagnosisItem] = []
+    for item in snapshot_items:
+        if item.is_available is not False:
+            continue
+        out.append(
+            DiagnosisItem(
+                diagnosis_id=diagnosis_id,
+                issue_type=ISSUE_UNAVAILABLE_VIDEO,
+                confidence=1.0,
+                reason=f"video unavailable: {item.unavailable_reason}",
+                source_track_id=item.track_id,
+                related_track_id=None,
+                status="open",
+            )
+        )
+    return out
+
+
+def build_metadata_drift_items(
+    diagnosis_id: int,
+    findings: list[Any],
+    curr_items: list[Any],
+) -> list[DiagnosisItem]:
+    """Build DiagnosisItem rows from DriftFinding objects.
+
+    ``confidence=1.0`` because each finding is a deterministic post-filter
+    output (the threshold check happened in ``detect_drift``). Severity goes
+    in ``reason`` text, NOT in ``confidence`` — using ``title_similarity``
+    as confidence would invert ``--min-confidence`` semantics (lower sim =
+    bigger drift = would get filtered out).
+
+    ``related_track_id`` is left ``None`` because the prev/curr ``Track``
+    rows are usually the same row (Tracks get upserted with latest metadata
+    on every scan). The durable prev/curr identifiers are the
+    ``SnapshotItem`` ids embedded in ``reason``.
+    """
+    curr_by_item_id = {it.id: it for it in curr_items}
+    out: list[DiagnosisItem] = []
+    for f in findings:
+        curr = curr_by_item_id.get(f.curr_snapshot_item_id)
+        track_id = curr.track_id if curr is not None else None
+        reason = (
+            f"source={f.source}; "
+            f"prev_item={f.prev_snapshot_item_id}, curr_item={f.curr_snapshot_item_id}; "
+            f"title: {f.prev_title!r} → {f.curr_title!r} (sim {f.title_similarity:.2f}); "
+            f"artists: {list(f.prev_artists)} → {list(f.curr_artists)}"
+        )
+        out.append(
+            DiagnosisItem(
+                diagnosis_id=diagnosis_id,
+                issue_type=ISSUE_METADATA_DRIFT,
+                confidence=1.0,
+                reason=reason,
+                source_track_id=track_id,
+                related_track_id=None,
+                status="open",
+            )
+        )
+    return out
 
 
 def latest_diagnosis(session: Session) -> Diagnosis | None:

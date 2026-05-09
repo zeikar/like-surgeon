@@ -193,3 +193,148 @@ def test_counts_summary():
     assert res.youtube_music_count == 2
     assert len(res.matched) == 1  # v1 matched by video_id
     assert len(res.possibly_missing_from_ytmusic) == 1  # vK has no ytmusic match
+
+
+def test_compare_likes_persists_unavailable_video_findings(session) -> None:
+    """One youtube_liked_videos snapshot with one is_available=False item
+    → DiagnosisItem(issue_type='unavailable_video') is persisted."""
+    from likesurgeon.cli import _compare_and_persist  # introduced in this task
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {"title": "T", "channelTitle": "A", "resourceId": {"videoId": "v1"}},
+                "contentDetails": {"videoId": "v1"},
+                "_likesurgeon_video_status": {"is_available": False, "reason": "deleted"},
+            }
+        ],
+    )
+
+    diagnosis_id = _compare_and_persist(session).diagnosis_id
+    rows = (
+        session.query(DiagnosisItem)
+        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_UNAVAILABLE_VIDEO)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].confidence == 1.0
+    assert "video unavailable: deleted" in rows[0].reason
+
+
+def test_compare_likes_persists_metadata_drift_findings(session) -> None:
+    """Two YouTube snapshots of the same source with same video_id but
+    different title → DiagnosisItem(issue_type='metadata_drift')."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.diagnosis import ISSUE_METADATA_DRIFT
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    # Two YT snapshots, same video_id, different title.
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Original Title",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "v"},
+                },
+                "contentDetails": {"videoId": "v"},
+            }
+        ],
+    )
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Completely Different Now [Remastered 2024]",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "v"},
+                },
+                "contentDetails": {"videoId": "v"},
+            }
+        ],
+    )
+    # YT Music snapshot so compare-likes has both sources to compare.
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+
+    diagnosis_id = _compare_and_persist(session).diagnosis_id
+    rows = (
+        session.query(DiagnosisItem)
+        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_METADATA_DRIFT)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].confidence == 1.0
+    # Reason carries source, snapshot-item ids, sim, and artists.
+    assert "source=youtube_liked_videos" in rows[0].reason
+    assert "prev_item=" in rows[0].reason
+    assert "curr_item=" in rows[0].reason
+    assert "title:" in rows[0].reason
+
+
+def test_compare_likes_drift_silently_skips_when_only_one_snapshot(session) -> None:
+    """Source with only 1 snapshot → no drift finding for it (no error)."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.diagnosis import ISSUE_METADATA_DRIFT
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {"title": "T", "channelTitle": "C", "resourceId": {"videoId": "v"}},
+                "contentDetails": {"videoId": "v"},
+            }
+        ],
+    )
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {
+                "videoId": "ytm",
+                "title": "T",
+                "artists": [{"name": "A"}],
+            }
+        ],
+    )
+
+    diagnosis_id = _compare_and_persist(session).diagnosis_id
+    rows = (
+        session.query(DiagnosisItem)
+        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_METADATA_DRIFT)
+        .all()
+    )
+    assert rows == []
