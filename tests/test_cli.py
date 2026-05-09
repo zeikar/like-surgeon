@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 # `youtube_client` carries the symbol we monkeypatch (the
@@ -219,6 +220,50 @@ def test_auth_ytmusic_converts_invalid_region_to_fail(
     assert "KOREA" in result.output
     assert "ISO 3166-1 alpha-2" in result.output
     assert "Traceback" not in result.output
+
+
+def test_video_ids_for_tracks_chunks_lookup_above_batch_size(
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Track lookup used by `issues` must chunk its IN(...) clause
+    so it doesn't exceed SQLite's `SQLITE_MAX_VARIABLE_NUMBER` for large
+    diagnoses. Use a small batch size to exercise the chunking branch
+    deterministically with a manageable number of fixture rows.
+    """
+    from likesurgeon import cli as _cli_mod
+    from likesurgeon.cli import _video_ids_for_tracks
+    from likesurgeon.models import Track
+
+    monkeypatch.setattr(_cli_mod, "_TRACK_LOOKUP_BATCH_SIZE", 100)
+
+    n = 250  # > 2× batch size — forces at least 3 chunks
+    tracks = [
+        Track(
+            source="youtube_liked_videos",
+            video_id=f"vid_{i:04d}",
+            title=f"t{i}",
+            artists="[]",
+            canonical_key=f"k{i}",
+            dedupe_key=f"d{i}",
+        )
+        for i in range(n)
+    ]
+    session.add_all(tracks)
+    session.commit()
+
+    track_ids = {t.id for t in tracks}
+    out = _video_ids_for_tracks(session, track_ids)
+
+    assert len(out) == n
+    assert all(out[t.id] == f"vid_{i:04d}" for i, t in enumerate(tracks))
+
+
+def test_video_ids_for_tracks_handles_empty_input(session: Session) -> None:
+    """Empty input must short-circuit without issuing any queries."""
+    from likesurgeon.cli import _video_ids_for_tracks
+
+    assert _video_ids_for_tracks(session, set()) == {}
 
 
 def test_auth_youtube_converts_invalid_region_to_fail(

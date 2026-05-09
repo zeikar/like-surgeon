@@ -76,6 +76,33 @@ def _fail(msg: str, code: int = 1) -> NoReturn:
     raise typer.Exit(code)
 
 
+_TRACK_LOOKUP_BATCH_SIZE = 500
+
+
+def _video_ids_for_tracks(session: Session, track_ids: set[int]) -> dict[int, str | None]:
+    """Map ``track_ids`` to their ``Track.video_id`` values.
+
+    Issues the lookup in batches of ``_TRACK_LOOKUP_BATCH_SIZE`` so the
+    IN(...) clause never exceeds SQLite's ``SQLITE_MAX_VARIABLE_NUMBER``
+    (which can be as low as 999 on older builds). The default 500 keeps
+    each query well under that ceiling on every supported sqlite.
+    """
+    from sqlalchemy import select
+
+    from .models import Track
+
+    if not track_ids:
+        return {}
+    out: dict[int, str | None] = {}
+    ids = list(track_ids)
+    for start in range(0, len(ids), _TRACK_LOOKUP_BATCH_SIZE):
+        chunk = ids[start : start + _TRACK_LOOKUP_BATCH_SIZE]
+        rows = session.scalars(select(Track).where(Track.id.in_(chunk))).all()
+        for t in rows:
+            out[t.id] = t.video_id
+    return out
+
+
 def _resolve_region(cli_region: str | None, config_region: str | None) -> str | None:
     """Pick the region to use for this scan.
 
@@ -614,10 +641,7 @@ def issues(
     """List issues from the latest diagnosis."""
     import json as jsonlib
 
-    from sqlalchemy import select
-
     from .diagnosis import diagnosis_items, latest_diagnosis
-    from .models import Track
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
@@ -638,19 +662,17 @@ def issues(
             items = [it for it in items if it.issue_type == type]
         items = [it for it in items if it.confidence >= min_confidence]
 
-        # Bulk-fetch the Tracks referenced by the filtered items so we can
-        # surface video_id alongside the internal track_id PKs. Done before
-        # leaving the session so the lookup can use the same connection.
+        # Bulk-fetch the Tracks referenced by the filtered items so we
+        # can surface video_id alongside the internal track_id PKs.
+        # Done before leaving the session so the lookup can use the
+        # same connection.
         track_ids: set[int] = {
             tid
             for it in items
             for tid in (it.source_track_id, it.related_track_id)
             if tid is not None
         }
-        video_id_by_track: dict[int, str | None] = {}
-        if track_ids:
-            rows = session.scalars(select(Track).where(Track.id.in_(track_ids))).all()
-            video_id_by_track = {t.id: t.video_id for t in rows}
+        video_id_by_track = _video_ids_for_tracks(session, track_ids)
 
     def _vid(track_id: int | None) -> str | None:
         if track_id is None:
