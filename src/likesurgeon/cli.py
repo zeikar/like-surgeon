@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
 from .compare import CompareInput, CompareResult, compare_likes
-from .config import Config
+from .config import Config, InvalidRegionError, _validate_region
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diff import diff_snapshots
 from .doctor import health_summary
@@ -71,6 +71,18 @@ def _resolve_region(cli_region: str | None, config_region: str | None) -> str | 
     code.
     """
     return cli_region or config_region
+
+
+def _parse_region_flag(value: str | None) -> str | None:
+    """Typer callback for ``--region``: validates the alpha-2 shape and
+    raises ``typer.BadParameter`` (exit 2) on bad input so the failure
+    surfaces before any API call."""
+    if value is None:
+        return None
+    try:
+        return _validate_region(value)
+    except InvalidRegionError as e:
+        raise typer.BadParameter(str(e)) from e
 
 
 def _version_callback(value: bool) -> None:
@@ -215,13 +227,25 @@ def scan_ytmusic(
 @scan_app.command("youtube-likes")
 def scan_youtube_likes(
     limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
+    region: Annotated[
+        str | None,
+        typer.Option(
+            "--region",
+            callback=_parse_region_flag,
+            help=(
+                "ISO 3166-1 alpha-2 country code for region-block detection. "
+                "Overrides config.json for this scan only; never written to disk."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Fetch YouTube liked videos (LL playlist) and store a snapshot.
 
-    Also runs a per-video availability check (`videos.list?part=status`) and
-    persists the result as `SnapshotItem.is_available` / `unavailable_reason`
-    so `compare-likes` can surface ghost videos. See spec "Status mapping
-    pipeline".
+    Also runs a per-video availability check (`videos.list?part=status,contentDetails`)
+    and persists the result as `SnapshotItem.is_available` /
+    `unavailable_reason` so `compare-likes` can surface ghost videos.
+    Region-aware detection runs when ``region`` is provided either via
+    ``--region`` or ``config.json``.
     """
     from .youtube_client import (
         AuthorizationRequiredError,
@@ -231,6 +255,14 @@ def scan_youtube_likes(
     )
 
     cfg, factory = _bootstrap()
+    user_region = _resolve_region(region, cfg.region)
+    if user_region is None:
+        console.print(
+            "[yellow]⚠[/yellow] No region configured — region-blocked videos won't "
+            "be detected as ghosts. Set [cyan]region[/cyan] in "
+            "[cyan]~/.like-surgeon/config.json[/cyan] or pass [cyan]--region <ISO-code>[/cyan]."
+        )
+
     client = YouTubeClient(
         client_secrets_path=cfg.youtube_oauth_client_path,
         token_path=cfg.youtube_token_path,
@@ -240,8 +272,6 @@ def scan_youtube_likes(
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
 
-    # Stage 1 + 2 + injection. attach_video_statuses mutates items in place
-    # so they can be passed straight to create_snapshot below.
     video_ids: list[str] = []
     for it in items:
         snippet = it.get("snippet") or {}
@@ -250,7 +280,7 @@ def scan_youtube_likes(
         if vid:
             video_ids.append(vid)
 
-    statuses = client.fetch_video_statuses(video_ids)
+    statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
 
     with session_scope(factory) as session:
