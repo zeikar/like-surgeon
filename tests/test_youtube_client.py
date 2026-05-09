@@ -219,3 +219,130 @@ def test_save_token_chmods_to_user_only(tmp_path: Path) -> None:
     assert token_path.exists()
     mode = token_path.stat().st_mode & 0o777
     assert mode == 0o600
+
+
+def test_video_status_dataclass_field_types() -> None:
+    """VideoStatus mirrors SnapshotItem's tri-state: bool | None for
+    `is_available` (available / unavailable / unknown) and str | None
+    for `reason`."""
+    from likesurgeon.youtube_client import VideoStatus
+
+    available = VideoStatus(is_available=True, reason=None)
+    unavailable = VideoStatus(is_available=False, reason="deleted")
+    unknown = VideoStatus(is_available=None, reason="status_check_failed")
+    assert available.is_available is True
+    assert unavailable.is_available is False
+    assert unknown.is_available is None
+
+
+def test_fetch_video_statuses_maps_uploadStatus_rejected(monkeypatch) -> None:
+    """`status.uploadStatus = "rejected"` → is_available=False, reason='rejected'."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake_videos_list(*, ids: list[str]) -> dict:
+        return {
+            "items": [
+                {"id": "rej1", "status": {"uploadStatus": "rejected", "privacyStatus": "public"}},
+            ]
+        }
+
+    monkeypatch.setattr(client, "_videos_list", fake_videos_list)
+    out = client.fetch_video_statuses(["rej1"])
+    assert out["rej1"] == VideoStatus(is_available=False, reason="rejected")
+
+
+def test_fetch_video_statuses_maps_uploadStatus_deleted(monkeypatch) -> None:
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(
+        client,
+        "_videos_list",
+        lambda *, ids: {
+            "items": [
+                {"id": "del1", "status": {"uploadStatus": "deleted", "privacyStatus": "public"}},
+            ]
+        },
+    )
+
+    out = client.fetch_video_statuses(["del1"])
+    assert out["del1"] == VideoStatus(is_available=False, reason="deleted")
+
+
+def test_fetch_video_statuses_maps_present_video_to_available(monkeypatch) -> None:
+    """Anything not rejected/deleted, when the video resource is present,
+    is treated as available — including private videos returned to the
+    owner (they can still play it). See spec for false-ghost discussion."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(
+        client,
+        "_videos_list",
+        lambda *, ids: {
+            "items": [
+                {"id": "pub", "status": {"uploadStatus": "processed", "privacyStatus": "public"}},
+                {"id": "unl", "status": {"uploadStatus": "processed", "privacyStatus": "unlisted"}},
+                {"id": "own", "status": {"uploadStatus": "processed", "privacyStatus": "private"}},
+            ]
+        },
+    )
+
+    out = client.fetch_video_statuses(["pub", "unl", "own"])
+    assert out["pub"] == VideoStatus(is_available=True, reason=None)
+    assert out["unl"] == VideoStatus(is_available=True, reason=None)
+    assert out["own"] == VideoStatus(is_available=True, reason=None)
+
+
+def test_fetch_video_statuses_emits_placeholder_for_missing(monkeypatch) -> None:
+    """IDs absent from the response → placeholder VideoStatus that the
+    scan command will disambiguate via snippet titles. fetch_video_statuses
+    NEVER emits 'private'/'deleted'/'unavailable' for missing IDs — those
+    decisions belong to stage 2."""
+    from likesurgeon.youtube_client import VideoStatus, YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(
+        client,
+        "_videos_list",
+        lambda *, ids: {
+            "items": [
+                {
+                    "id": "present",
+                    "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+                },
+            ]
+        },
+    )
+
+    out = client.fetch_video_statuses(["present", "gone"])
+    assert out["present"] == VideoStatus(is_available=True, reason=None)
+    assert out["gone"] == VideoStatus(is_available=False, reason="missing_from_videos_list")
+
+
+def test_fetch_video_statuses_batches_by_50(monkeypatch) -> None:
+    """120 IDs should produce 3 calls (50 + 50 + 20). The function returns
+    one entry per input ID regardless of batching."""
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    calls: list[list[str]] = []
+
+    def fake(*, ids: list[str]) -> dict:
+        calls.append(list(ids))
+        return {
+            "items": [
+                {"id": vid, "status": {"uploadStatus": "processed", "privacyStatus": "public"}}
+                for vid in ids
+            ]
+        }
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    video_ids = [f"v{i}" for i in range(120)]
+    out = client.fetch_video_statuses(video_ids)
+
+    assert len(calls) == 3
+    assert [len(c) for c in calls] == [50, 50, 20]
+    assert set(out.keys()) == set(video_ids)

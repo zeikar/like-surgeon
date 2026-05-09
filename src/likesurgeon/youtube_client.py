@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,32 @@ class ClientSecretsMissingError(FileNotFoundError):
 
 class AuthorizationRequiredError(RuntimeError):
     """Raised when no token exists (or a stale one cannot refresh)."""
+
+
+@dataclass(frozen=True)
+class VideoStatus:
+    """Result of a single video's availability check.
+
+    ``is_available`` is tri-state to mirror ``SnapshotItem.is_available``:
+    ``True`` (playable), ``False`` (unavailable), ``None`` (unknown — usually
+    a status-check failure).
+    """
+
+    is_available: bool | None
+    reason: str | None
+
+
+def _classify_status(status: dict[str, Any]) -> VideoStatus:
+    """Stage-1 status mapping for a present video resource. See spec
+    "Status mapping pipeline" for the full rules. privacyStatus is
+    deliberately NOT consulted: a returned private video means the caller
+    is the owner (or has explicit access), so it's playable."""
+    upload = status.get("uploadStatus")
+    if upload == "rejected":
+        return VideoStatus(is_available=False, reason="rejected")
+    if upload == "deleted":
+        return VideoStatus(is_available=False, reason="deleted")
+    return VideoStatus(is_available=True, reason=None)
 
 
 class YouTubeClient:
@@ -181,3 +208,49 @@ class YouTubeClient:
             if not page_token:
                 break
         return items[:limit]
+
+    _STATUS_BATCH_SIZE = 50
+
+    def _videos_list(self, *, ids: list[str]) -> dict[str, Any]:
+        """Thin wrapper around `videos.list?part=status&id=<ids>`.
+
+        Split out so tests can monkeypatch this single seam without faking
+        the entire `googleapiclient` discovery surface. Production callers
+        go through `fetch_video_statuses`.
+
+        Note: `maxResults` is intentionally NOT passed. Per the official
+        videos.list documentation, `maxResults` is only valid when filtering
+        by `chart` or `myRating`; with the `id` filter, supplying it makes
+        the live request fail. The API returns one item per requested ID
+        anyway.
+        """
+        service = self._service()
+        return service.videos().list(part="status", id=",".join(ids)).execute()
+
+    def fetch_video_statuses(self, video_ids: list[str]) -> dict[str, VideoStatus]:
+        """Stage-1 status check via batched `videos.list?part=status`.
+
+        Returns one entry per input ID. IDs missing from the API response
+        get the placeholder ``VideoStatus(is_available=False,
+        reason='missing_from_videos_list')`` — this function takes only
+        video IDs and has no access to ``playlistItems.list`` snippet
+        titles, so it cannot distinguish "made private" from "deleted"
+        from "region-restricted". The scan command resolves the
+        placeholder into a final reason. The placeholder must never reach
+        the database.
+
+        Batch failure handling lands in Task 3.
+        """
+        out: dict[str, VideoStatus] = {}
+        for start in range(0, len(video_ids), self._STATUS_BATCH_SIZE):
+            chunk = video_ids[start : start + self._STATUS_BATCH_SIZE]
+            resp = self._videos_list(ids=chunk)
+            seen: set[str] = set()
+            for item in resp.get("items", []):
+                vid = item["id"]
+                seen.add(vid)
+                out[vid] = _classify_status(item.get("status") or {})
+            for vid in chunk:
+                if vid not in seen:
+                    out[vid] = VideoStatus(is_available=False, reason="missing_from_videos_list")
+        return out
