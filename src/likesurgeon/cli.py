@@ -48,8 +48,18 @@ err_console = Console(stderr=True)
 
 
 def _bootstrap() -> tuple[Config, sessionmaker]:
-    """Resolve config, ensure app dir + schema, return a session factory."""
-    cfg = Config.load()
+    """Resolve config, ensure app dir + schema, return a session factory.
+
+    InvalidRegionError raised by ``Config.load`` (when ``config.json``
+    holds a non-alpha-2 region value) is caught here and converted to a
+    friendly ``_fail(code=2)`` so the user never sees a traceback for a
+    config typo. CLI flag validation lives elsewhere in the Typer
+    callback ``_parse_region_flag``.
+    """
+    try:
+        cfg = Config.load()
+    except InvalidRegionError as e:
+        _fail(str(e), code=2)
     cfg.ensure_app_dir()
     engine = make_engine(cfg.db_path)
     init_db(engine)

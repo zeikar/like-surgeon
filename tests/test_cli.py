@@ -155,3 +155,46 @@ def test_scan_youtube_likes_rejects_invalid_region_flag(
     assert result.exit_code == 2
     assert "ISO 3166-1 alpha-2" in result.output
     assert patch_youtube_client.fetch_called is False
+
+
+def test_config_load_propagates_invalid_region_in_json(
+    fake_home: Path,
+) -> None:
+    """Unit-level guard: Config.load() raises InvalidRegionError when
+    config.json holds a non-alpha-2 region. Pinned independently of the
+    CLI catch so a future config refactor can't silently swallow it."""
+    import json
+
+    from likesurgeon.config import Config, InvalidRegionError
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KOREA"}))
+
+    with pytest.raises(InvalidRegionError):
+        Config.load()
+
+
+def test_bootstrap_converts_invalid_region_to_fail(
+    fake_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """_bootstrap catches InvalidRegionError from Config.load and
+    converts it to typer.Exit(code=2) with a friendly message — the
+    user must never see a traceback for a config typo. The error
+    message must surface the offending value so the user can fix it."""
+    import json
+
+    import typer
+
+    from likesurgeon.cli import _bootstrap
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KOREA"}))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        _bootstrap()
+    assert exc_info.value.exit_code == 2
+    # `_fail` prints to err_console (stderr by default in this codebase).
+    # Capture both streams so we don't depend on Rich's stream choice.
+    out, err = capsys.readouterr()
+    combined = out + err
+    assert "KOREA" in combined
+    assert "ISO 3166-1 alpha-2" in combined
