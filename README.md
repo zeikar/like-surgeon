@@ -2,7 +2,7 @@
 
 > Sync, backup, and repair your YouTube Music liked songs.
 
-**Status:** MVP 0.2 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis. Local-first. No server, no destructive actions.
+**Status:** MVP 0.3 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis, ghost detection, and metadata drift. Local-first. No server, no destructive actions.
 
 ## What it does today
 
@@ -131,7 +131,7 @@ uv run likesurgeon issues --min-confidence 0.7 --format json
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
-- **YouTube Data API quota.** A scan of 5000 likes is ~100 quota units; the default daily quota is 10000. Re-scanning a few times a day is fine.
+- **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status` for ghost detection); the default daily quota is 10000. Re-scanning a few times a day is fine.
 - **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — nothing is mutated on the user's behalf.
 
 ## Local layout
