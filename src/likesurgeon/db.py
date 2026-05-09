@@ -26,24 +26,51 @@ def _sqlite_fk_pragma(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
+def _migrate_in_place(engine: Engine) -> None:
+    """Idempotently add columns introduced after a table was first created.
+
+    SQLite supports ``ALTER TABLE ... ADD COLUMN`` for nullable columns
+    without rewriting existing rows. This helper guards each ALTER with a
+    ``PRAGMA table_info`` check so it's safe to call on every engine
+    construction. Tables that don't exist yet are skipped — fresh installs
+    let ``init_db`` create them with the columns already in
+    ``Base.metadata``.
+    """
+    with engine.begin() as conn:
+        tables = {
+            row[0]
+            for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "snapshot_items" not in tables:
+            return
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(snapshot_items)")}
+        for name, decl in (
+            ("is_available", "BOOLEAN"),
+            ("unavailable_reason", "VARCHAR(32)"),
+        ):
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE snapshot_items ADD COLUMN {name} {decl}")
+
+
 def make_engine(db_path: Path) -> Engine:
-    """Build a SQLite engine pointing at ``db_path``."""
+    """Build a SQLite engine pointing at ``db_path``.
+
+    Runs ``_migrate_in_place`` as a side effect so every CLI command path
+    transparently bootstraps any 0.3+ schema additions on existing DBs.
+    """
     url = f"sqlite:///{db_path}"
-    return create_engine(url, future=True)
+    engine = create_engine(url, future=True)
+    _migrate_in_place(engine)
+    return engine
 
 
 def init_db(engine: Engine) -> None:
     """Create all tables if missing.
 
-    0.2 ships with a breaking schema change vs. 0.1: the YouTube Music source
-    string was renamed, three classifier columns were added to SnapshotItem,
-    Snapshot/Track ``created_at``/``updated_at`` became timezone-aware, and
-    two new tables were introduced for cross-source compare output —
-    ``Diagnosis`` (one row per ``compare-likes`` run) and ``DiagnosisItem``
-    (one row per persisted issue, FK to Diagnosis with cascade). Existing
-    0.1 DBs must be deleted and rescanned — a deliberate MVP choice; see
-    README's "Upgrading from 0.1" section. Alembic / proper migrations land
-    in 0.3+ once there's a real user base to protect.
+    For 0.3+ schema additions to existing DBs, see ``_migrate_in_place``
+    (called from ``make_engine``) — that path adds new nullable columns
+    without rewriting existing rows. ``init_db`` itself only handles the
+    "no tables yet" case.
     """
     Base.metadata.create_all(engine)
 

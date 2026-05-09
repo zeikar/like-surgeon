@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
+from .compare import CompareInput, CompareResult, compare_likes
 from .config import Config
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diff import diff_snapshots
@@ -202,11 +204,18 @@ def scan_ytmusic(
 def scan_youtube_likes(
     limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
 ) -> None:
-    """Fetch YouTube liked videos (LL playlist) and store a snapshot."""
+    """Fetch YouTube liked videos (LL playlist) and store a snapshot.
+
+    Also runs a per-video availability check (`videos.list?part=status`) and
+    persists the result as `SnapshotItem.is_available` / `unavailable_reason`
+    so `compare-likes` can surface ghost videos. See spec "Status mapping
+    pipeline".
+    """
     from .youtube_client import (
         AuthorizationRequiredError,
         ClientSecretsMissingError,
         YouTubeClient,
+        attach_video_statuses,
     )
 
     cfg, factory = _bootstrap()
@@ -219,16 +228,30 @@ def scan_youtube_likes(
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
 
+    # Stage 1 + 2 + injection. attach_video_statuses mutates items in place
+    # so they can be passed straight to create_snapshot below.
+    video_ids: list[str] = []
+    for it in items:
+        snippet = it.get("snippet") or {}
+        content = it.get("contentDetails") or {}
+        vid = content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+        if vid:
+            video_ids.append(vid)
+
+    statuses = client.fetch_video_statuses(video_ids)
+    attach_video_statuses(items, statuses)
+
     with session_scope(factory) as session:
         snap = create_snapshot(session, "youtube_liked_videos", items)
-        # Quick music-candidate count for the post-scan summary.
         from .snapshot import get_snapshot_items
 
         scan_items = get_snapshot_items(session, snap.id)
         music_like = sum(1 for it in scan_items if it.is_music_candidate)
+        unavailable = sum(1 for it in scan_items if it.is_available is False)
         console.print(
             f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored "
-            f"({len(items)} videos, [bold]{music_like}[/bold] music-like)."
+            f"({len(items)} videos, [bold]{music_like}[/bold] music-like, "
+            f"[bold]{unavailable}[/bold] unavailable)."
         )
 
 
@@ -363,7 +386,9 @@ def doctor() -> None:
             f"[bold]Latest diagnosis #{d.diagnosis_id}:[/bold] "
             f"{d.possibly_missing_from_ytmusic} possibly missing from YT Music · "
             f"{d.pointer_drift} pointer drift · "
-            f"{d.ytmusic_only} YT Music only"
+            f"{d.ytmusic_only} YT Music only · "
+            f"{d.unavailable_videos} unavailable videos · "
+            f"{d.metadata_drift} metadata drift"
         )
 
     if report.match_rate_percent is None:
@@ -374,43 +399,114 @@ def doctor() -> None:
         console.print(f"[bold]Match-rate health score:[/bold] [{color}]{score:.1f}%[/{color}]")
 
 
+@dataclass(frozen=True)
+class _PipelineResult:
+    """Compound return value for `_compare_and_persist` so the CLI wrapper
+    can render the existing summary table AND the two new finding-type
+    rows from a single call. Tests typically only need `.diagnosis_id`.
+    """
+
+    diagnosis_id: int
+    compare_result: CompareResult
+    unavailable_count: int
+    drift_count: int
+
+
+def _compare_and_persist(session: Session) -> _PipelineResult:
+    """Run the full 0.3 compare-likes pipeline against the current session
+    and return the persisted Diagnosis id plus the finding counts the CLI
+    summary needs.
+
+    Pipeline:
+      1. Cross-source matcher (existing 0.2 buckets) → CompareResult.
+      2. Persist a Diagnosis with the existing buckets via `create_diagnosis`.
+      3. Append ghost findings (latest YouTube snapshot's is_available=False rows).
+      4. Append drift findings per source (latest, prev) via `detect_drift`.
+      All findings live on a single Diagnosis row.
+    """
+    from .diagnosis import (
+        DiagnosisInput,
+        build_metadata_drift_items,
+        build_unavailable_video_items,
+        create_diagnosis,
+    )
+    from .drift import detect_drift
+    from .snapshot import (
+        YOUTUBE_LIKED_VIDEOS,
+        YTMUSIC_LIKED_SONGS,
+        get_snapshot_items,
+        latest_snapshot,
+        latest_snapshots_for_source,
+    )
+
+    yt_snap = latest_snapshot(session, source=YOUTUBE_LIKED_VIDEOS)
+    ytm_snap = latest_snapshot(session, source=YTMUSIC_LIKED_SONGS)
+    if yt_snap is None or ytm_snap is None:
+        missing: list[str] = []
+        if ytm_snap is None:
+            missing.append("[cyan]likesurgeon scan ytmusic[/cyan]")
+        if yt_snap is None:
+            missing.append("[cyan]likesurgeon scan youtube-likes[/cyan]")
+        _fail(
+            "Need both a ytmusic_liked_songs and a youtube_liked_videos "
+            f"snapshot first. Run: {', '.join(missing)}.",
+            code=2,
+        )
+
+    yt_items = get_snapshot_items(session, yt_snap.id)
+    ytm_items = get_snapshot_items(session, ytm_snap.id)
+
+    # Stage A — existing cross-source matcher.
+    cmp_result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
+
+    # Stage B — persist Diagnosis + the existing 0.2 finding buckets.
+    diagnosis = create_diagnosis(
+        session,
+        DiagnosisInput(
+            ytmusic_snapshot_id=ytm_snap.id,
+            youtube_snapshot_id=yt_snap.id,
+            result=cmp_result,
+        ),
+    )
+
+    # Stage C — append ghost findings.
+    ghost_items = build_unavailable_video_items(diagnosis.id, yt_items)
+    for it in ghost_items:
+        session.add(it)
+
+    # Stage D — append drift findings per source against (latest, prev).
+    drift_total = 0
+    for source in (YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS):
+        snaps = latest_snapshots_for_source(session, source, limit=2)
+        if len(snaps) < 2:
+            continue
+        curr_snap, prev_snap = snaps[0], snaps[1]
+        curr_items = get_snapshot_items(session, curr_snap.id)
+        prev_items = get_snapshot_items(session, prev_snap.id)
+        findings = detect_drift(prev_items, curr_items, source=source)
+        drift_items = build_metadata_drift_items(diagnosis.id, findings, curr_items)
+        drift_total += len(drift_items)
+        for it in drift_items:
+            session.add(it)
+
+    session.flush()
+    return _PipelineResult(
+        diagnosis_id=diagnosis.id,
+        compare_result=cmp_result,
+        unavailable_count=len(ghost_items),
+        drift_count=drift_total,
+    )
+
+
 @app.command("compare-likes")
 def compare_likes_cmd() -> None:
     """Compare latest YouTube Music vs. YouTube liked-videos snapshots."""
-    from .compare import CompareInput, compare_likes
-    from .diagnosis import DiagnosisInput, create_diagnosis
-    from .snapshot import get_snapshot_items, latest_snapshot
-
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        ytm_snap = latest_snapshot(session, source="ytmusic_liked_songs")
-        yt_snap = latest_snapshot(session, source="youtube_liked_videos")
-        if ytm_snap is None or yt_snap is None:
-            missing: list[str] = []
-            if ytm_snap is None:
-                missing.append("[cyan]likesurgeon scan ytmusic[/cyan]")
-            if yt_snap is None:
-                missing.append("[cyan]likesurgeon scan youtube-likes[/cyan]")
-            _fail(
-                "Need both a ytmusic_liked_songs and a youtube_liked_videos "
-                f"snapshot first. Run: {', '.join(missing)}.",
-                code=2,
-            )
+        outcome = _compare_and_persist(session)
 
-        ytm_items = get_snapshot_items(session, ytm_snap.id)
-        yt_items = get_snapshot_items(session, yt_snap.id)
-
-        result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
-        diag = create_diagnosis(
-            session,
-            DiagnosisInput(
-                ytmusic_snapshot_id=ytm_snap.id,
-                youtube_snapshot_id=yt_snap.id,
-                result=result,
-            ),
-        )
-
-    console.print(f"[green]✓[/green] Diagnosis [bold]#{diag.id}[/bold] saved.")
+    result = outcome.compare_result
+    console.print(f"[green]✓[/green] Diagnosis [bold]#{outcome.diagnosis_id}[/bold] saved.")
     table = Table(title="compare-likes summary")
     table.add_column("Bucket")
     table.add_column("Count", justify="right")
@@ -427,6 +523,8 @@ def compare_likes_cmd() -> None:
         str(len(result.ytmusic_only_likes)),
     )
     table.add_row("Pointer-drift candidates", str(len(result.pointer_drift_candidates)))
+    table.add_row("Unavailable videos (ghost)", str(outcome.unavailable_count))
+    table.add_row("Metadata drift candidates", str(outcome.drift_count))
     console.print(table)
     console.print("Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown.")
 
@@ -438,9 +536,9 @@ def issues(
         typer.Option(
             "--type",
             help=(
-                "Filter by issue type "
-                "(possibly_missing_from_ytmusic | possible_pointer_drift | "
-                "ytmusic_only)."
+                "Filter findings by issue type. One of: "
+                "possibly_missing_from_ytmusic | possible_pointer_drift | "
+                "ytmusic_only | unavailable_video | metadata_drift."
             ),
         ),
     ] = None,

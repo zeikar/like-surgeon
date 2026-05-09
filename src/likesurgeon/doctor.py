@@ -34,6 +34,8 @@ class DiagnosisSummary:
     possibly_missing_from_ytmusic: int
     pointer_drift: int
     ytmusic_only: int
+    unavailable_videos: int
+    metadata_drift: int
 
 
 @dataclass(frozen=True)
@@ -78,8 +80,10 @@ def _source_health(session: Session, source: str) -> SourceHealth:
 
 def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None, float | None]:
     from .diagnosis import (
+        ISSUE_METADATA_DRIFT,
         ISSUE_POINTER_DRIFT,
         ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
+        ISSUE_UNAVAILABLE_VIDEO,
         ISSUE_YTMUSIC_ONLY,
         diagnosis_items,
         latest_diagnosis,
@@ -94,6 +98,8 @@ def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None
         ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC: 0,
         ISSUE_POINTER_DRIFT: 0,
         ISSUE_YTMUSIC_ONLY: 0,
+        ISSUE_UNAVAILABLE_VIDEO: 0,
+        ISSUE_METADATA_DRIFT: 0,
     }
     for it in items:
         if it.issue_type in counts:
@@ -103,6 +109,8 @@ def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None
         possibly_missing_from_ytmusic=counts[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
         pointer_drift=counts[ISSUE_POINTER_DRIFT],
         ytmusic_only=counts[ISSUE_YTMUSIC_ONLY],
+        unavailable_videos=counts[ISSUE_UNAVAILABLE_VIDEO],
+        metadata_drift=counts[ISSUE_METADATA_DRIFT],
     )
 
     # Health: match_rate = (yt_music_candidates - unmatched) / yt_music_candidates.

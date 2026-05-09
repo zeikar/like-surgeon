@@ -2,7 +2,7 @@
 
 > Sync, backup, and repair your YouTube Music liked songs.
 
-**Status:** MVP 0.2 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis. Local-first. No server, no destructive actions.
+**Status:** MVP 0.3 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis, ghost detection, and metadata drift. Local-first. No server, no destructive actions.
 
 ## What it does today
 
@@ -11,6 +11,7 @@
 - Diffs any two snapshots, exports any snapshot to JSON.
 - Classifies YouTube liked videos as music-candidate / not via heuristics (channel ends with `- Topic`, "Provided to YouTube by …", "Official Music Video", "Lyric Video", `artist - title`, etc.; negatives like `vlog`, `tutorial`, `gameplay`).
 - `compare-likes` does a three-stage match (`video_id` → `canonical_key` → RapidFuzz fuzzy on `title | artists`) and persists findings as a `Diagnosis` plus per-finding `DiagnosisItem` rows.
+- Detects ghost YouTube likes (deleted, made private, unavailable) at scan time, and metadata drift (title or artists list changes) between snapshots — both surface through `compare-likes` and `issues`.
 - `issues` lists the latest diagnosis with type/confidence filters and JSON output.
 - `doctor` is now multi-source: counts per source, latest diagnosis summary, and a match-rate health score.
 
@@ -24,7 +25,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | 0.2         | YouTube Data API + classifier + cross-source compare/issues           |
 | 0.2.1       | Explored ytmusicapi OAuth (Device Code) to escape browser-header cookie staleness — abandoned: ytmusicapi 1.12 + Google's current backend reject every non-TV `clientName` for OAuth-issued tokens, and the TV clients return YouTube-shape responses ytmusicapi can't parse. Notes archived at [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md). Salvaged: `fetch_liked_songs` parse-error boundary so stale auth surfaces as a clean re-auth hint instead of a ytmusicapi traceback. |
 | **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
-| 0.3         | Matching engine for missing / "ghost" / pointer-drift tracks          |
+| **0.3**     | Matching engine: ghost YouTube likes (deleted/private/unavailable, detected at `scan youtube-likes` time via `videos.list`) and metadata drift (snapshot-pair title/artists comparison via [RapidFuzz](https://github.com/maxbachmann/RapidFuzz)). Both surface as new `issue_type` rows on `compare-likes`; no new commands. |
 | 0.4         | Backup playlist support                                               |
 | 1.0         | Local web UI / Electron app                                           |
 
@@ -120,28 +121,17 @@ uv run likesurgeon doctor
 uv run likesurgeon compare-likes
 uv run likesurgeon issues
 uv run likesurgeon issues --type possibly_missing_from_ytmusic
+uv run likesurgeon issues --type unavailable_video
+uv run likesurgeon issues --type metadata_drift
 uv run likesurgeon issues --min-confidence 0.7 --format json
 ```
 
 `compare-likes` requires a snapshot from each source. It prints a bucket summary and persists the run as a `Diagnosis`. `issues` then surfaces the per-item breakdown.
 
-## Upgrading from 0.1
-
-0.2 ships breaking schema changes (source-string rename + new tables/columns). At MVP scope we don't ship in-place migrations — delete the local DB and re-scan:
-
-```bash
-rm ~/.like-surgeon/like-surgeon.sqlite
-uv run likesurgeon init
-uv run likesurgeon scan ytmusic
-uv run likesurgeon scan youtube-likes  # once you've completed `auth youtube`
-```
-
-Re-scanning is fast (a 5000-like library is ~5 seconds for ytmusicapi and ~100 quota units for YouTube Data API).
-
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
-- **YouTube Data API quota.** A scan of 5000 likes is ~100 quota units; the default daily quota is 10000. Re-scanning a few times a day is fine.
+- **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status` for ghost detection); the default daily quota is 10000. Re-scanning a few times a day is fine.
 - **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — nothing is mutated on the user's behalf.
 
 ## Local layout

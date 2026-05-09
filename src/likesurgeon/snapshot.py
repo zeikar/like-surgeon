@@ -89,6 +89,8 @@ def _ytmusic_to_record(item: dict[str, Any]) -> dict[str, Any]:
         "is_music_candidate": None,  # ytmusic source: every track is music
         "music_candidate_score": None,
         "music_candidate_reason": None,
+        "is_available": None,
+        "unavailable_reason": None,
     }
 
 
@@ -123,6 +125,9 @@ def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
 
     classification = classify(title=title, channel=channel, description=description)
 
+    augmentation = item.get("_likesurgeon_video_status") or {}
+    raw = {k: v for k, v in item.items() if not k.startswith("_likesurgeon_")}
+
     return {
         "video_id": video_id,
         "title": title,
@@ -132,10 +137,12 @@ def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
         "thumbnails": (snippet.get("thumbnails") or None),
         "canonical_key": canon,
         "dedupe_key": dedupe,
-        "raw": item,
+        "raw": raw,
         "is_music_candidate": classification.is_music_candidate,
         "music_candidate_score": classification.score,
         "music_candidate_reason": classification.reason,
+        "is_available": augmentation.get("is_available"),
+        "unavailable_reason": augmentation.get("reason"),
     }
 
 
@@ -214,6 +221,8 @@ def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any
                 is_music_candidate=rec["is_music_candidate"],
                 music_candidate_score=rec["music_candidate_score"],
                 music_candidate_reason=rec["music_candidate_reason"],
+                is_available=rec.get("is_available"),
+                unavailable_reason=rec.get("unavailable_reason"),
             )
         )
     session.flush()
@@ -246,3 +255,18 @@ def latest_snapshot(session: Session, source: str | None = None) -> Snapshot | N
         stmt = stmt.where(Snapshot.source == source)
     stmt = stmt.order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(1)
     return session.scalar(stmt)
+
+
+def latest_snapshots_for_source(session: Session, source: str, *, limit: int = 2) -> list[Snapshot]:
+    """Return up to ``limit`` most-recent snapshots for ``source``,
+    most-recent first. Used by drift detection in `compare-likes` to
+    pull the (latest, previous) pair per source. Returns ``[]`` when the
+    source has no snapshots; returns a 1-list when only one exists.
+    """
+    stmt = (
+        select(Snapshot)
+        .where(Snapshot.source == source)
+        .order_by(Snapshot.created_at.desc(), Snapshot.id.desc())
+        .limit(limit)
+    )
+    return list(session.scalars(stmt).all())

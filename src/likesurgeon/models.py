@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -104,6 +105,12 @@ class SnapshotItem(Base):
     music_candidate_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     music_candidate_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Ghost detection (0.3): availability of the underlying YouTube video at
+    # scan time. ``None`` means "unknown" (snapshot taken before 0.3, or
+    # status check failed). Only populated for ``youtube_liked_videos`` rows.
+    is_available: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    unavailable_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     snapshot: Mapped[Snapshot] = relationship(back_populates="items")
     track: Mapped[Track] = relationship()
 
@@ -148,6 +155,11 @@ class DiagnosisItem(Base):
         ``video_id`` nor ``canonical_key`` exact.
       - ``ytmusic_only`` — YT Music has it but no YT like (informational —
         often just "user never liked it on YouTube").
+      - ``unavailable_video`` — the underlying YouTube video is no longer
+        playable (deleted/private/unavailable), detected at scan time via
+        ``videos.list``.
+      - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
+        of one source with meaningfully different title or artists.
     """
 
     __tablename__ = "diagnosis_items"
