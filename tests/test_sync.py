@@ -460,7 +460,9 @@ def test_execute_yt_unlike_success(session: Session) -> None:
     yt = FakeYouTube()
     ytm = FakeYTMusic()
     actions = [
-        PlannedAction(item_id=item.id, kind="yt_unlike", primary_video_id="ghost", secondary_video_id=None)
+        PlannedAction(
+            item_id=item.id, kind="yt_unlike", primary_video_id="ghost", secondary_video_id=None
+        )
     ]
     res = execute(session, actions, [], ytm=ytm, yt=yt)
 
@@ -488,7 +490,9 @@ def test_execute_ytm_like_success(session: Session) -> None:
     yt = FakeYouTube()
     ytm = FakeYTMusic()
     actions = [
-        PlannedAction(item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None)
+        PlannedAction(
+            item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None
+        )
     ]
     res = execute(session, actions, [], ytm=ytm, yt=yt)
 
@@ -556,7 +560,9 @@ def test_execute_yt_unlike_failure_keeps_status_open(session: Session) -> None:
     yt = FakeYouTube(raise_on={("ghost", "none")})
     ytm = FakeYTMusic()
     actions = [
-        PlannedAction(item_id=item.id, kind="yt_unlike", primary_video_id="ghost", secondary_video_id=None)
+        PlannedAction(
+            item_id=item.id, kind="yt_unlike", primary_video_id="ghost", secondary_video_id=None
+        )
     ]
     res = execute(session, actions, [], ytm=ytm, yt=yt)
 
@@ -679,7 +685,9 @@ def test_execute_ytm_like_failure_keeps_status_open(session: Session) -> None:
     yt = FakeYouTube()
     ytm = FakeYTMusic(raise_on={"song"})
     actions = [
-        PlannedAction(item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None)
+        PlannedAction(
+            item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None
+        )
     ]
     res = execute(session, actions, [], ytm=ytm, yt=yt)
 
@@ -707,7 +715,11 @@ def test_execute_skips_produce_sync_attempts(session: Session) -> None:
 
     yt = FakeYouTube()
     ytm = FakeYTMusic()
-    skips = [SkipRecord(item_id=item.id, kind="yt_unlike", reason="no video_id available for source track")]
+    skips = [
+        SkipRecord(
+            item_id=item.id, kind="yt_unlike", reason="no video_id available for source track"
+        )
+    ]
     res = execute(session, [], skips, ytm=ytm, yt=yt)
 
     assert res == ExecResult(applied=0, failed=0, skipped=1)
@@ -765,8 +777,12 @@ def test_execute_commits_per_action(session: Session) -> None:
     yt = CrashingYouTube()
     ytm = FakeYTMusic()
     actions = [
-        PlannedAction(item_id=item1_id, kind="yt_unlike", primary_video_id="vid_one", secondary_video_id=None),
-        PlannedAction(item_id=item2_id, kind="yt_unlike", primary_video_id="vid_two", secondary_video_id=None),
+        PlannedAction(
+            item_id=item1_id, kind="yt_unlike", primary_video_id="vid_one", secondary_video_id=None
+        ),
+        PlannedAction(
+            item_id=item2_id, kind="yt_unlike", primary_video_id="vid_two", secondary_video_id=None
+        ),
     ]
     with pytest.raises(RuntimeError, match="transport crash"):
         execute(session, actions, [], ytm=ytm, yt=yt)
@@ -786,5 +802,3 @@ def test_execute_commits_per_action(session: Session) -> None:
         assert attempts2 == []
     finally:
         fresh.close()
-
-

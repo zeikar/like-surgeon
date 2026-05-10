@@ -247,12 +247,7 @@ class YouTubeClient:
         token_has_write = _token_has_write_scope(self._token_path)
         if creds is not None and creds.valid and token_has_write:
             return
-        if (
-            creds is not None
-            and creds.expired
-            and creds.refresh_token
-            and token_has_write
-        ):
+        if creds is not None and creds.expired and creds.refresh_token and token_has_write:
             try:
                 creds.refresh(Request())
             except RefreshError:

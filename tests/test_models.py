@@ -52,8 +52,12 @@ def test_sync_attempt_cascade_delete_on_diagnosis_item(session: Session) -> None
     ``db._sqlite_fk_pragma``). Otherwise orphaned attempts would dangle on
     diagnoses pruned by future cleanup paths."""
     item = _make_diagnosis_item(session)
-    session.add(SyncAttempt(diagnosis_item_id=item.id, kind="ytm_like", status="failed", reason="x"))
-    session.add(SyncAttempt(diagnosis_item_id=item.id, kind="yt_unlike", status="applied", reason="y"))
+    session.add(
+        SyncAttempt(diagnosis_item_id=item.id, kind="ytm_like", status="failed", reason="x")
+    )
+    session.add(
+        SyncAttempt(diagnosis_item_id=item.id, kind="yt_unlike", status="applied", reason="y")
+    )
     session.flush()
     assert session.execute(select(SyncAttempt)).scalars().all()  # sanity
 

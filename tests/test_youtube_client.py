@@ -818,9 +818,7 @@ def test_has_write_scope_true_after_upgrade(tmp_path: Path) -> None:
 
 
 def test_has_write_scope_false_when_no_token(tmp_path: Path) -> None:
-    c = YouTubeClient(
-        client_secrets_path=None, token_path=tmp_path / "does-not-exist.json"
-    )
+    c = YouTubeClient(client_secrets_path=None, token_path=tmp_path / "does-not-exist.json")
     assert c.has_write_scope() is False
 
 
@@ -870,8 +868,7 @@ def test_has_write_scope_string_with_write_scope_returns_true(tmp_path: Path) ->
         "client_id": "fake",
         "client_secret": "fake",
         "scopes": (
-            "https://www.googleapis.com/auth/youtube "
-            "https://www.googleapis.com/auth/userinfo.email"
+            "https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/userinfo.email"
         ),
     }
     token_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -940,9 +937,7 @@ def test_authorize_re_runs_flow_when_token_lacks_write_scope(monkeypatch, tmp_pa
     monkeypatch.setattr(
         c,
         "_load_token",
-        lambda: _FakeCreds(
-            scopes=["https://www.googleapis.com/auth/youtube.readonly"], valid=True
-        ),
+        lambda: _FakeCreds(scopes=["https://www.googleapis.com/auth/youtube.readonly"], valid=True),
     )
     monkeypatch.setattr(c, "_save_token", lambda creds: None)
 
