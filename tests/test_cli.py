@@ -230,12 +230,16 @@ def test_video_ids_for_tracks_chunks_lookup_above_batch_size(
     so it doesn't exceed SQLite's `SQLITE_MAX_VARIABLE_NUMBER` for large
     diagnoses. Use a small batch size to exercise the chunking branch
     deterministically with a manageable number of fixture rows.
+
+    The helper lives in ``sync.py`` (cli.py re-exports it for back-compat),
+    so the batch-size constant must be patched on the sync module — that's
+    where the function reads it.
     """
-    from likesurgeon import cli as _cli_mod
+    from likesurgeon import sync as _sync_mod
     from likesurgeon.cli import _video_ids_for_tracks
     from likesurgeon.models import Track
 
-    monkeypatch.setattr(_cli_mod, "_TRACK_LOOKUP_BATCH_SIZE", 100)
+    monkeypatch.setattr(_sync_mod, "_TRACK_LOOKUP_BATCH_SIZE", 100)
 
     n = 250  # > 2× batch size — forces at least 3 chunks
     tracks = [

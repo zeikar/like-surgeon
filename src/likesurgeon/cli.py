@@ -19,6 +19,7 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .snapshot import create_snapshot, list_snapshots
+from .sync import _TRACK_LOOKUP_BATCH_SIZE, _video_ids_for_tracks  # noqa: F401 — re-exported
 from .ytmusic_client import (
     SUPPORTED_BROWSERS,
     AuthFileMissingError,
@@ -74,33 +75,6 @@ def _bootstrap() -> tuple[Config, sessionmaker]:
 def _fail(msg: str, code: int = 1) -> NoReturn:
     err_console.print(f"[bold red]Error:[/bold red] {msg}")
     raise typer.Exit(code)
-
-
-_TRACK_LOOKUP_BATCH_SIZE = 500
-
-
-def _video_ids_for_tracks(session: Session, track_ids: set[int]) -> dict[int, str | None]:
-    """Map ``track_ids`` to their ``Track.video_id`` values.
-
-    Issues the lookup in batches of ``_TRACK_LOOKUP_BATCH_SIZE`` so the
-    IN(...) clause never exceeds SQLite's ``SQLITE_MAX_VARIABLE_NUMBER``
-    (which can be as low as 999 on older builds). The default 500 keeps
-    each query well under that ceiling on every supported sqlite.
-    """
-    from sqlalchemy import select
-
-    from .models import Track
-
-    if not track_ids:
-        return {}
-    out: dict[int, str | None] = {}
-    ids = list(track_ids)
-    for start in range(0, len(ids), _TRACK_LOOKUP_BATCH_SIZE):
-        chunk = ids[start : start + _TRACK_LOOKUP_BATCH_SIZE]
-        rows = session.scalars(select(Track).where(Track.id.in_(chunk))).all()
-        for t in rows:
-            out[t.id] = t.video_id
-    return out
 
 
 def _resolve_region(cli_region: str | None, config_region: str | None) -> str | None:
