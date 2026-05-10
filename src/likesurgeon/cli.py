@@ -719,6 +719,16 @@ def sync(
             help="Auto-apply pointer-drift fixes only when confidence ≥ this value.",
         ),
     ] = 0.95,
+    limit: Annotated[
+        int | None,
+        typer.Option(
+            "--limit",
+            help=(
+                "Process at most N actions this run; the rest stay 'open' "
+                "for the next sync. Useful for ramped first runs."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Apply the latest diagnosis's actionable findings to YouTube / YT Music."""
     from .diagnosis import diagnosis_items, latest_diagnosis
@@ -736,6 +746,12 @@ def sync(
         items = diagnosis_items(session, diag.id)
         video_ids = resolve_video_ids(session, items)
         actions, skips = plan(items, video_ids, drift_min_confidence=drift_min_confidence)
+        if limit is not None and limit < len(actions):
+            console.print(
+                f"[yellow]--limit {limit}: applying first {limit} of "
+                f"{len(actions)} actions; rest stay open for next run.[/yellow]"
+            )
+            actions = actions[:limit]
         console.print(summarize(actions, skips))
 
         if dry_run:

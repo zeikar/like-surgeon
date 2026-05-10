@@ -717,3 +717,61 @@ def test_sync_ytm_only_run_skips_scope_check(
     assert _FakeYouTubeWrite.instances[0].rate_calls == []
     # YT Music half ran.
     assert _FakeYTMusicWrite.instances[0].calls == ["src_0"]
+
+
+def test_sync_limit_truncates_actions_and_leaves_rest_open(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """--limit N processes only the first N actions; the rest stay 'open'
+    so the next sync run picks them up. Used for ramped first runs."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
+    from likesurgeon.models import DiagnosisItem, SyncAttempt
+
+    _seed_diagnosis(
+        fake_home,
+        issue_types=[ISSUE_UNAVAILABLE_VIDEO] * 5,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes", "--limit", "2"])
+
+    assert result.exit_code == 0, result.output
+    assert "applying first 2 of 5" in result.output
+    assert "applied=2" in result.output
+
+    yt = _FakeYouTubeWrite.instances[0]
+    assert len(yt.rate_calls) == 2
+    assert yt.rate_calls == [("src_0", "none"), ("src_1", "none")]
+
+    s = _open_db(fake_home)
+    try:
+        items = list(s.scalars(select(DiagnosisItem).order_by(DiagnosisItem.id)).all())
+        # First two applied; remaining three stay 'open' for next run.
+        assert [it.status for it in items] == ["applied", "applied", "open", "open", "open"]
+        attempts = list(s.scalars(select(SyncAttempt)).all())
+        assert len(attempts) == 2
+    finally:
+        s.close()
+
+
+def test_sync_limit_above_action_count_is_noop(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """--limit N where N >= total actions doesn't print a truncation notice
+    and processes everything normally."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
+
+    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO] * 2)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes", "--limit", "10"])
+
+    assert result.exit_code == 0, result.output
+    assert "applying first" not in result.output
+    assert "applied=2" in result.output
