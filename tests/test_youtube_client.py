@@ -775,29 +775,61 @@ class _FakeCreds:
         self.refresh_token = refresh_token
 
 
-def test_has_write_scope_false_for_readonly_token(monkeypatch) -> None:
-    c = YouTubeClient(client_secrets_path=None, token_path=None)
-    monkeypatch.setattr(
-        c,
-        "_load_token",
-        lambda: _FakeCreds(scopes=["https://www.googleapis.com/auth/youtube.readonly"]),
+def _write_token_json(path: Path, *, scopes: list[str]) -> None:
+    """Write a real token JSON file in the shape google-auth expects.
+
+    Tests use real files (not monkeypatched ``_load_token``) for scope
+    checks because production reads the JSON's persisted ``scopes`` field
+    directly — ``Credentials.from_authorized_user_file`` overrides
+    ``creds.scopes`` with whatever you pass it, so a creds-based fake
+    would silently bypass the bug we're guarding against.
+    """
+    import json
+
+    payload = {
+        "token": "fake-access-token",
+        "refresh_token": "fake-refresh-token",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake-client-id",
+        "client_secret": "fake-client-secret",
+        "scopes": scopes,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_has_write_scope_false_for_readonly_token(tmp_path: Path) -> None:
+    """Real-file regression test: a token JSON whose persisted ``scopes``
+    list only has ``youtube.readonly`` must report no write scope, even
+    though ``Credentials.from_authorized_user_file(SCOPES)`` would
+    overwrite ``creds.scopes`` with the write scope."""
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_true_after_upgrade(tmp_path: Path) -> None:
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is True
+
+
+def test_has_write_scope_false_when_no_token(tmp_path: Path) -> None:
+    c = YouTubeClient(
+        client_secrets_path=None, token_path=tmp_path / "does-not-exist.json"
     )
     assert c.has_write_scope() is False
 
 
-def test_has_write_scope_true_after_upgrade(monkeypatch) -> None:
-    c = YouTubeClient(client_secrets_path=None, token_path=None)
-    monkeypatch.setattr(
-        c,
-        "_load_token",
-        lambda: _FakeCreds(scopes=["https://www.googleapis.com/auth/youtube"]),
-    )
-    assert c.has_write_scope() is True
+def test_has_write_scope_false_on_corrupt_token_json(tmp_path: Path) -> None:
+    """Defensive: malformed JSON shouldn't crash sync's pre-flight check."""
+    token_path = tmp_path / "youtube-token.json"
+    token_path.write_text("{not valid json", encoding="utf-8")
 
-
-def test_has_write_scope_false_when_no_token(monkeypatch) -> None:
-    c = YouTubeClient(client_secrets_path=None, token_path=None)
-    monkeypatch.setattr(c, "_load_token", lambda: None)
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
     assert c.has_write_scope() is False
 
 
@@ -806,11 +838,18 @@ def test_authorize_re_runs_flow_when_token_lacks_write_scope(monkeypatch, tmp_pa
     token whose ``creds.valid`` is True must NOT short-circuit ``authorize``
     — we have to re-run the consent flow so the user can grant the write
     scope. Otherwise ``likesurgeon auth youtube`` is a no-op and the user
-    is permanently stuck on read-only access."""
+    is permanently stuck on read-only access.
+
+    Uses a real token file for the scope check (the production code reads
+    the JSON directly) plus a monkeypatched ``_load_token`` to control
+    ``creds.valid`` without touching google-auth internals."""
     secrets = tmp_path / "client_secrets.json"
     secrets.write_text("{}", encoding="utf-8")  # presence-only; flow is mocked
 
-    c = YouTubeClient(client_secrets_path=secrets, token_path=None)
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=secrets, token_path=token_path)
     monkeypatch.setattr(
         c,
         "_load_token",
@@ -839,6 +878,53 @@ def test_authorize_re_runs_flow_when_token_lacks_write_scope(monkeypatch, tmp_pa
 
     assert len(flow_calls) == 1
     assert flow_calls[0][1] == ["https://www.googleapis.com/auth/youtube"]
+
+
+def test_rate_video_wraps_authorization_required_error(monkeypatch) -> None:
+    """If ``_service()`` raises (e.g. revoked token → AuthorizationRequiredError)
+    or any non-HttpError surfaces, ``rate_video`` must wrap it as
+    ``YouTubeWriteError`` so sync's continue-on-error loop records a per-item
+    failed attempt instead of aborting the whole run."""
+    from likesurgeon.youtube_client import AuthorizationRequiredError, YouTubeWriteError
+
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake_service() -> Any:
+        raise AuthorizationRequiredError("revoked")
+
+    monkeypatch.setattr(c, "_service", fake_service)
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.rate_video("VID123", "none")
+    assert exc_info.value.video_id == "VID123"
+    assert exc_info.value.rating == "none"
+    assert "revoked" in str(exc_info.value)
+
+
+def test_rate_video_wraps_transport_errors(monkeypatch) -> None:
+    """Transport / SSL / connection errors during ``.execute()`` must also
+    surface as ``YouTubeWriteError`` so they don't escape the dispatcher."""
+    from likesurgeon.youtube_client import YouTubeWriteError
+
+    class _ExplodingExecute:
+        def execute(self) -> None:
+            raise ConnectionError("network unreachable")
+
+    class _ExplodingRate:
+        def rate(self, **_kwargs: Any) -> _ExplodingExecute:
+            return _ExplodingExecute()
+
+    class _ExplodingService:
+        def videos(self) -> _ExplodingRate:
+            return _ExplodingRate()
+
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(c, "_service", lambda: _ExplodingService())
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.rate_video("VID456", "like")
+    assert exc_info.value.video_id == "VID456"
+    assert "network unreachable" in str(exc_info.value)
 
 
 def test_fetch_video_statuses_passes_region_through(monkeypatch) -> None:
