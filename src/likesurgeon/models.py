@@ -180,3 +180,31 @@ class DiagnosisItem(Base):
     status: Mapped[str] = mapped_column(String(32), default="open")
 
     diagnosis: Mapped[Diagnosis] = relationship(back_populates="items")
+    sync_attempts: Mapped[list[SyncAttempt]] = relationship(
+        back_populates="diagnosis_item", cascade="all, delete-orphan"
+    )
+
+
+class SyncAttempt(Base):
+    """One row per ``sync`` API call (or skip decision).
+
+    ``kind`` is one of ``yt_unlike``, ``ytm_like``, ``yt_relike_like``,
+    ``yt_relike_unlike`` — the two halves of a drift fix get separate rows
+    so the audit trail stays atomic per HTTP call. ``status`` is one of
+    ``applied``, ``failed``, ``skipped``. ``reason`` carries sync-side
+    detail (error message, threshold note, missing video_id, etc.) — the
+    originating ``DiagnosisItem.reason`` is never overwritten.
+    """
+
+    __tablename__ = "sync_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    diagnosis_item_id: Mapped[int] = mapped_column(
+        ForeignKey("diagnosis_items.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    diagnosis_item: Mapped[DiagnosisItem] = relationship(back_populates="sync_attempts")

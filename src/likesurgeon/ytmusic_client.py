@@ -32,6 +32,15 @@ class UnexpectedResponseError(RuntimeError):
     """
 
 
+class YTMusicWriteError(RuntimeError):
+    """Raised when a write call (e.g. ``rate_song``) fails."""
+
+    def __init__(self, video_id: str, message: str) -> None:
+        super().__init__(f"YT Music write failed for {video_id}: {message}")
+        self.video_id = video_id
+        self.message = message
+
+
 class CookieExtractionError(RuntimeError):
     """Raised when we can't pull usable YouTube cookies from a browser.
 
@@ -196,6 +205,19 @@ class YTMusicClient:
             "No YouTube Music auth file found. "
             "Run `likesurgeon auth ytmusic` and follow the printed instructions."
         )
+
+    def like_song(self, video_id: str) -> None:
+        """Like a song on YT Music via ``rate_song(video_id, "LIKE")``.
+
+        Wraps any error from ytmusicapi as ``YTMusicWriteError`` so the
+        dispatcher can attribute failures without leaking ytmusicapi
+        internals.
+        """
+        client = self._build()
+        try:
+            client.rate_song(video_id, "LIKE")
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YTMusicWriteError(video_id, str(exc)) from exc
 
     def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
         """Fetch up to ``limit`` liked songs. Returns the raw track dicts.

@@ -13,6 +13,7 @@ from likesurgeon.ytmusic_client import (
     AuthFileMissingError,
     UnexpectedResponseError,
     YTMusicClient,
+    YTMusicWriteError,
 )
 
 
@@ -72,6 +73,49 @@ def test_fetch_liked_songs_raises_when_tracks_not_list():
     client = _FakeClient({"tracks": "not-a-list"})
     with pytest.raises(UnexpectedResponseError, match="'tracks' is a str"):
         client.fetch_liked_songs()
+
+
+class _RatingFakeYTMusic:
+    """Records ``rate_song`` calls; optionally raises a chosen exception."""
+
+    def __init__(self, raise_with: Exception | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._raise = raise_with
+
+    def rate_song(self, video_id: str, rating: str) -> None:
+        self.calls.append((video_id, rating))
+        if self._raise is not None:
+            raise self._raise
+
+
+class _RatingClient(YTMusicClient):
+    def __init__(self, fake: _RatingFakeYTMusic) -> None:
+        super().__init__(browser_path=None)
+        self.fake = fake
+
+    def _build(self) -> Any:
+        return self.fake
+
+
+def test_like_song_calls_rate_song_with_LIKE() -> None:
+    """``like_song`` is a thin wrapper that always passes ``"LIKE"`` — no
+    other rating values flow through this method."""
+    fake = _RatingFakeYTMusic()
+    client = _RatingClient(fake)
+    client.like_song("vid42")
+    assert fake.calls == [("vid42", "LIKE")]
+
+
+def test_like_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
+    """ytmusicapi can raise a wide range of exception types from rate_song
+    (network, parse, auth). Surface them all as ``YTMusicWriteError`` so the
+    dispatcher's failure path doesn't have to fingerprint each one."""
+    fake = _RatingFakeYTMusic(raise_with=RuntimeError("boom"))
+    client = _RatingClient(fake)
+    with pytest.raises(YTMusicWriteError) as exc_info:
+        client.like_song("vid99")
+    assert exc_info.value.video_id == "vid99"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 def test_missing_auth_raises():

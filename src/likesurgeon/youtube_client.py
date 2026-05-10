@@ -20,7 +20,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -29,7 +29,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 LIKED_VIDEOS_FALLBACK_PLAYLIST_ID = "LL"
-SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+WRITE_SCOPE = "https://www.googleapis.com/auth/youtube"
+SCOPES = [WRITE_SCOPE]
 
 
 class ClientSecretsMissingError(FileNotFoundError):
@@ -38,6 +39,16 @@ class ClientSecretsMissingError(FileNotFoundError):
 
 class AuthorizationRequiredError(RuntimeError):
     """Raised when no token exists (or a stale one cannot refresh)."""
+
+
+class YouTubeWriteError(RuntimeError):
+    """Raised when a write call (e.g. ``videos.rate``) fails."""
+
+    def __init__(self, video_id: str, rating: str, message: str) -> None:
+        super().__init__(f"YouTube write failed for {video_id} ({rating}): {message}")
+        self.video_id = video_id
+        self.rating = rating
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -51,6 +62,16 @@ class VideoStatus:
 
     is_available: bool | None
     reason: str | None
+
+
+def _has_write_scope(creds: Credentials) -> bool:
+    """Whether ``creds.scopes`` includes the YouTube write scope.
+
+    ``creds.scopes`` is a list (possibly None on some shapes); a token issued
+    with only ``youtube.readonly`` will be missing the write scope and must
+    be re-consented before ``videos.rate`` will work.
+    """
+    return WRITE_SCOPE in (creds.scopes or [])
 
 
 def _is_quota_exceeded(exc: Any) -> bool:
@@ -186,18 +207,25 @@ class YouTubeClient:
     def authorize(self) -> None:
         """Run the InstalledApp flow once, persist the resulting token JSON.
 
-        Idempotent: if a usable token already exists, this is a no-op. If a
-        token exists but its refresh fails (revoked/expired), the method
-        falls through to the consent flow rather than raising — recovering
-        from a broken token is exactly the user-facing purpose of
-        ``auth youtube``, so making them re-run the command would be
-        circular. ``_service`` keeps the strict behavior because callers
-        there have no consent flow to fall back on.
+        Idempotent: if a usable token already exists *with the required write
+        scope*, this is a no-op. Existing readonly-only tokens (from 0.3.x)
+        fall through to the consent flow so users get a fresh token with the
+        write scope rather than dead-ending the loop. If a token exists but
+        its refresh fails (revoked/expired), the method also falls through
+        to the consent flow rather than raising — recovering from a broken
+        token is exactly the user-facing purpose of ``auth youtube``.
+        ``_service`` keeps the strict behavior because callers there have no
+        consent flow to fall back on.
         """
         creds = self._load_token()
-        if creds is not None and creds.valid:
+        if creds is not None and creds.valid and _has_write_scope(creds):
             return
-        if creds is not None and creds.expired and creds.refresh_token:
+        if (
+            creds is not None
+            and creds.expired
+            and creds.refresh_token
+            and _has_write_scope(creds)
+        ):
             try:
                 creds.refresh(Request())
             except RefreshError:
@@ -213,6 +241,18 @@ class YouTubeClient:
         flow = InstalledAppFlow.from_client_secrets_file(str(self._client_secrets_path), SCOPES)
         creds = flow.run_local_server(port=0)
         self._save_token(creds)
+
+    def has_write_scope(self) -> bool:
+        """Whether the persisted token grants the YouTube write scope.
+
+        Used by ``sync`` as a pre-flight check — should always be True after
+        the upgraded ``authorize()`` runs, but we still verify so a stale
+        readonly token from 0.3.x can't surprise a user mid-write.
+        """
+        creds = self._load_token()
+        if creds is None:
+            return False
+        return _has_write_scope(creds)
 
     def _load_token(self) -> Credentials | None:
         """Read the persisted token. Treats corrupt/partial JSON as "no token".
@@ -316,6 +356,22 @@ class YouTubeClient:
             if not page_token:
                 break
         return items[:limit]
+
+    def rate_video(self, video_id: str, rating: Literal["like", "none"]) -> None:
+        """Apply a rating to a video via ``videos.rate``.
+
+        Wraps ``HttpError`` (and any other googleapiclient surface error) in
+        ``YouTubeWriteError`` so the dispatcher can attribute failures to a
+        specific (video_id, rating) pair without leaking google-auth
+        internals.
+        """
+        from googleapiclient.errors import HttpError
+
+        service = self._service()
+        try:
+            service.videos().rate(id=video_id, rating=rating).execute()
+        except HttpError as exc:
+            raise YouTubeWriteError(video_id, rating, str(exc)) from exc
 
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
