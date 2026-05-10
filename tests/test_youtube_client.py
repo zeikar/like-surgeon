@@ -833,6 +833,46 @@ def test_has_write_scope_false_on_corrupt_token_json(tmp_path: Path) -> None:
     assert c.has_write_scope() is False
 
 
+def test_load_token_preserves_stored_readonly_scope(tmp_path: Path) -> None:
+    """Regression: ``_load_token`` must NOT pass our SCOPES list to
+    ``Credentials.from_authorized_user_file``. Doing so would override
+    ``creds.scopes`` with [youtube], which then leaks into the next
+    ``_save_token`` (after a refresh) and silently inflates the persisted
+    ``scopes`` field — turning a 0.3.x readonly token into a fake
+    write-scoped token at the file level after one read-side scan.
+    """
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    creds = c._load_token()
+
+    assert creds is not None
+    assert creds.scopes == ["https://www.googleapis.com/auth/youtube.readonly"]
+
+
+def test_save_after_load_preserves_readonly_scope_in_file(tmp_path: Path) -> None:
+    """End-to-end regression: load a readonly token, simulate a refresh by
+    re-saving the loaded creds (matches what ``_service()`` does after
+    ``creds.refresh``), then verify the file's ``scopes`` field is still
+    readonly. Before the fix, this test would see ``scopes: [youtube]``
+    in the re-saved file and ``has_write_scope()`` would return True.
+    """
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    creds = c._load_token()
+    assert creds is not None
+    c._save_token(creds)
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert persisted.get("scopes") == ["https://www.googleapis.com/auth/youtube.readonly"]
+    assert c.has_write_scope() is False
+
+
 def test_authorize_re_runs_flow_when_token_lacks_write_scope(monkeypatch, tmp_path) -> None:
     """Critical regression test for the OAuth dead-end: a 0.3.x readonly
     token whose ``creds.valid`` is True must NOT short-circuit ``authorize``

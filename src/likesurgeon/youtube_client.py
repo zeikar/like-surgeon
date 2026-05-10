@@ -275,11 +275,21 @@ class YouTubeClient:
         A corrupt token file shouldn't crash the CLI with a stack trace —
         the natural recovery is to re-run ``auth youtube``, which is exactly
         what the surrounding callers do when this returns ``None``.
+
+        **Important**: we deliberately don't pass ``SCOPES`` to
+        ``from_authorized_user_file``. Doing so overrides ``creds.scopes``
+        with our requested list — which then leaks into the next
+        ``_save_token`` (after a refresh) and silently inflates the
+        persisted ``scopes`` field. A 0.3.x readonly token would auto-
+        upgrade to ``scopes: [youtube]`` in the file after one read-side
+        refresh, breaking ``has_write_scope()`` even though no write
+        consent was ever given. Letting google-auth load the file's
+        stored scopes verbatim keeps the JSON's truth intact.
         """
         if self._token_path is None or not self._token_path.exists():
             return None
         try:
-            return Credentials.from_authorized_user_file(str(self._token_path), SCOPES)
+            return Credentials.from_authorized_user_file(str(self._token_path))
         except (ValueError, OSError):
             return None
 
