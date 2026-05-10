@@ -696,5 +696,84 @@ def issues(
     console.print(table)
 
 
+@app.command()
+def sync(
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run/--no-dry-run",
+            help="Print the plan and exit without applying any writes.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes/--no-yes",
+            help="Skip the interactive confirmation prompt.",
+        ),
+    ] = False,
+    drift_min_confidence: Annotated[
+        float,
+        typer.Option(
+            "--drift-min-confidence",
+            help="Auto-apply pointer-drift fixes only when confidence ≥ this value.",
+        ),
+    ] = 0.95,
+) -> None:
+    """Apply the latest diagnosis's actionable findings to YouTube / YT Music."""
+    from .diagnosis import diagnosis_items, latest_diagnosis
+    from .sync import execute, plan, resolve_video_ids, summarize
+
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session)
+        if diag is None:
+            console.print(
+                "[yellow]No diagnosis yet.[/yellow] "
+                "Run [cyan]likesurgeon compare-likes[/cyan] first."
+            )
+            raise typer.Exit(1)
+        items = diagnosis_items(session, diag.id)
+        video_ids = resolve_video_ids(session, items)
+        actions, skips = plan(items, video_ids, drift_min_confidence=drift_min_confidence)
+        console.print(summarize(actions, skips))
+
+        if dry_run:
+            return
+
+        if not yes and not typer.confirm("Proceed?", default=False):
+            raise typer.Abort()
+
+        # Build the YouTube client only if the plan needs it. ytm-only
+        # runs (no yt_unlike / yt_relike actions) skip the scope check
+        # entirely so a user without the YouTube write scope can still
+        # apply the YT Music half.
+        needs_youtube = any(a.kind in {"yt_unlike", "yt_relike"} for a in actions)
+        from .youtube_client import YouTubeClient
+
+        yt = YouTubeClient(
+            client_secrets_path=cfg.youtube_oauth_client_path,
+            token_path=cfg.youtube_token_path,
+        )
+        if needs_youtube and not yt.has_write_scope():
+            console.print(
+                "[yellow]YouTube write scope not granted.[/yellow] "
+                "Run [cyan]likesurgeon auth youtube[/cyan] to re-grant it."
+            )
+            raise typer.Exit(1)
+
+        ytm = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
+        result = execute(session, actions, skips, ytm=ytm, yt=yt)
+
+    console.print(
+        f"[bold]Sync result:[/bold] "
+        f"applied=[green]{result.applied}[/green] "
+        f"failed=[red]{result.failed}[/red] "
+        f"skipped=[yellow]{result.skipped}[/yellow]"
+    )
+    if result.failed:
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
