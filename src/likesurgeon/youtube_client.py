@@ -88,6 +88,15 @@ def _token_has_write_scope(token_path: Path | None) -> bool:
     if not isinstance(data, dict):
         return False
     scopes = data.get("scopes") or []
+    # google-auth accepts string scopes (space-separated) too, so a token
+    # JSON could legitimately store ``scopes`` as a string. Naive ``in``
+    # would then do substring matching — and the readonly scope contains
+    # the write scope as a prefix, so the check would falsely report
+    # write access. Normalize to a list before membership testing.
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    if not isinstance(scopes, list):
+        return False
     return WRITE_SCOPE in scopes
 
 

@@ -833,6 +833,53 @@ def test_has_write_scope_false_on_corrupt_token_json(tmp_path: Path) -> None:
     assert c.has_write_scope() is False
 
 
+def test_has_write_scope_string_readonly_does_not_substring_match(tmp_path: Path) -> None:
+    """Regression: the readonly scope string contains the write scope as
+    a prefix, so a token JSON storing ``scopes`` as a string (which
+    google-auth accepts as space-separated) must not trip naive ``in``
+    substring matching. ``has_write_scope()`` must split-then-membership-
+    test, not substring-match.
+    """
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    payload = {
+        "token": "fake",
+        "refresh_token": "fake",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake",
+        "client_secret": "fake",
+        "scopes": "https://www.googleapis.com/auth/youtube.readonly",
+    }
+    token_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_string_with_write_scope_returns_true(tmp_path: Path) -> None:
+    """Counterpart: a string ``scopes`` field that DOES include the write
+    scope (space-separated) must still be recognized after normalization."""
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    payload = {
+        "token": "fake",
+        "refresh_token": "fake",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake",
+        "client_secret": "fake",
+        "scopes": (
+            "https://www.googleapis.com/auth/youtube "
+            "https://www.googleapis.com/auth/userinfo.email"
+        ),
+    }
+    token_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is True
+
+
 def test_load_token_preserves_stored_readonly_scope(tmp_path: Path) -> None:
     """Regression: ``_load_token`` must NOT pass our SCOPES list to
     ``Credentials.from_authorized_user_file``. Doing so would override
