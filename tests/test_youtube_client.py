@@ -13,6 +13,7 @@ from likesurgeon.youtube_client import (
     AuthorizationRequiredError,
     ClientSecretsMissingError,
     YouTubeClient,
+    YouTubeWriteError,
 )
 
 
@@ -169,13 +170,17 @@ def test_load_token_returns_none_on_corrupt_json(tmp_path: Path) -> None:
 class _FakeRefreshFailingCreds:
     """Minimal Credentials stand-in whose ``refresh`` always blows up.
 
-    Exposes only the attributes ``_service`` reads — keeps the test
-    isolated from google-auth internals.
+    Exposes only the attributes ``_service`` / ``authorize`` read — keeps
+    the test isolated from google-auth internals. ``scopes`` includes the
+    write scope so the 0.4 scope-check guard isn't what triggers the
+    fall-through; this fixture is specifically about the refresh-failure
+    path.
     """
 
     valid = False
     expired = True
     refresh_token = "rt"
+    scopes = ["https://www.googleapis.com/auth/youtube"]
 
     def refresh(self, _request: Any) -> None:
         raise RefreshError("token revoked")
@@ -678,6 +683,330 @@ def test_classify_status_deleted_takes_precedence_over_region() -> None:
     assert _classify_status(status, content, "KR") == VideoStatus(
         is_available=False, reason="deleted"
     )
+
+
+class _FakeVideosRate:
+    """Mimics ``service.videos().rate(id=..., rating=...).execute()``.
+
+    Records (id, rating) per call. ``raise_with`` lets a test inject an
+    exception on ``.execute()`` to drive the error-wrap path.
+    """
+
+    def __init__(self, raise_with: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._raise = raise_with
+
+    def rate(self, **kwargs: Any) -> _FakeRequest:
+        self.calls.append(kwargs)
+        if self._raise is not None:
+            exc = self._raise
+
+            class _RaisingRequest:
+                def execute(self_inner) -> dict[str, Any]:  # noqa: N805
+                    raise exc
+
+            return _RaisingRequest()  # type: ignore[return-value]
+        return _FakeRequest({})
+
+
+class _FakeServiceWithVideos:
+    def __init__(self, videos: _FakeVideosRate) -> None:
+        self._videos = videos
+
+    def videos(self) -> _FakeVideosRate:
+        return self._videos
+
+
+def test_rate_video_calls_discovery_with_id_and_rating(monkeypatch) -> None:
+    """rate_video should call ``videos().rate(id=..., rating=...).execute()``
+    with exactly the inputs it was handed — no implicit translation."""
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    fake_videos = _FakeVideosRate()
+    monkeypatch.setattr(client, "_service", lambda: _FakeServiceWithVideos(fake_videos))
+
+    client.rate_video("vid123", "like")
+    client.rate_video("vid456", "none")
+
+    assert fake_videos.calls == [
+        {"id": "vid123", "rating": "like"},
+        {"id": "vid456", "rating": "none"},
+    ]
+
+
+def test_rate_video_wraps_http_error_as_youtube_write_error(monkeypatch) -> None:
+    """``HttpError`` from googleapiclient must surface as ``YouTubeWriteError``
+    carrying (video_id, rating, message) so the dispatcher can attribute
+    the failure to a specific action."""
+    from googleapiclient.errors import HttpError
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    err = HttpError(_FakeResp(403), b"forbidden")
+    monkeypatch.setattr(
+        client,
+        "_service",
+        lambda: _FakeServiceWithVideos(_FakeVideosRate(raise_with=err)),
+    )
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        client.rate_video("vidX", "like")
+    assert exc_info.value.video_id == "vidX"
+    assert exc_info.value.rating == "like"
+    assert exc_info.value.__cause__ is err
+
+
+class _FakeCreds:
+    """Minimal ``Credentials`` stand-in for scope / validity tests.
+
+    Only the attributes the production ``authorize`` / ``has_write_scope``
+    paths read are exposed.
+    """
+
+    def __init__(
+        self,
+        *,
+        scopes: list[str] | None,
+        valid: bool = True,
+        expired: bool = False,
+        refresh_token: str | None = None,
+    ) -> None:
+        self.scopes = scopes
+        self.valid = valid
+        self.expired = expired
+        self.refresh_token = refresh_token
+
+
+def _write_token_json(path: Path, *, scopes: list[str]) -> None:
+    """Write a real token JSON file in the shape google-auth expects.
+
+    Tests use real files (not monkeypatched ``_load_token``) for scope
+    checks because production reads the JSON's persisted ``scopes`` field
+    directly — ``Credentials.from_authorized_user_file`` overrides
+    ``creds.scopes`` with whatever you pass it, so a creds-based fake
+    would silently bypass the bug we're guarding against.
+    """
+    import json
+
+    payload = {
+        "token": "fake-access-token",
+        "refresh_token": "fake-refresh-token",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake-client-id",
+        "client_secret": "fake-client-secret",
+        "scopes": scopes,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_has_write_scope_false_for_readonly_token(tmp_path: Path) -> None:
+    """Real-file regression test: a token JSON whose persisted ``scopes``
+    list only has ``youtube.readonly`` must report no write scope, even
+    though ``Credentials.from_authorized_user_file(SCOPES)`` would
+    overwrite ``creds.scopes`` with the write scope."""
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_true_after_upgrade(tmp_path: Path) -> None:
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is True
+
+
+def test_has_write_scope_false_when_no_token(tmp_path: Path) -> None:
+    c = YouTubeClient(client_secrets_path=None, token_path=tmp_path / "does-not-exist.json")
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_false_on_corrupt_token_json(tmp_path: Path) -> None:
+    """Defensive: malformed JSON shouldn't crash sync's pre-flight check."""
+    token_path = tmp_path / "youtube-token.json"
+    token_path.write_text("{not valid json", encoding="utf-8")
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_string_readonly_does_not_substring_match(tmp_path: Path) -> None:
+    """Regression: the readonly scope string contains the write scope as
+    a prefix, so a token JSON storing ``scopes`` as a string (which
+    google-auth accepts as space-separated) must not trip naive ``in``
+    substring matching. ``has_write_scope()`` must split-then-membership-
+    test, not substring-match.
+    """
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    payload = {
+        "token": "fake",
+        "refresh_token": "fake",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake",
+        "client_secret": "fake",
+        "scopes": "https://www.googleapis.com/auth/youtube.readonly",
+    }
+    token_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is False
+
+
+def test_has_write_scope_string_with_write_scope_returns_true(tmp_path: Path) -> None:
+    """Counterpart: a string ``scopes`` field that DOES include the write
+    scope (space-separated) must still be recognized after normalization."""
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    payload = {
+        "token": "fake",
+        "refresh_token": "fake",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "fake",
+        "client_secret": "fake",
+        "scopes": (
+            "https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/userinfo.email"
+        ),
+    }
+    token_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    assert c.has_write_scope() is True
+
+
+def test_load_token_preserves_stored_readonly_scope(tmp_path: Path) -> None:
+    """Regression: ``_load_token`` must NOT pass our SCOPES list to
+    ``Credentials.from_authorized_user_file``. Doing so would override
+    ``creds.scopes`` with [youtube], which then leaks into the next
+    ``_save_token`` (after a refresh) and silently inflates the persisted
+    ``scopes`` field — turning a 0.3.x readonly token into a fake
+    write-scoped token at the file level after one read-side scan.
+    """
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    creds = c._load_token()
+
+    assert creds is not None
+    assert creds.scopes == ["https://www.googleapis.com/auth/youtube.readonly"]
+
+
+def test_save_after_load_preserves_readonly_scope_in_file(tmp_path: Path) -> None:
+    """End-to-end regression: load a readonly token, simulate a refresh by
+    re-saving the loaded creds (matches what ``_service()`` does after
+    ``creds.refresh``), then verify the file's ``scopes`` field is still
+    readonly. Before the fix, this test would see ``scopes: [youtube]``
+    in the re-saved file and ``has_write_scope()`` would return True.
+    """
+    import json
+
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=None, token_path=token_path)
+    creds = c._load_token()
+    assert creds is not None
+    c._save_token(creds)
+
+    persisted = json.loads(token_path.read_text(encoding="utf-8"))
+    assert persisted.get("scopes") == ["https://www.googleapis.com/auth/youtube.readonly"]
+    assert c.has_write_scope() is False
+
+
+def test_authorize_re_runs_flow_when_token_lacks_write_scope(monkeypatch, tmp_path) -> None:
+    """Critical regression test for the OAuth dead-end: a 0.3.x readonly
+    token whose ``creds.valid`` is True must NOT short-circuit ``authorize``
+    — we have to re-run the consent flow so the user can grant the write
+    scope. Otherwise ``likesurgeon auth youtube`` is a no-op and the user
+    is permanently stuck on read-only access.
+
+    Uses a real token file for the scope check (the production code reads
+    the JSON directly) plus a monkeypatched ``_load_token`` to control
+    ``creds.valid`` without touching google-auth internals."""
+    secrets = tmp_path / "client_secrets.json"
+    secrets.write_text("{}", encoding="utf-8")  # presence-only; flow is mocked
+
+    token_path = tmp_path / "youtube-token.json"
+    _write_token_json(token_path, scopes=["https://www.googleapis.com/auth/youtube.readonly"])
+
+    c = YouTubeClient(client_secrets_path=secrets, token_path=token_path)
+    monkeypatch.setattr(
+        c,
+        "_load_token",
+        lambda: _FakeCreds(scopes=["https://www.googleapis.com/auth/youtube.readonly"], valid=True),
+    )
+    monkeypatch.setattr(c, "_save_token", lambda creds: None)
+
+    flow_calls: list[tuple[str, list[str]]] = []
+
+    class _FakeFlow:
+        def run_local_server(self, port: int = 0) -> _FakeCreds:
+            return _FakeCreds(scopes=["https://www.googleapis.com/auth/youtube"])
+
+    def fake_from_secrets(path: str, scopes: list[str]) -> _FakeFlow:
+        flow_calls.append((path, scopes))
+        return _FakeFlow()
+
+    monkeypatch.setattr(
+        "likesurgeon.youtube_client.InstalledAppFlow.from_client_secrets_file",
+        staticmethod(fake_from_secrets),
+    )
+
+    c.authorize()
+
+    assert len(flow_calls) == 1
+    assert flow_calls[0][1] == ["https://www.googleapis.com/auth/youtube"]
+
+
+def test_rate_video_wraps_authorization_required_error(monkeypatch) -> None:
+    """If ``_service()`` raises (e.g. revoked token → AuthorizationRequiredError)
+    or any non-HttpError surfaces, ``rate_video`` must wrap it as
+    ``YouTubeWriteError`` so sync's continue-on-error loop records a per-item
+    failed attempt instead of aborting the whole run."""
+    from likesurgeon.youtube_client import AuthorizationRequiredError, YouTubeWriteError
+
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake_service() -> Any:
+        raise AuthorizationRequiredError("revoked")
+
+    monkeypatch.setattr(c, "_service", fake_service)
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.rate_video("VID123", "none")
+    assert exc_info.value.video_id == "VID123"
+    assert exc_info.value.rating == "none"
+    assert "revoked" in str(exc_info.value)
+
+
+def test_rate_video_wraps_transport_errors(monkeypatch) -> None:
+    """Transport / SSL / connection errors during ``.execute()`` must also
+    surface as ``YouTubeWriteError`` so they don't escape the dispatcher."""
+    from likesurgeon.youtube_client import YouTubeWriteError
+
+    class _ExplodingExecute:
+        def execute(self) -> None:
+            raise ConnectionError("network unreachable")
+
+    class _ExplodingRate:
+        def rate(self, **_kwargs: Any) -> _ExplodingExecute:
+            return _ExplodingExecute()
+
+    class _ExplodingService:
+        def videos(self) -> _ExplodingRate:
+            return _ExplodingRate()
+
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+    monkeypatch.setattr(c, "_service", lambda: _ExplodingService())
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.rate_video("VID456", "like")
+    assert exc_info.value.video_id == "VID456"
+    assert "network unreachable" in str(exc_info.value)
 
 
 def test_fetch_video_statuses_passes_region_through(monkeypatch) -> None:

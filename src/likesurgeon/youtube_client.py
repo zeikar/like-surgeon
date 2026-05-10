@@ -20,7 +20,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -29,7 +29,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 LIKED_VIDEOS_FALLBACK_PLAYLIST_ID = "LL"
-SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+WRITE_SCOPE = "https://www.googleapis.com/auth/youtube"
+SCOPES = [WRITE_SCOPE]
 
 
 class ClientSecretsMissingError(FileNotFoundError):
@@ -38,6 +39,16 @@ class ClientSecretsMissingError(FileNotFoundError):
 
 class AuthorizationRequiredError(RuntimeError):
     """Raised when no token exists (or a stale one cannot refresh)."""
+
+
+class YouTubeWriteError(RuntimeError):
+    """Raised when a write call (e.g. ``videos.rate``) fails."""
+
+    def __init__(self, video_id: str, rating: str, message: str) -> None:
+        super().__init__(f"YouTube write failed for {video_id} ({rating}): {message}")
+        self.video_id = video_id
+        self.rating = rating
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -51,6 +62,42 @@ class VideoStatus:
 
     is_available: bool | None
     reason: str | None
+
+
+def _token_has_write_scope(token_path: Path | None) -> bool:
+    """Whether the persisted token JSON's stored ``scopes`` includes the write scope.
+
+    Reads the file directly because ``Credentials.from_authorized_user_file``
+    overrides the file's stored scopes with whatever you pass it as the
+    ``scopes`` argument — so ``creds.scopes`` always reflects what the
+    *caller asked for*, not what the user actually consented to. To know
+    what was granted, we must inspect the JSON's persisted ``scopes`` field.
+
+    Missing file / unreadable / malformed JSON / no ``scopes`` field all
+    return False — the safe default ("not granted") matches the behavior
+    of "no token at all".
+    """
+    import json
+
+    if token_path is None or not token_path.exists():
+        return False
+    try:
+        data = json.loads(token_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    scopes = data.get("scopes") or []
+    # google-auth accepts string scopes (space-separated) too, so a token
+    # JSON could legitimately store ``scopes`` as a string. Naive ``in``
+    # would then do substring matching — and the readonly scope contains
+    # the write scope as a prefix, so the check would falsely report
+    # write access. Normalize to a list before membership testing.
+    if isinstance(scopes, str):
+        scopes = scopes.split()
+    if not isinstance(scopes, list):
+        return False
+    return WRITE_SCOPE in scopes
 
 
 def _is_quota_exceeded(exc: Any) -> bool:
@@ -186,18 +233,21 @@ class YouTubeClient:
     def authorize(self) -> None:
         """Run the InstalledApp flow once, persist the resulting token JSON.
 
-        Idempotent: if a usable token already exists, this is a no-op. If a
-        token exists but its refresh fails (revoked/expired), the method
-        falls through to the consent flow rather than raising — recovering
-        from a broken token is exactly the user-facing purpose of
-        ``auth youtube``, so making them re-run the command would be
-        circular. ``_service`` keeps the strict behavior because callers
-        there have no consent flow to fall back on.
+        Idempotent: if a usable token already exists *with the required write
+        scope*, this is a no-op. Existing readonly-only tokens (from 0.3.x)
+        fall through to the consent flow so users get a fresh token with the
+        write scope rather than dead-ending the loop. If a token exists but
+        its refresh fails (revoked/expired), the method also falls through
+        to the consent flow rather than raising — recovering from a broken
+        token is exactly the user-facing purpose of ``auth youtube``.
+        ``_service`` keeps the strict behavior because callers there have no
+        consent flow to fall back on.
         """
         creds = self._load_token()
-        if creds is not None and creds.valid:
+        token_has_write = _token_has_write_scope(self._token_path)
+        if creds is not None and creds.valid and token_has_write:
             return
-        if creds is not None and creds.expired and creds.refresh_token:
+        if creds is not None and creds.expired and creds.refresh_token and token_has_write:
             try:
                 creds.refresh(Request())
             except RefreshError:
@@ -214,17 +264,36 @@ class YouTubeClient:
         creds = flow.run_local_server(port=0)
         self._save_token(creds)
 
+    def has_write_scope(self) -> bool:
+        """Whether the persisted token grants the YouTube write scope.
+
+        Used by ``sync`` as a pre-flight check — should always be True after
+        the upgraded ``authorize()`` runs, but we still verify so a stale
+        readonly token from 0.3.x can't surprise a user mid-write.
+        """
+        return _token_has_write_scope(self._token_path)
+
     def _load_token(self) -> Credentials | None:
         """Read the persisted token. Treats corrupt/partial JSON as "no token".
 
         A corrupt token file shouldn't crash the CLI with a stack trace —
         the natural recovery is to re-run ``auth youtube``, which is exactly
         what the surrounding callers do when this returns ``None``.
+
+        **Important**: we deliberately don't pass ``SCOPES`` to
+        ``from_authorized_user_file``. Doing so overrides ``creds.scopes``
+        with our requested list — which then leaks into the next
+        ``_save_token`` (after a refresh) and silently inflates the
+        persisted ``scopes`` field. A 0.3.x readonly token would auto-
+        upgrade to ``scopes: [youtube]`` in the file after one read-side
+        refresh, breaking ``has_write_scope()`` even though no write
+        consent was ever given. Letting google-auth load the file's
+        stored scopes verbatim keeps the JSON's truth intact.
         """
         if self._token_path is None or not self._token_path.exists():
             return None
         try:
-            return Credentials.from_authorized_user_file(str(self._token_path), SCOPES)
+            return Credentials.from_authorized_user_file(str(self._token_path))
         except (ValueError, OSError):
             return None
 
@@ -316,6 +385,22 @@ class YouTubeClient:
             if not page_token:
                 break
         return items[:limit]
+
+    def rate_video(self, video_id: str, rating: Literal["like", "none"]) -> None:
+        """Apply a rating to a video via ``videos.rate``.
+
+        Wraps any error from auth/build/execute (HttpError, RefreshError-
+        wrapped ``AuthorizationRequiredError``, transport exceptions) as
+        ``YouTubeWriteError`` so the dispatcher's continue-on-error loop
+        records a per-item failed attempt instead of aborting the whole
+        sync. ``_service()`` is inside the try because token refresh can
+        fail at this point.
+        """
+        try:
+            service = self._service()
+            service.videos().rate(id=video_id, rating=rating).execute()
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YouTubeWriteError(video_id, rating, str(exc)) from exc
 
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
