@@ -339,6 +339,28 @@ def test_plan_skips_already_applied_items_silently(session: Session) -> None:
     assert skips == []
 
 
+def test_plan_skips_manually_skipped_items_silently(session: Session) -> None:
+    """``DiagnosisItem.status='skipped'`` is a permanent manual override
+    (e.g. a private/deleted YouTube ghost that ``videos.rate`` can't unlike
+    anyway). The planner must treat it as terminal — same as 'applied' —
+    rather than re-emitting the action every run."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "vid", suffix="m")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_UNAVAILABLE_VIDEO,
+        source_track=t,
+        status="skipped",
+    )
+    session.commit()
+
+    actions, skips = plan([item], {t.id: "vid"}, drift_min_confidence=0.95)
+
+    assert actions == []
+    assert skips == []
+
+
 def test_plan_missing_video_id_emits_skip_with_action_kind(session: Session) -> None:
     """A finding whose required video_id isn't in the lookup must produce a
     SkipRecord whose ``kind`` matches the action it WOULD have been."""

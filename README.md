@@ -166,6 +166,7 @@ uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence 
 - Each HTTP call (or skip decision) writes one `SyncAttempt` row with `kind`, `status` (`applied`/`failed`/`skipped`), and a `reason`. The originating `DiagnosisItem.reason` (the diagnosis-time evidence) is **never overwritten** — sync detail lives on `SyncAttempt.reason` instead.
 - `DiagnosisItem.status` only flips to `'applied'` when every API call for the action succeeded. For drift that means BOTH halves. Anything else (failure, low-confidence skip) leaves it at `'open'` so the next `sync` re-evaluates it.
 - Re-running `sync` is idempotent: applied items are skipped; failures and previously-skipped findings are re-tried (so lowering `--drift-min-confidence` will pick up borderline drifts on the next run).
+- **Permanent manual skip.** If you want to tell sync to *never* attempt a particular finding again — e.g. a private/deleted YouTube ghost that `videos.rate` rejects with 403/404 — set its `DiagnosisItem.status` to `'skipped'` directly (currently via SQL on `~/.like-surgeon/like-surgeon.sqlite`). The planner treats `'applied'` and `'skipped'` identically as terminal at item level.
 - Continue-on-error: a failure (quota exhausted, transport error, revoked token) records the per-item `failed` row and moves on. The run exits non-zero if any action failed.
 
 #### Quota

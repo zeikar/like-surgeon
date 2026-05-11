@@ -114,16 +114,21 @@ def plan(
 ) -> tuple[list[PlannedAction], list[SkipRecord]]:
     """Map findings to actions / skips. Pure — no I/O, no client calls.
 
-    ``status == 'applied'`` items are silently dropped (terminal — re-running
-    sync must not re-attempt them, and there's nothing to record). Findings
-    of type ``ytmusic_only`` or ``metadata_drift`` are also silently dropped
-    (informational, not actionable in 0.4).
+    Items with ``status`` in {``'applied'``, ``'skipped'``} are silently
+    dropped (terminal at item level — re-running sync must not re-attempt
+    them, and there's nothing to record). ``'applied'`` is set by ``execute``
+    when every API call for an action succeeded; ``'skipped'`` is reserved
+    for an explicit manual override ("I never want to act on this finding"
+    — e.g. a private/deleted YouTube ghost that ``videos.rate`` can't
+    unlike anyway, so retrying would just noise the audit log forever).
+    Findings of type ``ytmusic_only`` or ``metadata_drift`` are also
+    silently dropped (informational, not actionable in 0.4).
     """
     actions: list[PlannedAction] = []
     skips: list[SkipRecord] = []
 
     for item in items:
-        if item.status == "applied":
+        if item.status in ("applied", "skipped"):
             continue
 
         if item.issue_type == ISSUE_UNAVAILABLE_VIDEO:
