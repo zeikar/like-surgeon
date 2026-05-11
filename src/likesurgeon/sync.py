@@ -12,7 +12,9 @@ Invariants:
   * ``DiagnosisItem.status`` flips to ``"applied"`` only when every API
     call for the action succeeded (drift = both halves). Anything else
     (failure, skip) leaves it as ``"open"`` so the next ``sync`` run
-    re-evaluates it.
+    re-evaluates it. Exception: ``ytm_dedupe`` is non-idempotent and
+    flips to ``"applied"`` after any attempt (success or failure) to
+    prevent auto-retry over-removal.
   * Per-action commit cadence: a crash mid-run preserves prior actions'
     SyncAttempt rows AND any status updates already committed. Drift's
     two HTTP calls count as one action (one commit).
@@ -20,6 +22,7 @@ Invariants:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,10 +38,11 @@ from .diagnosis import (
     ISSUE_YTMUSIC_ONLY,
 )
 from .models import DiagnosisItem, SyncAttempt, Track
+from .snapshot import YTMUSIC_LIKED_SONGS
 from .youtube_client import YouTubeClient, YouTubeWriteError
 from .ytmusic_client import YTMusicClient, YTMusicWriteError
 
-ActionKind = Literal["yt_unlike", "ytm_like", "yt_relike"]
+ActionKind = Literal["yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe"]
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -109,6 +113,40 @@ class ExecResult:
     skipped: int
 
 
+@dataclass(frozen=True)
+class _DuplicateReason:
+    count: int
+    source: str
+    positions: tuple[int, ...]
+
+
+_DUPLICATE_REASON_RE = re.compile(
+    r"^appears (?P<count>\d+) times in (?P<source>\w+) snapshot "
+    r"\(positions: (?P<positions>[\d, ]+)\)$"
+)
+
+
+def _parse_duplicate_in_source_reason(reason: str) -> _DuplicateReason | None:
+    """Parse the diagnosis-time reason emitted by ``build_duplicate_in_source_items``.
+
+    Returns ``None`` for any deviation: malformed input, multi-source
+    contamination, count-vs-positions mismatch (e.g.
+    ``"appears 2 times ... (positions: 0, 1, 5)"``). Callers MUST treat
+    ``None`` as "do not auto-act."
+    """
+    m = _DUPLICATE_REASON_RE.fullmatch(reason)
+    if m is None:
+        return None
+    count = int(m.group("count"))
+    try:
+        positions = tuple(int(p.strip()) for p in m.group("positions").split(","))
+    except ValueError:
+        return None
+    if len(positions) != count:
+        return None
+    return _DuplicateReason(count=count, source=m.group("source"), positions=positions)
+
+
 def plan(
     items: list[DiagnosisItem],
     video_ids: dict[int, str],
@@ -124,9 +162,12 @@ def plan(
     for an explicit manual override ("I never want to act on this finding"
     — e.g. a private/deleted YouTube ghost that ``videos.rate`` can't
     unlike anyway, so retrying would just noise the audit log forever).
-    Findings of type ``ytmusic_only``, ``metadata_drift``, or
-    ``duplicate_in_source`` are also silently dropped (informational, not
-    actionable in 0.4 — within-source dedup is deferred to 0.5).
+    Findings of type ``ytmusic_only`` or ``metadata_drift`` are silently
+    dropped (informational, not actionable in 0.5).
+    ``duplicate_in_source`` maps to ``ytm_dedupe`` only when the parsed
+    reason validates as ytmusic-source + N=2 + matching position count.
+    All other shapes produce a ``SkipRecord`` — we never default to a
+    destructive YT Music write.
     """
     actions: list[PlannedAction] = []
     skips: list[SkipRecord] = []
@@ -205,13 +246,60 @@ def plan(
                 )
             )
 
-        elif item.issue_type in {
-            ISSUE_YTMUSIC_ONLY,
-            ISSUE_METADATA_DRIFT,
-            ISSUE_DUPLICATE_IN_SOURCE,
-        }:
+        elif item.issue_type in {ISSUE_YTMUSIC_ONLY, ISSUE_METADATA_DRIFT}:
             # Informational findings — no record, no action.
             continue
+
+        elif item.issue_type == ISSUE_DUPLICATE_IN_SOURCE:
+            parsed = _parse_duplicate_in_source_reason(item.reason)
+            if parsed is None:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason="unparseable duplicate_in_source reason",
+                    )
+                )
+                continue
+            if parsed.source != YTMUSIC_LIKED_SONGS:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason=f"duplicate in {parsed.source} source; not handled in 0.5",
+                    )
+                )
+                continue
+            if parsed.count != 2:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason=(
+                            f"count={parsed.count}; only N=2 is auto-handled in 0.5. "
+                            "File an issue for higher counts."
+                        ),
+                    )
+                )
+                continue
+            primary = _video_id_for(video_ids, item.source_track_id)
+            if not primary:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason="no video_id available for source track",
+                    )
+                )
+                continue
+            actions.append(
+                PlannedAction(
+                    item_id=item.id,
+                    kind="ytm_dedupe",
+                    primary_video_id=primary,
+                    secondary_video_id=None,
+                )
+            )
 
         # Unknown future issue types fall through silently (no WARN channel
         # — sync.plan stays pure).
@@ -225,12 +313,15 @@ def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None
     return video_ids.get(track_id)
 
 
+_PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe")
+
 # Quota cost per action kind (YouTube `videos.rate` = 50 units; ytm is free).
 # Drift's worst case = 100 (like 50 + unlike 50 if the like succeeds).
 _QUOTA_COST: dict[ActionKind, int] = {
     "yt_unlike": 50,
     "ytm_like": 0,
     "yt_relike": 100,
+    "ytm_dedupe": 0,
 }
 
 
@@ -246,11 +337,11 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
     quota = sum(_QUOTA_COST[a.kind] for a in actions)
 
     lines = ["Sync plan:"]
-    for kind in ("yt_unlike", "ytm_like", "yt_relike"):
+    for kind in _PLAN_ACTION_KINDS:
         lines.append(f"  {kind}: {by_action.get(kind, 0)}")
     lines.append(f"  skipped: {len(skips)}")
     if by_skip:
-        for kind in ("yt_unlike", "ytm_like", "yt_relike"):
+        for kind in _PLAN_ACTION_KINDS:
             count = by_skip.get(kind, 0)
             if count:
                 lines.append(f"    {kind}: {count}")
@@ -276,6 +367,12 @@ def execute(
     Commit cadence: per-action. A crash mid-run preserves all prior
     commits — the next ``sync`` re-evaluates anything not at
     ``status='applied'``.
+
+    Carve-out: ``ytm_dedupe`` flips ``item.status`` to ``"applied"``
+    regardless of success. The call is non-idempotent — auto-retrying
+    a failed unlike risks over-removal because client failure can't
+    distinguish "server processed, client errored" from "server didn't
+    process". Genuine failures self-correct via the next compare-likes.
     """
     applied = 0
     failed = 0
@@ -303,10 +400,16 @@ def execute(
 
         ok = _dispatch(action, ytm=ytm, yt=yt, session=session)
         if ok:
-            item.status = "applied"
             applied += 1
         else:
             failed += 1
+        # ytm_dedupe is non-idempotent — terminal-on-attempt regardless of success.
+        # Client failure doesn't distinguish "server processed, client errored"
+        # from "server didn't process", so auto-retry would risk over-removal.
+        # Genuine failures self-correct via the next compare-likes (lingering dup
+        # → new finding → new attempt).
+        if ok or action.kind == "ytm_dedupe":
+            item.status = "applied"
         session.commit()
 
     return ExecResult(applied=applied, failed=failed, skipped=skipped)
@@ -323,6 +426,10 @@ def _dispatch(
 
     ``True`` iff every call for the action succeeded — i.e. the dispatcher
     is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
+
+    Note: for ``ytm_dedupe``, the bool return is used only for
+    ``ExecResult`` counting. Terminality (``status='applied'`` regardless
+    of success) is handled by ``execute()``, not here.
     """
     if action.kind == "yt_unlike":
         return _try_yt_rate(
@@ -367,6 +474,14 @@ def _dispatch(
             yt=yt,
             video_id=action.secondary_video_id,
             rating="none",
+        )
+
+    if action.kind == "ytm_dedupe":
+        return _try_ytm_unlike(
+            session,
+            action.item_id,
+            ytm=ytm,
+            video_id=action.primary_video_id,
         )
 
     # Unreachable for the closed ActionKind set, but keeps the function
@@ -429,6 +544,36 @@ def _try_ytm_like(
         SyncAttempt(
             diagnosis_item_id=item_id,
             kind="ytm_like",
+            status="applied",
+            reason="ok",
+        )
+    )
+    return True
+
+
+def _try_ytm_unlike(
+    session: Session,
+    item_id: int,
+    *,
+    ytm: YTMusicClient,
+    video_id: str,
+) -> bool:
+    try:
+        ytm.unlike_song(video_id)
+    except YTMusicWriteError as exc:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="ytm_dedupe",
+                status="failed",
+                reason=str(exc),
+            )
+        )
+        return False
+    session.add(
+        SyncAttempt(
+            diagnosis_item_id=item_id,
+            kind="ytm_dedupe",
             status="applied",
             reason="ok",
         )

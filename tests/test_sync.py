@@ -20,6 +20,8 @@ from likesurgeon.sync import (
     ExecResult,
     PlannedAction,
     SkipRecord,
+    _DuplicateReason,
+    _parse_duplicate_in_source_reason,
     execute,
     plan,
     resolve_video_ids,
@@ -48,13 +50,24 @@ class FakeYouTube:
 
 
 class FakeYTMusic:
-    def __init__(self, raise_on: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        raise_on: set[str] | None = None,
+        raise_on_unlike: set[str] | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self._raise_on = raise_on or set()
+        self.unlike_calls: list[str] = []
+        self.raise_on_unlike: set[str] = raise_on_unlike or set()
 
     def like_song(self, video_id: str) -> None:
         self.calls.append(video_id)
         if video_id in self._raise_on:
+            raise YTMusicWriteError(video_id, "boom")
+
+    def unlike_song(self, video_id: str) -> None:
+        self.unlike_calls.append(video_id)
+        if video_id in self.raise_on_unlike:
             raise YTMusicWriteError(video_id, "boom")
 
 
@@ -432,10 +445,11 @@ def test_plan_ignores_ytmusic_only_and_metadata_drift(session: Session) -> None:
     assert skips == []
 
 
-def test_plan_ignores_duplicate_in_source_alongside_actionable(session: Session) -> None:
-    """duplicate_in_source is informational (acted on by a future 0.5
-    dedupe command). Planner must emit no action / no skip for it,
-    while still planning actionable findings in the same diagnosis."""
+def test_plan_duplicate_in_source_ytmusic_n2_emits_ytm_dedupe_alongside_actionable(
+    session: Session,
+) -> None:
+    """A ytmusic-source N=2 duplicate emits a ytm_dedupe action, while an
+    actionable finding in the same diagnosis still produces its own action."""
     diag = _make_diagnosis(session)
     dup_t = _make_track(session, "dup", suffix="dup")
     ghost_t = _make_track(session, "ghost", suffix="g")
@@ -444,6 +458,7 @@ def test_plan_ignores_duplicate_in_source_alongside_actionable(session: Session)
         diag,
         issue_type=ISSUE_DUPLICATE_IN_SOURCE,
         source_track=dup_t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
     )
     ghost = _make_item(
         session,
@@ -459,11 +474,145 @@ def test_plan_ignores_duplicate_in_source_alongside_actionable(session: Session)
         drift_min_confidence=0.95,
     )
 
-    # The dup finding produces neither an action nor a skip.
-    assert all(a.item_id != dup.id for a in actions)
-    assert all(s.item_id != dup.id for s in skips)
-    # The ghost finding still becomes a yt_unlike action.
-    assert [a.item_id for a in actions] == [ghost.id]
+    assert skips == []
+    assert len(actions) == 2
+    assert actions[0].item_id == dup.id
+    assert actions[0].kind == "ytm_dedupe"
+    assert actions[0].primary_video_id == "dup"
+    assert actions[0].secondary_video_id is None
+    assert actions[1].item_id == ghost.id
+    assert actions[1].kind == "yt_unlike"
+
+
+def test_plan_duplicate_in_source_ytmusic_n3_emits_skip(session: Session) -> None:
+    """N=3 duplicates are not auto-handled in 0.5 — planner emits a SkipRecord
+    with a reason containing 'count=3'."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "dup3", suffix="dup3")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+        reason="appears 3 times in ytmusic_liked_songs snapshot (positions: 0, 1, 5)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [dup],
+        {dup_t.id: "dup3"},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].item_id == dup.id
+    assert skips[0].kind == "ytm_dedupe"
+    assert "count=3" in skips[0].reason
+
+
+def test_plan_duplicate_in_source_youtube_emits_skip(session: Session) -> None:
+    """Duplicates in the youtube_liked_videos source are not handled — planner
+    emits a SkipRecord with a reason containing 'youtube_liked_videos source'."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "ytdup", suffix="ytdup")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+        reason="appears 2 times in youtube_liked_videos snapshot (positions: 0, 5)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [dup],
+        {dup_t.id: "ytdup"},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].item_id == dup.id
+    assert skips[0].kind == "ytm_dedupe"
+    assert "youtube_liked_videos source" in skips[0].reason
+
+
+def test_plan_duplicate_in_source_count_mismatch_emits_skip(session: Session) -> None:
+    """count=2 but 3 positions — the v3 regex hole. Parser returns None,
+    planner emits a SkipRecord with reason containing 'unparseable'."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "mismatch", suffix="mismatch")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1, 5)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [dup],
+        {dup_t.id: "mismatch"},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].kind == "ytm_dedupe"
+    assert "unparseable" in skips[0].reason
+
+
+def test_plan_duplicate_in_source_missing_video_id_emits_skip(session: Session) -> None:
+    """Valid ytmusic N=2 reason, but the source track has no video_id in the
+    lookup map — planner emits a SkipRecord with reason containing 'no video_id'."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "dup_novid", suffix="novid")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
+    )
+    session.commit()
+
+    # dup_t.id intentionally omitted from video_ids
+    actions, skips = plan(
+        [dup],
+        {},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].kind == "ytm_dedupe"
+    assert "no video_id" in skips[0].reason
+
+
+def test_plan_skips_failed_ytm_dedupe_item_in_same_diagnosis(session: Session) -> None:
+    """A DiagnosisItem with status='applied' is silently dropped regardless of
+    issue_type — pins the non-idempotent retry guard for ytm_dedupe."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "dup_done", suffix="done")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+        status="applied",
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [dup],
+        {dup_t.id: "dup_done"},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
     assert skips == []
 
 
@@ -491,6 +640,31 @@ def test_summarize_counts_and_quota() -> None:
     assert "skipped: 1" in s
     # Quota: 2 unlikes (100) + 0 ytm + 1 relike worst-case (100) = 200.
     assert "200" in s
+
+
+def test_summarize_includes_ytm_dedupe() -> None:
+    """ytm_dedupe action and skip both appear in summarize output.
+    ytm_dedupe has quota cost 0, so YouTube quota is unchanged."""
+    actions = [
+        PlannedAction(item_id=1, kind="ytm_dedupe", primary_video_id="d", secondary_video_id=None),
+    ]
+    skips = [
+        SkipRecord(item_id=2, kind="ytm_dedupe", reason="count=3; only N=2 is auto-handled"),
+    ]
+
+    s = summarize(actions, skips)
+
+    # Action line for ytm_dedupe
+    assert "ytm_dedupe: 1" in s
+    # Skip total and per-kind breakdown
+    assert "skipped: 1" in s
+    assert "ytm_dedupe: 1" in s
+    # Quota: ytm_dedupe cost=0, so 0 units
+    assert "0" in s
+    # The existing non-ytm_dedupe action kinds show 0
+    assert "yt_unlike: 0" in s
+    assert "ytm_like: 0" in s
+    assert "yt_relike: 0" in s
 
 
 # ---------------------------------------------------------------------------
@@ -860,3 +1034,187 @@ def test_execute_commits_per_action(session: Session) -> None:
         assert attempts2 == []
     finally:
         fresh.close()
+
+
+# ---------------------------------------------------------------------------
+# _parse_duplicate_in_source_reason
+# ---------------------------------------------------------------------------
+
+
+def test_parse_dup_reason_ytmusic_n2() -> None:
+    result = _parse_duplicate_in_source_reason(
+        "appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)"
+    )
+    assert result == _DuplicateReason(count=2, source="ytmusic_liked_songs", positions=(0, 1))
+
+
+def test_parse_dup_reason_youtube_n2() -> None:
+    result = _parse_duplicate_in_source_reason(
+        "appears 2 times in youtube_liked_videos snapshot (positions: 3, 7)"
+    )
+    assert result == _DuplicateReason(count=2, source="youtube_liked_videos", positions=(3, 7))
+
+
+def test_parse_dup_reason_n3() -> None:
+    result = _parse_duplicate_in_source_reason(
+        "appears 3 times in ytmusic_liked_songs snapshot (positions: 0, 1, 5)"
+    )
+    assert result == _DuplicateReason(count=3, source="ytmusic_liked_songs", positions=(0, 1, 5))
+
+
+def test_parse_dup_reason_count_mismatch_returns_none() -> None:
+    # count=2 but 3 positions — mismatch must return None
+    result = _parse_duplicate_in_source_reason(
+        "appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1, 5)"
+    )
+    assert result is None
+
+
+def test_parse_dup_reason_unknown_source_text_returns_none() -> None:
+    # surrounding text makes fullmatch fail
+    result = _parse_duplicate_in_source_reason("manually edited: appears 2 times in elsewhere")
+    assert result is None
+
+
+def test_parse_dup_reason_random_text_returns_none() -> None:
+    result = _parse_duplicate_in_source_reason("random text")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# execute — ytm_dedupe terminal-on-attempt semantics
+# ---------------------------------------------------------------------------
+
+
+def test_execute_ytm_dedupe_success_marks_applied(session: Session) -> None:
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "vid", suffix="dup")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
+    )
+    session.commit()
+    original_reason = item.reason
+
+    ytm = FakeYTMusic()
+    yt = FakeYouTube()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="ytm_dedupe", primary_video_id="vid", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert ytm.unlike_calls == ["vid"]
+    session.refresh(item)
+    assert item.status == "applied"
+    assert item.reason == original_reason
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 1
+    assert rows[0].kind == "ytm_dedupe"
+    assert rows[0].status == "applied"
+
+
+def test_execute_ytm_dedupe_failure_still_marks_applied(session: Session) -> None:
+    """ytm_dedupe is non-idempotent; execute() flips status='applied' regardless to prevent auto-retry within same Diagnosis."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "vid", suffix="dup")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
+    )
+    session.commit()
+    original_reason = item.reason
+
+    ytm = FakeYTMusic(raise_on_unlike={"vid"})
+    yt = FakeYouTube()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="ytm_dedupe", primary_video_id="vid", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    session.refresh(item)
+    assert item.status == "applied"
+    assert item.reason == original_reason
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 1
+    assert rows[0].kind == "ytm_dedupe"
+    assert rows[0].status == "failed"
+    assert "boom" in rows[0].reason
+
+
+def test_execute_ytm_dedupe_skip_emits_attempt(session: Session) -> None:
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "vid", suffix="dup")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=t,
+        reason="appears 3 times in ytmusic_liked_songs snapshot (positions: 0, 1, 5)",
+    )
+    session.commit()
+
+    ytm = FakeYTMusic()
+    yt = FakeYouTube()
+    skips = [
+        SkipRecord(
+            item_id=item.id,
+            kind="ytm_dedupe",
+            reason="count=3; only N=2 is auto-handled in 0.5",
+        )
+    ]
+    res = execute(session, [], skips, ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 1
+    assert rows[0].kind == "ytm_dedupe"
+    assert rows[0].status == "skipped"
+    assert rows[0].reason == "count=3; only N=2 is auto-handled in 0.5"
+
+
+def test_parse_dup_reason_roundtrip_with_builder() -> None:
+    from likesurgeon.diagnosis import build_duplicate_in_source_items
+    from likesurgeon.models import SnapshotItem
+    from likesurgeon.snapshot import YTMUSIC_LIKED_SONGS
+
+    items = [
+        SnapshotItem(
+            snapshot_id=1,
+            track_id=10,
+            position=0,
+            video_id="vid_abc",
+            title="Song",
+            artists="[]",
+            canonical_key="song",
+        ),
+        SnapshotItem(
+            snapshot_id=1,
+            track_id=11,
+            position=1,
+            video_id="vid_abc",
+            title="Song",
+            artists="[]",
+            canonical_key="song",
+        ),
+    ]
+    diagnosis_items = build_duplicate_in_source_items(
+        diagnosis_id=1, snapshot_items=items, source=YTMUSIC_LIKED_SONGS
+    )
+    assert len(diagnosis_items) == 1
+    reason = diagnosis_items[0].reason
+    result = _parse_duplicate_in_source_reason(reason)
+    assert result == _DuplicateReason(count=2, source="ytmusic_liked_songs", positions=(0, 1))

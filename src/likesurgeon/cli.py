@@ -800,10 +800,9 @@ def sync(
         if not yes and not typer.confirm("Proceed?", default=False):
             raise typer.Abort()
 
-        # Build the YouTube client only if the plan needs it. ytm-only
-        # runs (no yt_unlike / yt_relike actions) skip the scope check
-        # entirely so a user without the YouTube write scope can still
-        # apply the YT Music half.
+        # Always construct (cheap); only the write-scope check and write method calls are
+        # gated on needs_youtube.
+        # ytm_dedupe is ytmusic-only; not in needs_youtube
         needs_youtube = any(a.kind in {"yt_unlike", "yt_relike"} for a in actions)
         from .youtube_client import YouTubeClient
 

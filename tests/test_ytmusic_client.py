@@ -118,6 +118,34 @@ def test_like_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
     assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
+def test_unlike_song_calls_rate_song_with_INDIFFERENT() -> None:
+    """``unlike_song`` always passes ``"INDIFFERENT"`` — no other rating flows through."""
+    fake = _RatingFakeYTMusic()
+    client = _RatingClient(fake)
+    client.unlike_song("vid42")
+    assert fake.calls == [("vid42", "INDIFFERENT")]
+
+
+def test_unlike_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
+    """ytmusicapi can raise a wide range of exception types from rate_song.
+    Surface them all as ``YTMusicWriteError`` so the dispatcher's failure
+    path doesn't have to fingerprint each one."""
+    fake = _RatingFakeYTMusic(raise_with=RuntimeError("boom"))
+    client = _RatingClient(fake)
+    with pytest.raises(YTMusicWriteError) as exc_info:
+        client.unlike_song("vid99")
+    assert exc_info.value.video_id == "vid99"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_unlike_song_does_not_wrap_build_failure() -> None:
+    """``_build()`` is called outside the try block, so auth failures propagate
+    as ``AuthFileMissingError`` rather than being wrapped as ``YTMusicWriteError``."""
+    client = YTMusicClient(browser_path=Path("/nonexistent"))
+    with pytest.raises(AuthFileMissingError):
+        client.unlike_song("vid")
+
+
 def test_missing_auth_raises():
     client = YTMusicClient(browser_path=Path("/nope/browser.json"))
     with pytest.raises(AuthFileMissingError):

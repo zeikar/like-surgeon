@@ -328,13 +328,15 @@ class _FakeYouTubeWrite:
 
 
 class _FakeYTMusicWrite:
-    """Stub for the YT Music half of `sync`. Records like_song calls."""
+    """Stub for the YT Music half of `sync`. Records like_song and unlike_song calls."""
 
     instances: list[_FakeYTMusicWrite] = []
     raise_on: set[str] = set()
+    raise_on_unlike: set[str] = set()
 
     def __init__(self, **kwargs: Any) -> None:
         self.calls: list[str] = []
+        self.unlike_calls: list[str] = []
         type(self).instances.append(self)
 
     def like_song(self, video_id: str) -> None:
@@ -342,6 +344,13 @@ class _FakeYTMusicWrite:
 
         self.calls.append(video_id)
         if video_id in type(self).raise_on:
+            raise YTMusicWriteError(video_id, "boom")
+
+    def unlike_song(self, video_id: str) -> None:
+        from likesurgeon.ytmusic_client import YTMusicWriteError
+
+        self.unlike_calls.append(video_id)
+        if video_id in type(self).raise_on_unlike:
             raise YTMusicWriteError(video_id, "boom")
 
 
@@ -353,6 +362,7 @@ def _reset_sync_fakes() -> Iterable[None]:
     _FakeYouTubeWrite.rate_raise_on = set()
     _FakeYTMusicWrite.instances = []
     _FakeYTMusicWrite.raise_on = set()
+    _FakeYTMusicWrite.raise_on_unlike = set()
     yield
 
 
@@ -775,6 +785,226 @@ def test_sync_limit_above_action_count_is_noop(
     assert result.exit_code == 0, result.output
     assert "applying first" not in result.output
     assert "applied=2" in result.output
+
+
+def _seed_dedupe_item(home: Path, *, video_id: str, source: str = "ytmusic_liked_songs") -> int:
+    """Seed a Diagnosis with one ISSUE_DUPLICATE_IN_SOURCE item. Returns item id."""
+    from likesurgeon.config import DEFAULT_DB_FILENAME
+    from likesurgeon.db import init_db, make_engine, make_session_factory
+    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE
+    from likesurgeon.models import Diagnosis, DiagnosisItem, Track
+
+    home.mkdir(parents=True, exist_ok=True)
+    db_path = home / DEFAULT_DB_FILENAME
+    engine = make_engine(db_path)
+    init_db(engine)
+    factory = make_session_factory(engine)
+
+    s = factory()
+    try:
+        diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=None)
+        s.add(diag)
+        s.flush()
+
+        track = Track(
+            source=source,
+            video_id=video_id,
+            title="dup title",
+            artists="[]",
+            canonical_key="ck-dup",
+            dedupe_key="dk-dup",
+        )
+        s.add(track)
+        s.flush()
+
+        item = DiagnosisItem(
+            diagnosis_id=diag.id,
+            issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+            confidence=1.0,
+            reason=f"appears 2 times in {source} snapshot (positions: 0, 1)",
+            source_track_id=track.id,
+            related_track_id=None,
+            status="open",
+        )
+        s.add(item)
+        s.flush()
+        item_id = item.id
+        s.commit()
+    finally:
+        s.close()
+    return item_id
+
+
+def test_sync_ytm_only_dedupe_success_no_youtube_method_calls(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """ytm_dedupe-only plan: unlike_song is called, has_write_scope and rate_video are NOT."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.models import SyncAttempt
+
+    _seed_dedupe_item(fake_home, video_id="dup_vid")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+
+    yt = _FakeYouTubeWrite.instances[0]
+    assert yt.scope_calls == 0, "has_write_scope must not be called for ytm_dedupe-only runs"
+    assert yt.rate_calls == [], "rate_video must not be called for ytm_dedupe-only runs"
+
+    ytm = _FakeYTMusicWrite.instances[0]
+    assert ytm.unlike_calls == ["dup_vid"]
+
+    assert "ytm_dedupe: 1" in result.output
+
+    s = _open_db(fake_home)
+    try:
+        attempts = list(s.scalars(select(SyncAttempt)).all())
+        assert len(attempts) == 1
+        assert attempts[0].kind == "ytm_dedupe"
+        assert attempts[0].status == "applied"
+    finally:
+        s.close()
+
+
+def test_sync_ytm_only_dedupe_failure_exits_nonzero_but_marks_applied(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """ytm_dedupe that raises: exit non-zero, no YouTube calls, item.status='applied' (terminal-on-attempt)."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.models import DiagnosisItem, SyncAttempt
+
+    item_id = _seed_dedupe_item(fake_home, video_id="dup_vid")
+    _FakeYTMusicWrite.raise_on_unlike = {"dup_vid"}
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code != 0
+
+    yt = _FakeYouTubeWrite.instances[0]
+    assert yt.scope_calls == 0
+    assert yt.rate_calls == []
+
+    s = _open_db(fake_home)
+    try:
+        item = s.get(DiagnosisItem, item_id)
+        assert item.status == "applied", "ytm_dedupe is terminal-on-attempt even on failure"
+        attempts = list(s.scalars(select(SyncAttempt)).all())
+        assert len(attempts) == 1
+        assert attempts[0].kind == "ytm_dedupe"
+        assert attempts[0].status == "failed"
+    finally:
+        s.close()
+
+
+def test_sync_limit_with_mixed_dedupe_and_unlike(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """--limit 1 with one ytm_dedupe + one yt_unlike: exactly one action runs, other stays open."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.config import DEFAULT_DB_FILENAME
+    from likesurgeon.db import init_db, make_engine, make_session_factory
+    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE, ISSUE_UNAVAILABLE_VIDEO
+    from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt, Track
+
+    # Seed a diagnosis with two items in one transaction so they share one Diagnosis row.
+    fake_home.mkdir(parents=True, exist_ok=True)
+    db_path = fake_home / DEFAULT_DB_FILENAME
+    engine = make_engine(db_path)
+    init_db(engine)
+    factory = make_session_factory(engine)
+
+    s = factory()
+    try:
+        diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=None)
+        s.add(diag)
+        s.flush()
+
+        track_dup = Track(
+            source="ytmusic_liked_songs",
+            video_id="dup_vid",
+            title="dup",
+            artists="[]",
+            canonical_key="ck-dup",
+            dedupe_key="dk-dup",
+        )
+        track_ghost = Track(
+            source="youtube_liked_videos",
+            video_id="ghost_vid",
+            title="ghost",
+            artists="[]",
+            canonical_key="ck-ghost",
+            dedupe_key="dk-ghost",
+        )
+        s.add_all([track_dup, track_ghost])
+        s.flush()
+
+        item_dup = DiagnosisItem(
+            diagnosis_id=diag.id,
+            issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+            confidence=1.0,
+            reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
+            source_track_id=track_dup.id,
+            related_track_id=None,
+            status="open",
+        )
+        item_ghost = DiagnosisItem(
+            diagnosis_id=diag.id,
+            issue_type=ISSUE_UNAVAILABLE_VIDEO,
+            confidence=1.0,
+            reason="unavailable",
+            source_track_id=track_ghost.id,
+            related_track_id=None,
+            status="open",
+        )
+        s.add_all([item_dup, item_ghost])
+        s.flush()
+        dup_id = item_dup.id
+        ghost_id = item_ghost.id
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes", "--limit", "1"])
+
+    assert result.exit_code == 0, result.output
+
+    ytm = _FakeYTMusicWrite.instances[0]
+    yt = _FakeYouTubeWrite.instances[0]
+
+    dedupe_ran = len(ytm.unlike_calls) == 1
+    unlike_ran = len(yt.rate_calls) == 1
+    # Exactly one of the two actions ran.
+    assert dedupe_ran ^ unlike_ran, (
+        f"Expected exactly one action; got unlike_calls={ytm.unlike_calls}, rate_calls={yt.rate_calls}"
+    )
+
+    s = _open_db(fake_home)
+    try:
+        items = {r.id: r for r in s.scalars(select(DiagnosisItem)).all()}
+        applied_statuses = [v.status for v in items.values() if v.status == "applied"]
+        open_statuses = [v.status for v in items.values() if v.status == "open"]
+        assert len(applied_statuses) == 1, "exactly one item should be applied"
+        assert len(open_statuses) == 1, "exactly one item should remain open"
+
+        attempts = list(s.scalars(select(SyncAttempt)).all())
+        assert len(attempts) == 1, "exactly one SyncAttempt row expected"
+    finally:
+        s.close()
+
+    _ = dup_id, ghost_id  # referenced above via items dict; kept for clarity
 
 
 # ---------------------------------------------------------------------------
