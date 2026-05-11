@@ -12,7 +12,7 @@ from rich.table import Table
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
-from .compare import CompareInput, CompareResult, compare_likes
+from .compare import CompareInput, CompareResult, compare_likes, dedupe_by_video_id
 from .config import Config, InvalidRegionError, _validate_region
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diff import diff_snapshots
@@ -446,7 +446,8 @@ def doctor() -> None:
             f"{d.pointer_drift} pointer drift · "
             f"{d.ytmusic_only} YT Music only · "
             f"{d.unavailable_videos} unavailable videos · "
-            f"{d.metadata_drift} metadata drift"
+            f"{d.metadata_drift} metadata drift · "
+            f"{d.duplicate_in_source} duplicate likes"
         )
 
     if report.match_rate_percent is None:
@@ -462,12 +463,23 @@ class _PipelineResult:
     """Compound return value for `_compare_and_persist` so the CLI wrapper
     can render the existing summary table AND the two new finding-type
     rows from a single call. Tests typically only need `.diagnosis_id`.
+
+    Raw counts (``raw_ytmusic_count`` / ``raw_youtube_total_count`` /
+    ``raw_youtube_music_count``) reflect snapshot row counts as scanned —
+    the "what's actually in your account" view, including within-source
+    duplicates. ``compare_result`` counts are post-canonicalization
+    (each ``video_id`` collapsed to one row), matching what the matcher
+    actually saw.
     """
 
     diagnosis_id: int
     compare_result: CompareResult
     unavailable_count: int
     drift_count: int
+    duplicate_count: int
+    raw_ytmusic_count: int
+    raw_youtube_total_count: int
+    raw_youtube_music_count: int
 
 
 def _compare_and_persist(session: Session) -> _PipelineResult:
@@ -484,6 +496,7 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
     """
     from .diagnosis import (
         DiagnosisInput,
+        build_duplicate_in_source_items,
         build_metadata_drift_items,
         build_unavailable_video_items,
         create_diagnosis,
@@ -511,10 +524,17 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
             code=2,
         )
 
-    yt_items = get_snapshot_items(session, yt_snap.id)
-    ytm_items = get_snapshot_items(session, ytm_snap.id)
+    yt_items_raw = get_snapshot_items(session, yt_snap.id)
+    ytm_items_raw = get_snapshot_items(session, ytm_snap.id)
 
-    # Stage A — existing cross-source matcher.
+    # Stage A0 — within-source duplicate detection (pre-matching).
+    # We retain the raw rows so the duplicate-finding builder sees every
+    # occurrence; canonicalized streams feed the matcher and drift detector
+    # below so each ``video_id`` is counted at most once per source.
+    yt_items = dedupe_by_video_id(yt_items_raw)
+    ytm_items = dedupe_by_video_id(ytm_items_raw)
+
+    # Stage A — existing cross-source matcher (over canonicalized items).
     cmp_result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
 
     # Stage B — persist Diagnosis + the existing 0.2 finding buckets.
@@ -527,20 +547,34 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
         ),
     )
 
+    # Stage B1 — append within-source duplicate findings now that we have
+    # ``diagnosis.id``. Builder sees the RAW snapshot items so every
+    # duplicate occurrence is counted.
+    dup_items_yt = build_duplicate_in_source_items(diagnosis.id, yt_items_raw, YOUTUBE_LIKED_VIDEOS)
+    dup_items_ytm = build_duplicate_in_source_items(
+        diagnosis.id, ytm_items_raw, YTMUSIC_LIKED_SONGS
+    )
+    for it in (*dup_items_yt, *dup_items_ytm):
+        session.add(it)
+    duplicate_total = len(dup_items_yt) + len(dup_items_ytm)
+
     # Stage C — append ghost findings.
     ghost_items = build_unavailable_video_items(diagnosis.id, yt_items)
     for it in ghost_items:
         session.add(it)
 
     # Stage D — append drift findings per source against (latest, prev).
+    # Drift re-fetches from DB inside the loop, so canonicalization must
+    # be reapplied here (rebinding ``yt_items`` / ``ytm_items`` above
+    # doesn't affect these fresh fetches).
     drift_total = 0
     for source in (YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS):
         snaps = latest_snapshots_for_source(session, source, limit=2)
         if len(snaps) < 2:
             continue
         curr_snap, prev_snap = snaps[0], snaps[1]
-        curr_items = get_snapshot_items(session, curr_snap.id)
-        prev_items = get_snapshot_items(session, prev_snap.id)
+        curr_items = dedupe_by_video_id(get_snapshot_items(session, curr_snap.id))
+        prev_items = dedupe_by_video_id(get_snapshot_items(session, prev_snap.id))
         findings = detect_drift(prev_items, curr_items, source=source)
         drift_items = build_metadata_drift_items(diagnosis.id, findings, curr_items)
         drift_total += len(drift_items)
@@ -553,6 +587,10 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
         compare_result=cmp_result,
         unavailable_count=len(ghost_items),
         drift_count=drift_total,
+        duplicate_count=duplicate_total,
+        raw_ytmusic_count=len(ytm_items_raw),
+        raw_youtube_total_count=len(yt_items_raw),
+        raw_youtube_music_count=sum(1 for it in yt_items_raw if it.is_music_candidate),
     )
 
 
@@ -568,9 +606,9 @@ def compare_likes_cmd() -> None:
     table = Table(title="compare-likes summary")
     table.add_column("Bucket")
     table.add_column("Count", justify="right")
-    table.add_row("YouTube Music liked songs", str(result.ytmusic_count))
-    table.add_row("YouTube liked videos (total)", str(result.youtube_total_count))
-    table.add_row("YouTube liked videos (music-like)", str(result.youtube_music_count))
+    table.add_row("YouTube Music liked songs", str(outcome.raw_ytmusic_count))
+    table.add_row("YouTube liked videos (total)", str(outcome.raw_youtube_total_count))
+    table.add_row("YouTube liked videos (music-like)", str(outcome.raw_youtube_music_count))
     table.add_row("Matched (any stage)", str(len(result.matched)))
     table.add_row(
         "Possibly missing from YT Music",
@@ -583,6 +621,7 @@ def compare_likes_cmd() -> None:
     table.add_row("Pointer-drift candidates", str(len(result.pointer_drift_candidates)))
     table.add_row("Unavailable videos (ghost)", str(outcome.unavailable_count))
     table.add_row("Metadata drift candidates", str(outcome.drift_count))
+    table.add_row("Duplicate likes (within-source)", str(outcome.duplicate_count))
     console.print(table)
     console.print("Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown.")
 
@@ -596,7 +635,8 @@ def issues(
             help=(
                 "Filter findings by issue type. One of: "
                 "possibly_missing_from_ytmusic | possible_pointer_drift | "
-                "ytmusic_only | unavailable_video | metadata_drift."
+                "ytmusic_only | unavailable_video | metadata_drift | "
+                "duplicate_in_source."
             ),
         ),
     ] = None,

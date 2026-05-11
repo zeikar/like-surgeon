@@ -16,14 +16,17 @@ from likesurgeon.compare import (
     UnmatchedItem,
 )
 from likesurgeon.diagnosis import (
+    ISSUE_DUPLICATE_IN_SOURCE,
     ISSUE_POINTER_DRIFT,
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
     ISSUE_YTMUSIC_ONLY,
     DiagnosisInput,
+    build_duplicate_in_source_items,
     create_diagnosis,
     diagnosis_items,
     latest_diagnosis,
 )
+from likesurgeon.models import Diagnosis
 from likesurgeon.snapshot import create_snapshot, get_snapshot_items
 
 
@@ -124,6 +127,127 @@ def test_create_diagnosis_persists_each_bucket(session: Session):
     assert drift.related_track_id == ytm_items[0].track_id
     # All items default to status='open'.
     assert all(it.status == "open" for it in items)
+
+
+def _make_empty_diagnosis(session: Session) -> Diagnosis:
+    diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=None)
+    session.add(diag)
+    session.flush()
+    return diag
+
+
+def test_build_duplicate_in_source_items_emits_one_per_duplicated_video_id(
+    session: Session,
+):
+    """Snapshot with two items sharing the same video_id yields exactly ONE
+    DiagnosisItem per duplicated video_id — never additive on top of
+    existing buckets."""
+    snap = create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            _ytm_item("dup_vid", "Day by Day", ["X"]),
+            _ytm_item("unique_vid", "Other", ["Y"]),
+            _ytm_item("dup_vid", "Day by Day", ["X"]),
+        ],
+    )
+    session.commit()
+    diag = _make_empty_diagnosis(session)
+    items = get_snapshot_items(session, snap.id)
+
+    result = build_duplicate_in_source_items(diag.id, items, "ytmusic_liked_songs")
+
+    assert len(result) == 1
+    finding = result[0]
+    assert finding.issue_type == ISSUE_DUPLICATE_IN_SOURCE
+    assert finding.confidence == 1.0
+    # source_track_id resolves to the lowest-position row (position=0).
+    dup_rows_sorted = sorted(
+        [it for it in items if it.video_id == "dup_vid"], key=lambda it: it.position
+    )
+    assert finding.source_track_id == dup_rows_sorted[0].track_id
+    assert finding.related_track_id is None
+    assert finding.status == "open"
+    assert "appears 2 times" in finding.reason
+    # Positions show in ascending order.
+    expected_positions = ", ".join(str(it.position) for it in dup_rows_sorted)
+    assert expected_positions in finding.reason
+
+
+def test_build_duplicate_in_source_items_no_duplicates_returns_empty(
+    session: Session,
+):
+    snap = create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            _ytm_item("a", "A", ["X"]),
+            _ytm_item("b", "B", ["Y"]),
+        ],
+    )
+    session.commit()
+    diag = _make_empty_diagnosis(session)
+    items = get_snapshot_items(session, snap.id)
+
+    assert build_duplicate_in_source_items(diag.id, items, "ytmusic_liked_songs") == []
+
+
+def test_build_duplicate_in_source_items_skips_null_video_ids(session: Session):
+    """Rows whose video_id is NULL share no identity — they can't be
+    duplicates of each other."""
+    # ytmusic items without a videoId still translate to SnapshotItem
+    # rows (the translator falls back to ``canon:<key>`` for dedupe_key
+    # but leaves SnapshotItem.video_id = None).
+    snap = create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {"title": "Untitled A", "artists": [{"name": "X"}]},
+            {"title": "Untitled B", "artists": [{"name": "Y"}]},
+        ],
+    )
+    session.commit()
+    diag = _make_empty_diagnosis(session)
+    items = get_snapshot_items(session, snap.id)
+    # Sanity: both rows have NULL video_id.
+    assert all(it.video_id is None for it in items)
+
+    assert build_duplicate_in_source_items(diag.id, items, "ytmusic_liked_songs") == []
+
+
+def test_build_duplicate_in_source_items_picks_lowest_position_first(
+    session: Session,
+):
+    """Three rows with the same video_id at distinct positions: builder
+    must internally sort by position so ``source_track_id`` resolves to
+    the lowest-position row's track and the reason lists positions in
+    ascending order regardless of caller's input order."""
+    snap = create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            _ytm_item("v", "A", ["X"]),  # position 0
+            _ytm_item("v", "A", ["X"]),  # position 1
+            _ytm_item("v", "A", ["X"]),  # position 2
+        ],
+    )
+    session.commit()
+    diag = _make_empty_diagnosis(session)
+    items = get_snapshot_items(session, snap.id)
+    # Shuffle the caller-provided list so we can prove the builder
+    # doesn't trust input order.
+    shuffled = [items[2], items[0], items[1]]
+
+    result = build_duplicate_in_source_items(diag.id, shuffled, "ytmusic_liked_songs")
+
+    assert len(result) == 1
+    finding = result[0]
+    # source_track_id == track_id of the position-0 row.
+    by_position = sorted(items, key=lambda it: it.position)
+    assert finding.source_track_id == by_position[0].track_id
+    # Positions render in ascending order in the reason text.
+    assert "positions: 0, 1, 2" in finding.reason
+    assert "appears 3 times" in finding.reason
 
 
 def test_latest_diagnosis_orders_by_recency(session: Session):

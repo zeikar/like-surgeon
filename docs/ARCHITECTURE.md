@@ -69,7 +69,7 @@ Five tables, all SQLite-backed at `~/.like-surgeon/like-surgeon.sqlite`:
   - `is_music_candidate` / `music_candidate_score` / `music_candidate_reason` — populated for YouTube rows only (ytmusic is always music).
   - `is_available` / `unavailable_reason` — ghost detection result, populated for YouTube rows only. Reasons: `deleted`, `rejected`, `region_blocked` (0.3.1+).
 - **`diagnoses`** — one row per `compare-likes` run. References both source snapshots.
-- **`diagnosis_items`** — findings: `issue_type` ∈ {`possibly_missing_from_ytmusic`, `possible_pointer_drift`, `ytmusic_only`, `unavailable_video`, `metadata_drift`}, plus `confidence`, `reason`, optional `source_track_id` / `related_track_id`.
+- **`diagnosis_items`** — findings: `issue_type` ∈ {`possibly_missing_from_ytmusic`, `possible_pointer_drift`, `ytmusic_only`, `unavailable_video`, `metadata_drift`, `duplicate_in_source`}, plus `confidence`, `reason`, optional `source_track_id` / `related_track_id`.
 
 **Lightweight in-place migration only.** [`_migrate_in_place`](../src/likesurgeon/db.py) (called from `make_engine` on every CLI run) idempotently issues `ALTER TABLE ... ADD COLUMN` for nullable columns added after a table was first created — that's how 0.3's `is_available` / `unavailable_reason` reach pre-0.3 DBs without forcing a re-scan. There is no Alembic-style framework, so any **breaking** change during 0.x (renamed columns, type changes, FK reshuffles) requires dropping `~/.like-surgeon/like-surgeon.sqlite` and re-scanning. The DB only holds derived data; no original-source state is lost.
 

@@ -24,9 +24,10 @@ to expose row-level ids on their items.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from rapidfuzz import fuzz
 
@@ -41,6 +42,44 @@ class _Itemish(Protocol):
     artists: Any
     canonical_key: str
     is_music_candidate: bool | None
+
+
+class _VideoIdPositioned(Protocol):
+    """Minimal duck-typed contract for ``dedupe_by_video_id``.
+
+    Keeps ``compare.py`` decoupled from the SQLAlchemy ORM — both real
+    ``SnapshotItem`` rows and lightweight test stand-ins satisfy this.
+    """
+
+    video_id: str | None
+    position: int
+
+
+_T = TypeVar("_T", bound=_VideoIdPositioned)
+
+
+def dedupe_by_video_id(items: Sequence[_T]) -> list[_T]:
+    """Return one row per ``video_id`` (lowest-position winner), NULL-safe.
+
+    Contract:
+      - Rows with falsy ``video_id`` pass through unchanged (no identity).
+      - For each non-null ``video_id`` group, keep the row with the
+        smallest ``position``; discard the rest.
+      - Output is sorted by ``position`` ascending (position-stable).
+      - Idempotent: running twice returns an equal list.
+    """
+    kept: dict[str, _T] = {}
+    no_id: list[_T] = []
+    for it in items:
+        if not it.video_id:
+            no_id.append(it)
+            continue
+        existing = kept.get(it.video_id)
+        if existing is None or it.position < existing.position:
+            kept[it.video_id] = it
+    combined: list[_T] = list(kept.values()) + no_id
+    combined.sort(key=lambda x: x.position)
+    return combined
 
 
 def _normalize_artists(value: Any) -> list[str]:

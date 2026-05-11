@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from likesurgeon.db import make_session_factory
 from likesurgeon.diagnosis import (
+    ISSUE_DUPLICATE_IN_SOURCE,
     ISSUE_METADATA_DRIFT,
     ISSUE_POINTER_DRIFT,
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
@@ -428,6 +429,41 @@ def test_plan_ignores_ytmusic_only_and_metadata_drift(session: Session) -> None:
     actions, skips = plan([only, drift], {t1.id: "v1", t2.id: "v2"}, drift_min_confidence=0.95)
 
     assert actions == []
+    assert skips == []
+
+
+def test_plan_ignores_duplicate_in_source_alongside_actionable(session: Session) -> None:
+    """duplicate_in_source is informational (acted on by a future 0.5
+    dedupe command). Planner must emit no action / no skip for it,
+    while still planning actionable findings in the same diagnosis."""
+    diag = _make_diagnosis(session)
+    dup_t = _make_track(session, "dup", suffix="dup")
+    ghost_t = _make_track(session, "ghost", suffix="g")
+    dup = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=dup_t,
+    )
+    ghost = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_UNAVAILABLE_VIDEO,
+        source_track=ghost_t,
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [dup, ghost],
+        {dup_t.id: "dup", ghost_t.id: "ghost"},
+        drift_min_confidence=0.95,
+    )
+
+    # The dup finding produces neither an action nor a skip.
+    assert all(a.item_id != dup.id for a in actions)
+    assert all(s.item_id != dup.id for s in skips)
+    # The ghost finding still becomes a yt_unlike action.
+    assert [a.item_id for a in actions] == [ghost.id]
     assert skips == []
 
 
