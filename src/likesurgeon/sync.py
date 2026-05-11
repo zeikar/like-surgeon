@@ -27,9 +27,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .diagnosis import (
+    ISSUE_DUPLICATE_IN_SOURCE,
+    ISSUE_METADATA_DRIFT,
     ISSUE_POINTER_DRIFT,
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
     ISSUE_UNAVAILABLE_VIDEO,
+    ISSUE_YTMUSIC_ONLY,
 )
 from .models import DiagnosisItem, SyncAttempt, Track
 from .youtube_client import YouTubeClient, YouTubeWriteError
@@ -121,8 +124,9 @@ def plan(
     for an explicit manual override ("I never want to act on this finding"
     — e.g. a private/deleted YouTube ghost that ``videos.rate`` can't
     unlike anyway, so retrying would just noise the audit log forever).
-    Findings of type ``ytmusic_only`` or ``metadata_drift`` are also
-    silently dropped (informational, not actionable in 0.4).
+    Findings of type ``ytmusic_only``, ``metadata_drift``, or
+    ``duplicate_in_source`` are also silently dropped (informational, not
+    actionable in 0.4 — within-source dedup is deferred to 0.5).
     """
     actions: list[PlannedAction] = []
     skips: list[SkipRecord] = []
@@ -201,7 +205,16 @@ def plan(
                 )
             )
 
-        # ytmusic_only / metadata_drift: silently ignored — no record at all.
+        elif item.issue_type in {
+            ISSUE_YTMUSIC_ONLY,
+            ISSUE_METADATA_DRIFT,
+            ISSUE_DUPLICATE_IN_SOURCE,
+        }:
+            # Informational findings — no record, no action.
+            continue
+
+        # Unknown future issue types fall through silently (no WARN channel
+        # — sync.plan stays pure).
 
     return actions, skips
 

@@ -160,6 +160,9 @@ class DiagnosisItem(Base):
         ``videos.list``.
       - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
         of one source with meaningfully different title or artists.
+      - ``duplicate_in_source`` — the same ``video_id`` appears more than
+        once in a single snapshot (ytmusic accumulates these over time).
+        Informational; actual dedup ships as a separate command in 0.5.
     """
 
     __tablename__ = "diagnosis_items"

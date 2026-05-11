@@ -775,3 +775,315 @@ def test_sync_limit_above_action_count_is_noop(
     assert result.exit_code == 0, result.output
     assert "applying first" not in result.output
     assert "applied=2" in result.output
+
+
+# ---------------------------------------------------------------------------
+# duplicate_in_source — compare-likes pipeline + canonicalization.
+#
+# These tests drive the on-disk DB through the CliRunner like the sync tests
+# above, then inspect persisted DiagnosisItem rows. Stdout assertions are
+# label-presence-only (Rich table column wrapping is brittle); the real
+# correctness check is the SQL row count.
+# ---------------------------------------------------------------------------
+
+
+def _ytm_raw(video_id: str, title: str, artists: list[str]) -> dict:
+    return {
+        "videoId": video_id,
+        "title": title,
+        "artists": [{"name": a} for a in artists],
+    }
+
+
+def _yt_raw(video_id: str, title: str, channel: str = "ArtistVEVO") -> dict:
+    return {
+        "snippet": {
+            "title": title,
+            "channelTitle": channel,
+            "resourceId": {"videoId": video_id},
+        },
+        "contentDetails": {"videoId": video_id},
+    }
+
+
+def test_compare_likes_reports_duplicate_in_source_bucket(
+    fake_home: Path,
+) -> None:
+    """One ytmusic video_id duplicated twice → exactly 1 duplicate_in_source row
+    and the bucket label appears in compare-likes stdout."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [
+                _ytm_raw("dup", "Day by Day", ["X"]),
+                _ytm_raw("dup", "Day by Day", ["X"]),
+                _ytm_raw("unique", "Other", ["Y"]),
+            ],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare-likes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Duplicate likes (within-source)" in result.output
+
+    s = _open_db(fake_home)
+    try:
+        from sqlalchemy import select as _select
+
+        rows = list(
+            s.scalars(
+                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_DUPLICATE_IN_SOURCE)
+            ).all()
+        )
+    finally:
+        s.close()
+    assert len(rows) == 1
+
+
+def test_duplicate_does_not_phantom_inflate_ytmusic_only_bucket(fake_home: Path) -> None:
+    """Canonicalization removes phantom surplus rows from ytmusic_only: a
+    video_id duplicated twice (pre-fix: 2 phantom ``ytmusic_only`` rows)
+    must collapse to exactly 1 — the canonical row remains because it
+    genuinely has no YT counterpart. The phantom inflation is what
+    ``sync`` could previously act on by mistake."""
+    from sqlalchemy import select as _select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
+    from likesurgeon.models import DiagnosisItem, Track
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [
+                _ytm_raw("dup", "Day by Day", ["X"]),
+                _ytm_raw("dup", "Day by Day", ["X"]),
+            ],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare-likes"])
+    assert result.exit_code == 0, result.output
+
+    s = _open_db(fake_home)
+    try:
+        dup_track = s.scalar(
+            _select(Track).where(Track.source == "ytmusic_liked_songs", Track.video_id == "dup")
+        )
+        assert dup_track is not None
+        ytm_only_rows = list(
+            s.scalars(
+                _select(DiagnosisItem).where(
+                    DiagnosisItem.issue_type == ISSUE_YTMUSIC_ONLY,
+                    DiagnosisItem.source_track_id == dup_track.id,
+                )
+            ).all()
+        )
+    finally:
+        s.close()
+    # Exactly 1 canonical row — the phantom surplus row is gone.
+    assert len(ytm_only_rows) == 1
+
+
+def test_compare_likes_handles_youtube_side_duplicate(fake_home: Path) -> None:
+    """Rare-but-possible: YouTube has a duplicated music-candidate video_id
+    with no ytmusic counterpart. Pre-canonicalization, the surplus row
+    would surface as a phantom ``possibly_missing_from_ytmusic`` that sync
+    would happily act on (this is the bug). After canonicalization: 1
+    duplicate_in_source finding tagged to the YouTube side, and the
+    canonical row produces exactly 1 ``possibly_missing_from_ytmusic``
+    (phantom surplus is gone — only the genuine row remains)."""
+    from sqlalchemy import select as _select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import (
+        ISSUE_DUPLICATE_IN_SOURCE,
+        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
+    )
+    from likesurgeon.models import DiagnosisItem, Track
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [_ytm_raw("other", "Other Song", ["Y"])],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [
+                _yt_raw("dup_yt", "Some Music Video (Official MV)", "MusicVEVO"),
+                _yt_raw("dup_yt", "Some Music Video (Official MV)", "MusicVEVO"),
+            ],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare-likes"])
+    assert result.exit_code == 0, result.output
+
+    s = _open_db(fake_home)
+    try:
+        # 1 duplicate_in_source row tagged to the YouTube side.
+        dup_rows = list(
+            s.scalars(
+                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_DUPLICATE_IN_SOURCE)
+            ).all()
+        )
+        assert len(dup_rows) == 1
+        assert "youtube_liked_videos" in dup_rows[0].reason
+
+        # Exactly 1 (canonical) possibly_missing row for the duplicated
+        # YouTube video_id — the phantom surplus is gone.
+        dup_track = s.scalar(
+            _select(Track).where(Track.source == "youtube_liked_videos", Track.video_id == "dup_yt")
+        )
+        assert dup_track is not None
+        rows = list(
+            s.scalars(
+                _select(DiagnosisItem).where(
+                    DiagnosisItem.issue_type == ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
+                    DiagnosisItem.source_track_id == dup_track.id,
+                )
+            ).all()
+        )
+    finally:
+        s.close()
+    assert len(rows) == 1
+
+
+def test_issues_filter_by_duplicate_in_source_type(fake_home: Path) -> None:
+    """`issues --type duplicate_in_source` returns exactly the 1 dup finding;
+    `--type ytmusic_only` does not include the duplicated video_id."""
+    from likesurgeon.cli import app
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [
+                _ytm_raw("dup", "Day by Day", ["X"]),
+                _ytm_raw("dup", "Day by Day", ["X"]),
+            ],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["compare-likes"]).exit_code == 0
+
+    dup_result = runner.invoke(app, ["issues", "--type", "duplicate_in_source", "--format", "json"])
+    assert dup_result.exit_code == 0, dup_result.output
+    import json as _json
+
+    payload = _json.loads(dup_result.stdout)
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["issue_type"] == "duplicate_in_source"
+
+    ytm_only = runner.invoke(app, ["issues", "--type", "ytmusic_only", "--format", "json"])
+    assert ytm_only.exit_code == 0
+    payload2 = _json.loads(ytm_only.stdout)
+    # The duplicated "dup" video_id appears in ytmusic_only at most once
+    # (its canonical row) — phantom surplus is eliminated by
+    # canonicalization.
+    dup_in_only = [it for it in payload2["items"] if it["source_video_id"] == "dup"]
+    assert len(dup_in_only) <= 1
+
+
+def test_compare_likes_raw_total_counts_include_duplicates(
+    fake_home: Path,
+) -> None:
+    """User-facing semantic: the raw ``YouTube Music liked songs`` count
+    reflects the snapshot's actual row count (= what's in the user's
+    account) even when duplicates are present. Buckets reflect post-
+    canonicalization findings."""
+    from likesurgeon.cli import app
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [
+                _ytm_raw("a", "A", ["X"]),
+                _ytm_raw("b", "B", ["Y"]),
+                _ytm_raw("dup", "D", ["Z"]),
+                _ytm_raw("dup", "D", ["Z"]),
+                _ytm_raw("c", "C", ["W"]),
+            ],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    runner = CliRunner()
+    # Use a wide terminal so Rich doesn't wrap the count column.
+    result = runner.invoke(app, ["compare-likes"], terminal_width=200)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # The raw ytmusic count row must reflect 5 (the snapshot has 5 rows),
+    # not 4 (the canonicalized matcher view).
+    assert "YouTube Music liked songs" in out
+
+    # Stronger check via _PipelineResult directly: the CLI surfaces raw
+    # counts in the totals rows while the bucket counts reflect the
+    # canonicalized comparison.
+    from likesurgeon.cli import _compare_and_persist
+
+    s = _open_db(fake_home)
+    try:
+        # Fresh pipeline run for the assertion. The CLI invocation above
+        # already persisted a Diagnosis; this is purely about the in-
+        # memory counts the renderer would feed Rich.
+        outcome = _compare_and_persist(s)
+        s.rollback()
+    finally:
+        s.close()
+    assert outcome.raw_ytmusic_count == 5
+    # compare_result.ytmusic_count is the post-canonicalization view: 4.
+    assert outcome.compare_result.ytmusic_count == 4

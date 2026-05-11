@@ -16,6 +16,7 @@ ISSUE_POINTER_DRIFT = "possible_pointer_drift"
 ISSUE_YTMUSIC_ONLY = "ytmusic_only"
 ISSUE_UNAVAILABLE_VIDEO = "unavailable_video"
 ISSUE_METADATA_DRIFT = "metadata_drift"
+ISSUE_DUPLICATE_IN_SOURCE = "duplicate_in_source"
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,49 @@ def build_metadata_drift_items(
                 confidence=1.0,
                 reason=reason,
                 source_track_id=track_id,
+                related_track_id=None,
+                status="open",
+            )
+        )
+    return out
+
+
+def build_duplicate_in_source_items(
+    diagnosis_id: int,
+    snapshot_items: list[SnapshotItem],
+    source: str,
+) -> list[DiagnosisItem]:
+    """Build DiagnosisItem rows for within-source duplicate ``video_id`` groups.
+
+    ``confidence=1.0`` because a duplicate row is a deterministic fact about
+    the snapshot — there's no probability to surface. Filtering with
+    ``--min-confidence`` should never hide a real duplicate.
+
+    Rows with falsy ``video_id`` are skipped (no identity to dedupe). For
+    each duplicated ``video_id`` group, the group is sorted by ``position``
+    ascending and ``source_track_id`` resolves to the position-1 row's
+    ``track_id`` so output is deterministic regardless of caller input order.
+    """
+    groups: dict[str, list[SnapshotItem]] = {}
+    for item in snapshot_items:
+        if not item.video_id:
+            continue
+        groups.setdefault(item.video_id, []).append(item)
+
+    out: list[DiagnosisItem] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        sorted_group = sorted(group, key=lambda it: it.position)
+        positions = ", ".join(str(it.position) for it in sorted_group)
+        reason = f"appears {len(sorted_group)} times in {source} snapshot (positions: {positions})"
+        out.append(
+            DiagnosisItem(
+                diagnosis_id=diagnosis_id,
+                issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+                confidence=1.0,
+                reason=reason,
+                source_track_id=sorted_group[0].track_id,
                 related_track_id=None,
                 status="open",
             )

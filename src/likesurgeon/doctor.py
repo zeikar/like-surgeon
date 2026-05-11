@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .compare import dedupe_by_video_id
 from .diff import DiffResult, diff_snapshots
 from .models import Snapshot
 from .snapshot import get_snapshot_items, latest_snapshot
@@ -36,6 +37,7 @@ class DiagnosisSummary:
     ytmusic_only: int
     unavailable_videos: int
     metadata_drift: int
+    duplicate_in_source: int
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ def _source_health(session: Session, source: str) -> SourceHealth:
 
 def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None, float | None]:
     from .diagnosis import (
+        ISSUE_DUPLICATE_IN_SOURCE,
         ISSUE_METADATA_DRIFT,
         ISSUE_POINTER_DRIFT,
         ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
@@ -100,6 +103,7 @@ def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None
         ISSUE_YTMUSIC_ONLY: 0,
         ISSUE_UNAVAILABLE_VIDEO: 0,
         ISSUE_METADATA_DRIFT: 0,
+        ISSUE_DUPLICATE_IN_SOURCE: 0,
     }
     for it in items:
         if it.issue_type in counts:
@@ -111,13 +115,20 @@ def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None
         ytmusic_only=counts[ISSUE_YTMUSIC_ONLY],
         unavailable_videos=counts[ISSUE_UNAVAILABLE_VIDEO],
         metadata_drift=counts[ISSUE_METADATA_DRIFT],
+        duplicate_in_source=counts[ISSUE_DUPLICATE_IN_SOURCE],
     )
 
     # Health: match_rate = (yt_music_candidates - unmatched) / yt_music_candidates.
     # The "unmatched" count is exactly the high-priority bucket from this run.
+    #
+    # Denominator must use the same canonicalized view the diagnosis used —
+    # ``compare`` dedupes by video_id before matching, so the unmatched count
+    # is per unique video_id, not per raw row. Mixing raw denominator with
+    # canonicalized numerator would falsely inflate the score whenever the
+    # YouTube snapshot contains within-source duplicates.
     if diag.youtube_snapshot_id is None:
         return summary, None
-    yt_items = get_snapshot_items(session, diag.youtube_snapshot_id)
+    yt_items = dedupe_by_video_id(get_snapshot_items(session, diag.youtube_snapshot_id))
     yt_music_count = sum(1 for it in yt_items if it.is_music_candidate)
     if yt_music_count == 0:
         return summary, None

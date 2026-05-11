@@ -160,6 +160,7 @@ uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence 
 | `possible_pointer_drift` | YouTube like → unlike | `videos.rate("like")` then `videos.rate("none")` | — | `confidence >= --drift-min-confidence` (default 0.95) | Re-points the YouTube like at the YT Music track's video_id. Like first, then unlike — a partial failure leaves a duplicate like (cleaned up on the next run) instead of losing the original. |
 | `ytmusic_only` | — | — | — | never | Informational only. Reverse-direction sync (YT Music → YouTube) is out of scope for 0.4. |
 | `metadata_drift` | — | — | — | never | Informational only. Title/artist drift is signal for the user, not a write target. |
+| `duplicate_in_source` | — | — | — | never | Informational. Acts on this finding deferred to 0.5 (dedupe command). |
 
 #### State model
 

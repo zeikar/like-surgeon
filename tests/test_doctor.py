@@ -189,3 +189,88 @@ def test_doctor_summary_counts_new_issue_types(session) -> None:
     assert report.latest_diagnosis is not None
     assert report.latest_diagnosis.unavailable_videos >= 1
     assert report.latest_diagnosis.metadata_drift >= 1
+
+
+def test_doctor_summary_counts_duplicate_in_source(session) -> None:
+    """`duplicate_in_source` count surfaces in DiagnosisSummary aggregation."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.doctor import health_summary
+    from likesurgeon.snapshot import create_snapshot
+
+    # YT Music snapshot with a duplicated video_id.
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [
+            {"videoId": "dup", "title": "T", "artists": [{"name": "A"}]},
+            {"videoId": "dup", "title": "T", "artists": [{"name": "A"}]},
+        ],
+    )
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Music",
+                    "channelTitle": "C",
+                    "resourceId": {"videoId": "yt_only"},
+                },
+                "contentDetails": {"videoId": "yt_only"},
+            },
+        ],
+    )
+
+    _compare_and_persist(session)
+    report = health_summary(session)
+    assert report.latest_diagnosis is not None
+    assert report.latest_diagnosis.duplicate_in_source == 1
+
+
+def test_doctor_match_rate_denominator_is_canonicalized(session) -> None:
+    """Regression: when YouTube has within-source duplicates, the doctor
+    health score must compute the denominator on the canonicalized view
+    (same as the diagnosis), not on raw snapshot rows. Otherwise the
+    numerator (canonicalized missing count) and denominator (raw rows)
+    disagree and the percentage misleads — e.g. an entirely-unmatched
+    YouTube snapshot with one video duplicated would falsely report 50%.
+
+    Setup: YT side has video_id 'x' twice (music-candidate), no ytmusic
+    match. Canonicalized view = 1 music candidate, 1 missing → 0%.
+    Raw view (the bug) = 2 candidates, 1 missing → 50%.
+    """
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.snapshot import create_snapshot
+
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [],  # no ytmusic matches at all
+    )
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Song (Official Audio)",
+                    "channelTitle": "Artist - Topic",
+                    "resourceId": {"videoId": "x"},
+                },
+                "contentDetails": {"videoId": "x"},
+            },
+            {
+                "snippet": {
+                    "title": "Song (Official Audio)",
+                    "channelTitle": "Artist - Topic",
+                    "resourceId": {"videoId": "x"},
+                },
+                "contentDetails": {"videoId": "x"},
+            },
+        ],
+    )
+
+    _compare_and_persist(session)
+    report = health_summary(session)
+    # Canonicalized: 1 unique music candidate, 1 missing → 0%.
+    assert report.match_rate_percent == 0.0
