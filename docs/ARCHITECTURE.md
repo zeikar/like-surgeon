@@ -100,5 +100,6 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 - **0.2.2**: `--from-browser` cookie extraction (no more DevTools paste)
 - **0.3**: matching engine (three-stage, multiset semantics, ghost detection, drift)
 - **0.3.1**: region-aware ghost detection (`regionRestriction` + `config.json`)
-- **0.4**: write actions for cross-source like sync (planned, source-of-truth = YouTube)
+- **0.4**: write actions for cross-source like sync (source-of-truth = YouTube)
+- **0.5**: `sync` learns `duplicate_in_source` (ytmusic source, N=2) — one `rate_song("INDIFFERENT")` per finding, terminal after attempt
 - **1.0**: local web UI / Electron app

@@ -1,6 +1,6 @@
 [project]
 name = "likesurgeon"
-version = "0.4.1"
+version = "0.5.0"
 description = "Sync, backup, and repair your YouTube Music liked songs."
 readme = "README.md"
 requires-python = ">=3.11"
