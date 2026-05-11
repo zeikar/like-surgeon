@@ -19,6 +19,7 @@ dist/
 .mypy_cache/
 .coverage
 htmlcov/
+.hyperclaude/
 
 # Editor
 .idea/
