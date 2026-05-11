@@ -219,6 +219,20 @@ class YTMusicClient:
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YTMusicWriteError(video_id, str(exc)) from exc
 
+    def unlike_song(self, video_id: str) -> None:
+        """Remove ONE LM-playlist entry for ``video_id`` via ``rate_song(..., "INDIFFERENT")``.
+
+        This is the only viable dedupe path: ``LIKE`` is non-idempotent (every call
+        appends to LM), and ``setVideoId`` isn't returned by ``get_liked_songs`` so
+        ``remove_playlist_items`` can't target a specific occurrence. Propagation is
+        eventually consistent on the order of minutes — see callers' cooldown notes.
+        """
+        client = self._build()
+        try:
+            client.rate_song(video_id, "INDIFFERENT")
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YTMusicWriteError(video_id, str(exc)) from exc
+
     def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
         """Fetch up to ``limit`` liked songs. Returns the raw track dicts.
 

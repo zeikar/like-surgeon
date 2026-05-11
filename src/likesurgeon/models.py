@@ -162,7 +162,10 @@ class DiagnosisItem(Base):
         of one source with meaningfully different title or artists.
       - ``duplicate_in_source`` — the same ``video_id`` appears more than
         once in a single snapshot (ytmusic accumulates these over time).
-        Informational; actual dedup ships as a separate command in 0.5.
+        Actionable via ``ytm_dedupe`` (ytmusic source, N=2 only) as of 0.5.
+        Non-idempotent — ``status='applied'`` is set after attempt regardless
+        of outcome (carve-out from the standard 'applied = full success'
+        invariant; see ``sync.execute()`` docstring).
     """
 
     __tablename__ = "diagnosis_items"
@@ -192,7 +195,7 @@ class SyncAttempt(Base):
     """One row per ``sync`` API call (or skip decision).
 
     ``kind`` is one of ``yt_unlike``, ``ytm_like``, ``yt_relike_like``,
-    ``yt_relike_unlike`` — the two halves of a drift fix get separate rows
+    ``yt_relike_unlike``, ``ytm_dedupe`` — the two halves of a drift fix get separate rows
     so the audit trail stays atomic per HTTP call. ``status`` is one of
     ``applied``, ``failed``, ``skipped``. ``reason`` carries sync-side
     detail (error message, threshold note, missing video_id, etc.) — the
