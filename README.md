@@ -2,7 +2,7 @@
 
 > Sync, backup, and repair your YouTube Music liked songs.
 
-**Status:** MVP 0.3.1 — read-only scanner across YouTube Music *and* YouTube, with cross-source diagnosis, region-aware ghost detection, and metadata drift. Local-first. No server, no destructive actions.
+**Status:** MVP 0.4 — cross-source diagnosis (read) **plus** `sync` (write-back) for YouTube ghosts, YT Music missing likes, and pointer-drift fixes. Local-first, no server.
 
 ## What it does today
 
@@ -27,7 +27,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | **0.2.2**   | Auth/UX polish: `--from-browser` flag on `auth ytmusic` reads YT Music cookies straight from a logged-in browser via [browser-cookie3](https://pypi.org/project/browser-cookie3/) and writes a ytmusicapi-compatible `browser.json` (POSIX mode `0o600`). Manual paste flow stays as a fallback. The TVHTML5 OAuth path documented in [docs/notes/ytmusic-oauth-tvhtml5-fallback.md](docs/notes/ytmusic-oauth-tvhtml5-fallback.md) remains shelved unless cookie extraction fails on a target platform. |
 | **0.3**     | Matching engine: ghost YouTube likes (deleted/private/unavailable, detected at `scan youtube-likes` time via `videos.list`) and metadata drift (snapshot-pair title/artists comparison via [RapidFuzz](https://github.com/maxbachmann/RapidFuzz)). Both surface as new `issue_type` rows on `compare-likes`; no new commands. |
 | **0.3.1**   | Region-aware ghost detection: `videos.list?part=status,contentDetails` checks `regionRestriction` against the user's configured ISO 3166-1 alpha-2 region (`config.json` or `--region` flag). Region-blocked videos surface as `unavailable_video` findings with `unavailable_reason="region_blocked"`. No new commands, quota cost unchanged. |
-| 0.4         | Write actions for cross-source like sync (planned)                    |
+| **0.4**     | `sync` command: applies the latest diagnosis's actionable findings to YouTube (`videos.rate`) and YT Music (`rate_song`). New `SyncAttempt` audit table records every HTTP call without overwriting the diagnosis-time `reason`. OAuth scope upgraded to `youtube` (write); `authorize()` re-prompts consent when a cached token only has `youtube.readonly`. |
 | 1.0         | Local web UI / Electron app                                           |
 
 ## Install
@@ -138,6 +138,44 @@ uv run likesurgeon issues --min-confidence 0.7 --format json
 ```
 
 `compare-likes` requires a snapshot from each source. It prints a bucket summary and persists the run as a `Diagnosis`. `issues` then surfaces the per-item breakdown.
+
+### 6. Sync (write actions)
+
+`sync` applies the latest diagnosis's actionable findings. Default is **actually write** after a y/N prompt — use `--dry-run` to see the plan without writing, `--yes` to skip the prompt, `--limit N` to ramp.
+
+```bash
+uv run likesurgeon sync --dry-run                 # plan + quota estimate, no writes
+uv run likesurgeon sync                            # apply, with confirmation prompt
+uv run likesurgeon sync --yes                      # apply, no prompt
+uv run likesurgeon sync --limit 20 --yes           # apply first 20 actions only
+uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence drifts
+```
+
+#### What each finding type does
+
+| `issue_type` | Action | YouTube call | YT Music call | Auto-apply | Notes |
+|---|---|---|---|---|---|
+| `unavailable_video` | YouTube unlike | `videos.rate(rating="none")` | — | always | Removes ghosts (private / deleted / region-blocked) from your Liked videos. |
+| `possibly_missing_from_ytmusic` | YT Music like | — | `rate_song("LIKE")` | always | Adds a YouTube-only like into YT Music. Non-music videos may return 200 OK but won't appear in the YT Music library — they'll re-surface on the next `compare-likes` until manually deduped. |
+| `possible_pointer_drift` | YouTube like → unlike | `videos.rate("like")` then `videos.rate("none")` | — | `confidence >= --drift-min-confidence` (default 0.95) | Re-points the YouTube like at the YT Music track's video_id. Like first, then unlike — a partial failure leaves a duplicate like (cleaned up on the next run) instead of losing the original. |
+| `ytmusic_only` | — | — | — | never | Informational only. Reverse-direction sync (YT Music → YouTube) is out of scope for 0.4. |
+| `metadata_drift` | — | — | — | never | Informational only. Title/artist drift is signal for the user, not a write target. |
+
+#### State model
+
+- Each HTTP call (or skip decision) writes one `SyncAttempt` row with `kind`, `status` (`applied`/`failed`/`skipped`), and a `reason`. The originating `DiagnosisItem.reason` (the diagnosis-time evidence) is **never overwritten** — sync detail lives on `SyncAttempt.reason` instead.
+- `DiagnosisItem.status` only flips to `'applied'` when every API call for the action succeeded. For drift that means BOTH halves. Anything else (failure, low-confidence skip) leaves it at `'open'` so the next `sync` re-evaluates it.
+- Re-running `sync` is idempotent: applied items are skipped; failures and previously-skipped findings are re-tried (so lowering `--drift-min-confidence` will pick up borderline drifts on the next run).
+- Continue-on-error: a failure (quota exhausted, transport error, revoked token) records the per-item `failed` row and moves on. The run exits non-zero if any action failed.
+
+#### Quota
+
+`videos.rate` is **50 units per call**. A drift fix is two calls (= 100 units). The default daily YouTube quota is 10,000 units. The plan summary prints the estimate before the prompt; if it exceeds your remaining quota, slice across days with `--limit`.
+
+#### Safety
+
+- First run after upgrading from 0.3.x: the existing OAuth token only has `youtube.readonly`. Run `likesurgeon auth youtube` again — the consent screen will list "Manage your YouTube account" (the write scope). Without it, `sync` aborts with a clear message before any HTTP call.
+- Re-scanning before a big sync is recommended. The diagnosis is a point-in-time snapshot — region restrictions in particular can flip, and unliking a stale "region-blocked" ghost that's since become available again is a false positive you can avoid by `scan youtube-likes` + `compare-likes` first.
 
 ## Caveats
 
