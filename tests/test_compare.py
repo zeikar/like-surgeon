@@ -34,9 +34,10 @@ class _FakeItem:
     artists: tuple[str, ...]
     canonical_key: str
     is_music_candidate: bool | None = None
+    is_available: bool | None = None
 
 
-def _yt(track_id, video_id, title, artists, music=True):
+def _yt(track_id, video_id, title, artists, music=True, available=None):
     return _FakeItem(
         track_id=track_id,
         video_id=video_id,
@@ -44,6 +45,7 @@ def _yt(track_id, video_id, title, artists, music=True):
         artists=tuple(artists),
         canonical_key=f"{', '.join(sorted(a.lower() for a in artists))}|{title.lower()}",
         is_music_candidate=music,
+        is_available=available,
     )
 
 
@@ -85,6 +87,48 @@ def test_fuzzy_match_when_neither_video_id_nor_canonical_match():
     assert len(res.matched) == 1
     assert res.matched[0].kind is MatchKind.FUZZY
     assert res.matched[0].confidence >= 0.8
+
+
+def test_ghost_yt_video_excluded_from_possibly_missing_from_ytmusic():
+    """Regression for 0.4-0.6 silent cross-prop bug.
+
+    A YouTube ghost vid (``is_available=False``, e.g. region-blocked /
+    deleted / private) that matcher missed on ytmusic side was previously
+    surfaced as BOTH ``unavailable_video`` AND
+    ``possibly_missing_from_ytmusic``. The 0.4 sync then ran:
+        1. ``yt_unlike(vid)`` (unavailable_video action) → YouTube state none
+        2. ``ytm_like(vid)`` (possibly_missing action) → ytmusic adds vid,
+           which cross-propagates back to YouTube as like → revert.
+
+    Net effect: the ghost stayed liked AND ytmusic acquired a dead entry.
+    Fix: exclude ghosts from ``possibly_missing_from_ytmusic`` (they're
+    not meaningfully missing — they're dead). ``unavailable_video``
+    finding (built separately by ``build_unavailable_video_items``)
+    remains the sole source of truth for ghosts.
+    """
+    ytm: list[_FakeItem] = []
+    yt = [_yt(2, "ghostvid", "Dead Song", ["Artist"], available=False)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt))
+    assert len(res.possibly_missing_from_ytmusic) == 0
+
+
+def test_unknown_availability_still_surfaces_as_possibly_missing():
+    """Defensive — ``is_available=None`` (e.g. status unchecked, ytmusic
+    items without availability info) must NOT be filtered out."""
+    ytm: list[_FakeItem] = []
+    yt = [_yt(2, "unknownvid", "Song", ["Artist"], available=None)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt))
+    assert len(res.possibly_missing_from_ytmusic) == 1
+    assert res.possibly_missing_from_ytmusic[0].video_id == "unknownvid"
+
+
+def test_available_yt_video_surfaces_as_possibly_missing():
+    """Sanity — explicit ``is_available=True`` behaves the same as
+    None (current behavior — both surface)."""
+    ytm: list[_FakeItem] = []
+    yt = [_yt(2, "livevid", "Song", ["Artist"], available=True)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt))
+    assert len(res.possibly_missing_from_ytmusic) == 1
 
 
 def test_possibly_missing_from_ytmusic_when_yt_video_unmatched():
