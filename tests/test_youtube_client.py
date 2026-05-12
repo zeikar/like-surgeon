@@ -1009,6 +1009,178 @@ def test_rate_video_wraps_transport_errors(monkeypatch) -> None:
     assert "network unreachable" in str(exc_info.value)
 
 
+def test_iso8601_duration_to_seconds_typical_values() -> None:
+    from likesurgeon.youtube_client import _iso8601_duration_to_seconds
+
+    assert _iso8601_duration_to_seconds("PT4M31S") == 271
+    assert _iso8601_duration_to_seconds("PT1H2M3S") == 3723
+    assert _iso8601_duration_to_seconds("PT45S") == 45
+    assert _iso8601_duration_to_seconds("PT0S") == 0
+    assert _iso8601_duration_to_seconds("oops") is None
+    assert _iso8601_duration_to_seconds("") is None
+    assert _iso8601_duration_to_seconds("PT") is None
+
+
+def test_fetch_canonical_metadata_batches_by_50(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    calls: list[list[str]] = []
+
+    def fake(*, ids: list[str]) -> dict:
+        calls.append(list(ids))
+        return {
+            "items": [
+                {
+                    "id": vid,
+                    "snippet": {"channelId": "ch1", "title": "T"},
+                    "contentDetails": {"duration": "PT1M"},
+                }
+                for vid in ids
+            ]
+        }
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    video_ids = [f"v{i}" for i in range(60)]
+    client.fetch_canonical_metadata(video_ids)
+
+    assert len(calls) == 2
+    assert len(calls[0]) == 50
+    assert len(calls[1]) == 10
+
+
+def test_fetch_canonical_metadata_returns_dict_with_expected_fields(monkeypatch) -> None:
+    from likesurgeon.compare import CanonicalMetadata
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        return {
+            "items": [
+                {
+                    "id": "vid1",
+                    "snippet": {"channelId": "ch_a", "title": "Song One"},
+                    "contentDetails": {"duration": "PT3M30S"},
+                },
+                {
+                    "id": "vid2",
+                    "snippet": {"channelId": "ch_b", "title": "Song Two"},
+                    "contentDetails": {"duration": "PT1H2M3S"},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    result = client.fetch_canonical_metadata(["vid1", "vid2"])
+
+    assert result["vid1"] == CanonicalMetadata(
+        video_id="vid1", title="Song One", channel_id="ch_a", duration_seconds=210
+    )
+    assert result["vid2"] == CanonicalMetadata(
+        video_id="vid2", title="Song Two", channel_id="ch_b", duration_seconds=3723
+    )
+
+
+def test_fetch_canonical_metadata_missing_video_id_absent_from_result(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        # Only returns vid1, not vid2
+        return {
+            "items": [
+                {
+                    "id": "vid1",
+                    "snippet": {"channelId": "ch_a", "title": "Song One"},
+                    "contentDetails": {"duration": "PT1M"},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    result = client.fetch_canonical_metadata(["vid1", "vid2"])
+
+    assert "vid1" in result
+    assert "vid2" not in result
+
+
+def test_fetch_canonical_metadata_skips_row_with_empty_channel_id(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        return {
+            "items": [
+                {
+                    "id": "vid1",
+                    "snippet": {"channelId": "", "title": "No Channel"},
+                    "contentDetails": {"duration": "PT1M"},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    result = client.fetch_canonical_metadata(["vid1"])
+
+    assert "vid1" not in result
+
+
+def test_fetch_canonical_metadata_skips_row_with_malformed_duration(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        return {
+            "items": [
+                {
+                    "id": "vid1",
+                    "snippet": {"channelId": "ch_a", "title": "Bad Duration"},
+                    "contentDetails": {"duration": "oops"},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    result = client.fetch_canonical_metadata(["vid1"])
+
+    assert "vid1" not in result
+
+
+def test_fetch_canonical_metadata_empty_input_returns_empty_dict(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    calls: list[Any] = []
+
+    def fake(*, ids: list[str]) -> dict:
+        calls.append(ids)
+        return {"items": []}
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+    result = client.fetch_canonical_metadata([])
+
+    assert result == {}
+    assert len(calls) == 0
+
+
+def test_fetch_canonical_metadata_raises_when_batch_fails(monkeypatch) -> None:
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake(*, ids: list[str]) -> dict:
+        raise RuntimeError("API down")
+
+    monkeypatch.setattr(client, "_canonical_metadata_videos_list", fake)
+
+    with pytest.raises(RuntimeError, match="API down"):
+        client.fetch_canonical_metadata(["vid1"])
+
+
 def test_fetch_video_statuses_passes_region_through(monkeypatch) -> None:
     """fetch_video_statuses receives user_region kwarg and threads it to
     classification — KR blocked items get region_blocked, JP-allowed get

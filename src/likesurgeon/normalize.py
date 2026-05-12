@@ -7,6 +7,7 @@ engine in MVP 0.3.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 
 # Noise patterns that decorate titles but don't change song identity.
@@ -57,6 +58,17 @@ def normalize_artists(artists: Iterable[str]) -> str:
     parts = [p for p in parts if p]
     parts.sort()
     return ", ".join(parts)
+
+
+def normalize_for_match(text: str) -> str:
+    """Normalize text for compare-likes Stage 4 title matching.
+
+    After NFKC, the wave dash U+301C still needs explicit mapping to ASCII ``~``
+    because NFKC does not unify it with U+FF5E fullwidth tilde.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("〜", "~")  # wave dash → ASCII tilde
+    return text.strip().casefold()
 
 
 def canonical_key(title: str, artists: Iterable[str]) -> str:

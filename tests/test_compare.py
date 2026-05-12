@@ -7,10 +7,20 @@ from dataclasses import dataclass
 import pytest
 
 from likesurgeon.compare import (
+    CanonicalMetadata,
     CompareInput,
+    CompareResult,
+    Match,
     MatchKind,
+    Stage4Candidate,
+    Stage4Evidence,
+    Stage4Match,
+    Stage4Result,
+    UnmatchedItem,
+    apply_stage4_result,
     compare_likes,
     dedupe_by_video_id,
+    stage4_enrich_drift,
 )
 
 
@@ -469,3 +479,312 @@ def test_compare_likes_no_ghost_findings_for_pre_0_3_data(session) -> None:
         .all()
     )
     assert rows == []
+
+
+def test_match_evidence_defaults_to_none():
+    """Match constructed without evidence kwarg has evidence=None."""
+    m = Match(
+        ytmusic_track_id=1,
+        youtube_track_id=2,
+        kind=MatchKind.VIDEO_ID,
+        confidence=1.0,
+        ytmusic_title="Song A",
+        youtube_title="Song A (Official MV)",
+    )
+    assert m.evidence is None
+
+
+def test_match_evidence_carries_stage4_data():
+    """Match constructed with evidence round-trips Stage4Evidence fields."""
+    ev = Stage4Evidence(
+        channel_id="UC123",
+        duration_seconds=271,
+        normalized_title="title",
+    )
+    m = Match(
+        ytmusic_track_id=1,
+        youtube_track_id=2,
+        kind=MatchKind.STAGE4_ENRICHMENT,
+        confidence=1.0,
+        ytmusic_title="Title",
+        youtube_title="Title",
+        evidence=ev,
+    )
+    assert m.evidence is not None
+    assert m.evidence.channel_id == "UC123"
+    assert m.evidence.duration_seconds == 271
+    assert m.evidence.normalized_title == "title"
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 pure-function tests
+# ---------------------------------------------------------------------------
+
+_META_EGAO = {
+    "Gvey12GFPwU": CanonicalMetadata("Gvey12GFPwU", "えがお、み〜っけた！", "UCxxx", 271),
+    "32pGBZGk4kU": CanonicalMetadata("32pGBZGk4kU", "えがお、み～っけた！", "UCxxx", 271),
+}
+
+
+def test_stage4_empty_metadata_returns_empty_result():
+    ytm = [Stage4Candidate(0, 1, "Gvey12GFPwU", "えがお")]
+    yt = [Stage4Candidate(0, 2, "32pGBZGk4kU", "えがお")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata={})
+    assert result.new_pairs == []
+    assert result.consumed_original_ytm_indices == frozenset()
+    assert result.consumed_original_yt_indices == frozenset()
+
+
+def test_stage4_no_ytm_candidates_returns_empty_result():
+    result = stage4_enrich_drift(
+        ytm_candidates=[],
+        yt_candidates=[Stage4Candidate(0, 2, "32pGBZGk4kU", "えがお")],
+        metadata=_META_EGAO,
+    )
+    assert result.new_pairs == []
+    assert result.consumed_original_ytm_indices == frozenset()
+    assert result.consumed_original_yt_indices == frozenset()
+
+
+def test_stage4_full_triple_match_promotes():
+    ytm = [Stage4Candidate(0, 1, "Gvey12GFPwU", "えがお、み〜っけた！ - I found a smile!")]
+    yt = [Stage4Candidate(0, 2, "32pGBZGk4kU", "えがお、み～っけた！")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=_META_EGAO)
+    assert len(result.new_pairs) == 1
+    pair = result.new_pairs[0]
+    assert pair.ytmusic_track_id == 1
+    assert pair.youtube_track_id == 2
+    assert pair.ytmusic_video_id == "Gvey12GFPwU"
+    assert pair.youtube_video_id == "32pGBZGk4kU"
+    assert pair.ytmusic_title == "えがお、み〜っけた！ - I found a smile!"
+    assert pair.youtube_title == "えがお、み～っけた！"
+    assert pair.evidence.channel_id == "UCxxx"
+    assert pair.evidence.duration_seconds == 271
+    assert result.consumed_original_ytm_indices == frozenset({0})
+    assert result.consumed_original_yt_indices == frozenset({0})
+
+
+def test_stage4_nonzero_original_indices_preserved():
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 200),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Title", "UCabc", 200),
+    }
+    ytm = [Stage4Candidate(original_index=7, track_id=10, video_id="vid_ytm", title="Song Title")]
+    yt = [Stage4Candidate(original_index=42, track_id=20, video_id="vid_yt", title="Song Title")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert len(result.new_pairs) == 1
+    assert result.new_pairs[0].original_ytm_index == 7
+    assert result.new_pairs[0].original_yt_index == 42
+    assert result.consumed_original_ytm_indices == frozenset({7})
+    assert result.consumed_original_yt_indices == frozenset({42})
+
+
+def test_stage4_channel_match_duration_match_but_title_mismatch_does_not_promote():
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Alpha", "UCabc", 200),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Beta", "UCabc", 200),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Alpha")]
+    yt = [Stage4Candidate(0, 2, "vid_yt", "Song Beta")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert result.new_pairs == []
+
+
+def test_stage4_channel_match_title_match_but_duration_outside_tolerance_does_not_promote():
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 271),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Title", "UCabc", 280),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Title")]
+    yt = [Stage4Candidate(0, 2, "vid_yt", "Song Title")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert result.new_pairs == []
+
+
+def test_stage4_duration_within_tolerance_plus_two_promotes():
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 271),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Title", "UCabc", 273),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Title")]
+    yt = [Stage4Candidate(0, 2, "vid_yt", "Song Title")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert len(result.new_pairs) == 1
+
+
+def test_stage4_duration_within_tolerance_minus_two_promotes():
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 273),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Title", "UCabc", 271),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Title")]
+    yt = [Stage4Candidate(0, 2, "vid_yt", "Song Title")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert len(result.new_pairs) == 1
+
+
+def test_stage4_collision_two_yt_rows_same_key_does_not_promote():
+    """Two yt candidates share the same (channel_id, normalized_title, duration) key — ambiguous."""
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 271),
+        "vid_yt1": CanonicalMetadata("vid_yt1", "Song Title", "UCabc", 271),
+        "vid_yt2": CanonicalMetadata("vid_yt2", "Song Title", "UCabc", 271),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Title")]
+    yt = [
+        Stage4Candidate(0, 2, "vid_yt1", "Song Title"),
+        Stage4Candidate(1, 3, "vid_yt2", "Song Title"),
+    ]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert result.new_pairs == []
+
+
+def test_stage4_two_distinct_yt_durations_within_tolerance_window_does_not_promote():
+    """yt rows at 270 and 272 same channel/title; ytm at 271 — both within ±2s — ambiguous."""
+    meta = {
+        "vid_ytm": CanonicalMetadata("vid_ytm", "Song Title", "UCabc", 271),
+        "vid_yt1": CanonicalMetadata("vid_yt1", "Song Title", "UCabc", 270),
+        "vid_yt2": CanonicalMetadata("vid_yt2", "Song Title", "UCabc", 272),
+    }
+    ytm = [Stage4Candidate(0, 1, "vid_ytm", "Song Title")]
+    yt = [
+        Stage4Candidate(0, 2, "vid_yt1", "Song Title"),
+        Stage4Candidate(1, 3, "vid_yt2", "Song Title"),
+    ]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert result.new_pairs == []
+
+
+def test_stage4_two_ytm_rows_collide_first_consumes_yt_row():
+    """Two ytm rows both map to the same yt row; first promotes, second is excluded."""
+    meta = {
+        "vid_ytm1": CanonicalMetadata("vid_ytm1", "Song Title", "UCabc", 271),
+        "vid_ytm2": CanonicalMetadata("vid_ytm2", "Song Title", "UCabc", 271),
+        "vid_yt": CanonicalMetadata("vid_yt", "Song Title", "UCabc", 271),
+    }
+    ytm = [
+        Stage4Candidate(0, 1, "vid_ytm1", "Song Title"),
+        Stage4Candidate(1, 2, "vid_ytm2", "Song Title"),
+    ]
+    yt = [Stage4Candidate(0, 3, "vid_yt", "Song Title")]
+    result = stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=meta)
+    assert len(result.new_pairs) == 1
+    assert result.new_pairs[0].ytmusic_track_id == 1
+    assert result.consumed_original_ytm_indices == frozenset({0})
+    assert result.consumed_original_yt_indices == frozenset({0})
+
+
+def test_stage4_does_not_mutate_input_lists():
+    ytm = [Stage4Candidate(0, 1, "Gvey12GFPwU", "えがお、み〜っけた！ - I found a smile!")]
+    yt = [Stage4Candidate(0, 2, "32pGBZGk4kU", "えがお、み～っけた！")]
+    original_ytm = list(ytm)
+    original_yt = list(yt)
+    stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=_META_EGAO)
+    stage4_enrich_drift(ytm_candidates=ytm, yt_candidates=yt, metadata=_META_EGAO)
+    assert ytm == original_ytm
+    assert yt == original_yt
+
+
+# ---------------------------------------------------------------------------
+# apply_stage4_result tests
+# ---------------------------------------------------------------------------
+
+
+def _make_stage4_match(
+    ytm_vid: str = "Gvey12GFPwU",
+    yt_vid: str = "32pGBZGk4kU",
+    ytm_track: int = 1,
+    yt_track: int = 2,
+    ytm_title: str = "YTM Title",
+    yt_title: str = "YT Title",
+    original_ytm_index: int = 0,
+    original_yt_index: int = 0,
+) -> Stage4Match:
+    ev = Stage4Evidence(channel_id="UCxxx", duration_seconds=271, normalized_title="title")
+    return Stage4Match(
+        ytmusic_track_id=ytm_track,
+        youtube_track_id=yt_track,
+        ytmusic_video_id=ytm_vid,
+        youtube_video_id=yt_vid,
+        ytmusic_title=ytm_title,
+        youtube_title=yt_title,
+        evidence=ev,
+        original_ytm_index=original_ytm_index,
+        original_yt_index=original_yt_index,
+    )
+
+
+def _empty_compare_result() -> CompareResult:
+    return CompareResult(ytmusic_count=0, youtube_total_count=0, youtube_music_count=0)
+
+
+def test_apply_stage4_result_returns_fresh_compare_result():
+    pair = _make_stage4_match()
+    s4 = Stage4Result(
+        new_pairs=[pair],
+        consumed_original_ytm_indices=frozenset({0}),
+        consumed_original_yt_indices=frozenset({0}),
+    )
+    cr = _empty_compare_result()
+    out = apply_stage4_result(cr, s4)
+    # Input unchanged.
+    assert cr.matched == []
+    assert cr.pointer_drift_candidates == []
+    # Output is a new object.
+    assert out is not cr
+    assert isinstance(out, CompareResult)
+
+
+def test_apply_stage4_result_constructs_match_from_stage4_match():
+    pair = _make_stage4_match(ytm_track=10, yt_track=20, ytm_title="YTM", yt_title="YT")
+    s4 = Stage4Result(
+        new_pairs=[pair],
+        consumed_original_ytm_indices=frozenset({0}),
+        consumed_original_yt_indices=frozenset({0}),
+    )
+    out = apply_stage4_result(_empty_compare_result(), s4)
+
+    assert len(out.matched) == 1
+    assert len(out.pointer_drift_candidates) == 1
+    m = out.matched[0]
+    assert m.kind is MatchKind.STAGE4_ENRICHMENT
+    assert m.confidence == 0.95
+    assert m.ytmusic_track_id == 10
+    assert m.youtube_track_id == 20
+    assert m.ytmusic_title == "YTM"
+    assert m.youtube_title == "YT"
+    assert m.evidence is not None
+    assert m.evidence.channel_id == "UCxxx"
+    # Same object in both lists.
+    assert out.matched[0] is out.pointer_drift_candidates[0]
+
+
+def test_apply_stage4_result_removes_consumed_video_ids_from_unmatched_buckets():
+    pair = _make_stage4_match(ytm_vid="vid_ytm", yt_vid="vid_yt")
+    s4 = Stage4Result(
+        new_pairs=[pair],
+        consumed_original_ytm_indices=frozenset({0}),
+        consumed_original_yt_indices=frozenset({0}),
+    )
+    unmatched_ytm_consumed = UnmatchedItem(1, "vid_ytm", "T", [], "k")
+    unmatched_ytm_other = UnmatchedItem(2, "other_vid", "T2", [], "k2")
+    unmatched_yt_consumed = UnmatchedItem(3, "vid_yt", "T3", [], "k3")
+    unmatched_yt_other = UnmatchedItem(4, "another_vid", "T4", [], "k4")
+
+    cr = CompareResult(
+        ytmusic_count=2,
+        youtube_total_count=2,
+        youtube_music_count=2,
+        ytmusic_only_likes=[unmatched_ytm_consumed, unmatched_ytm_other],
+        possibly_missing_from_ytmusic=[unmatched_yt_consumed, unmatched_yt_other],
+    )
+    out = apply_stage4_result(cr, s4)
+
+    # Consumed video_ids removed from each bucket.
+    assert len(out.ytmusic_only_likes) == 1
+    assert out.ytmusic_only_likes[0].video_id == "other_vid"
+    assert len(out.possibly_missing_from_ytmusic) == 1
+    assert out.possibly_missing_from_ytmusic[0].video_id == "another_vid"
+    # Original unchanged.
+    assert len(cr.ytmusic_only_likes) == 2
+    assert len(cr.possibly_missing_from_ytmusic) == 2

@@ -482,16 +482,17 @@ class _PipelineResult:
     raw_youtube_music_count: int
 
 
-def _compare_and_persist(session: Session) -> _PipelineResult:
+def _compare_and_persist(session: Session, cfg: Config | None = None) -> _PipelineResult:
     """Run the full 0.3 compare-likes pipeline against the current session
     and return the persisted Diagnosis id plus the finding counts the CLI
     summary needs.
 
     Pipeline:
       1. Cross-source matcher (existing 0.2 buckets) → CompareResult.
-      2. Persist a Diagnosis with the existing buckets via `create_diagnosis`.
-      3. Append ghost findings (latest YouTube snapshot's is_available=False rows).
-      4. Append drift findings per source (latest, prev) via `detect_drift`.
+      2. Stage 4 enrichment via YouTube canonical metadata (skipped when cfg is None).
+      3. Persist a Diagnosis with the existing buckets via `create_diagnosis`.
+      4. Append ghost findings (latest YouTube snapshot's is_available=False rows).
+      5. Append drift findings per source (latest, prev) via `detect_drift`.
       All findings live on a single Diagnosis row.
     """
     from .diagnosis import (
@@ -537,6 +538,109 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
     # Stage A — existing cross-source matcher (over canonicalized items).
     cmp_result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
 
+    # === Stage 4: drift detection via YouTube enrichment ===
+    from .compare import (
+        CanonicalMetadata,
+        Stage4Candidate,
+        apply_stage4_result,
+        stage4_enrich_drift,
+    )
+    from .youtube_client import AuthorizationRequiredError, ClientSecretsMissingError, YouTubeClient
+
+    # Build matched track_id exclusion sets.
+    matched_ytm_track_ids = {m.ytmusic_track_id for m in cmp_result.matched}
+    matched_yt_track_ids = {m.youtube_track_id for m in cmp_result.matched}
+
+    # Build ytm_candidates: unmatched ytm rows with a video_id.
+    ytm_candidates: list[Stage4Candidate] = []
+    for i, item in enumerate(ytm_items):
+        if not item.video_id:
+            continue
+        if item.track_id in matched_ytm_track_ids:
+            continue
+        ytm_candidates.append(
+            Stage4Candidate(
+                original_index=i,
+                track_id=item.track_id,
+                video_id=item.video_id,
+                title=item.title,
+            )
+        )
+
+    # Build yt_candidates: deduped union of (possibly_missing) ∪ (ghost) MINUS already-matched.
+    pm_yt_video_ids = {u.video_id for u in cmp_result.possibly_missing_from_ytmusic}
+    yt_unique_by_index: dict[int, Stage4Candidate] = {}
+    for i, item in enumerate(yt_items):
+        if not item.video_id:
+            continue
+        if item.track_id in matched_yt_track_ids:
+            continue
+        is_ghost = item.is_available is False
+        is_in_pm_bucket = item.video_id in pm_yt_video_ids
+        if not (is_ghost or is_in_pm_bucket):
+            continue
+        yt_unique_by_index[i] = Stage4Candidate(
+            original_index=i,
+            track_id=item.track_id,
+            video_id=item.video_id,
+            title=item.title,
+        )
+    yt_candidates = sorted(yt_unique_by_index.values(), key=lambda c: c.original_index)
+
+    # Combined unique vids for batch lookup.
+    vids = sorted({c.video_id for c in ytm_candidates} | {c.video_id for c in yt_candidates})
+
+    # Construct YouTube client (only when cfg paths are available).
+    yt_client = (
+        YouTubeClient(
+            client_secrets_path=cfg.youtube_oauth_client_path,
+            token_path=cfg.youtube_token_path,
+        )
+        if cfg is not None
+        else None
+    )
+
+    metadata: dict[str, CanonicalMetadata] = {}
+    skip_reason: str | None = None
+    if vids and yt_client is None:
+        skip_reason = "no YouTube auth"
+    elif vids:
+        try:
+            metadata = yt_client.fetch_canonical_metadata(vids)  # type: ignore[union-attr]
+        except (AuthorizationRequiredError, ClientSecretsMissingError, FileNotFoundError):
+            skip_reason = "no YouTube auth"
+        except Exception as exc:  # noqa: BLE001 — boundary catch
+            from googleapiclient.errors import HttpError
+
+            if isinstance(exc, HttpError):
+                skip_reason = f"YouTube API error: {exc}"
+            else:
+                skip_reason = f"unexpected: {exc.__class__.__name__}"
+
+    # Status print — three distinct cases.
+    if not vids:
+        console.print("Stage 4 enrichment: no unmatched candidates to enrich")
+    elif skip_reason is not None:
+        console.print(f"Stage 4 enrichment skipped ({skip_reason})")
+    elif not metadata:
+        console.print(
+            f"Stage 4 enrichment: fetched 0 of {len(vids)} candidate(s) "
+            "(rows dropped — missing channel or duration)"
+        )
+    else:
+        console.print(
+            f"Stage 4 enrichment: fetched {len(metadata)} of {len(vids)} canonical record(s)"
+        )
+
+    # Run Stage 4 + apply.
+    stage4 = stage4_enrich_drift(
+        ytm_candidates=ytm_candidates,
+        yt_candidates=yt_candidates,
+        metadata=metadata,
+    )
+    cmp_result = apply_stage4_result(cmp_result, stage4)
+    console.print(f"Stage 4 promoted {len(stage4.new_pairs)} drift candidate(s)")
+
     # Stage B — persist Diagnosis + the existing 0.2 finding buckets.
     diagnosis = create_diagnosis(
         session,
@@ -559,7 +663,9 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
     duplicate_total = len(dup_items_yt) + len(dup_items_ytm)
 
     # Stage C — append ghost findings.
-    ghost_items = build_unavailable_video_items(diagnosis.id, yt_items)
+    ghost_items = build_unavailable_video_items(
+        diagnosis.id, yt_items, exclude_yt_indices=stage4.consumed_original_yt_indices
+    )
     for it in ghost_items:
         session.add(it)
 
@@ -597,9 +703,9 @@ def _compare_and_persist(session: Session) -> _PipelineResult:
 @app.command("compare-likes")
 def compare_likes_cmd() -> None:
     """Compare latest YouTube Music vs. YouTube liked-videos snapshots."""
-    _, factory = _bootstrap()
+    cfg, factory = _bootstrap()
     with session_scope(factory) as session:
-        outcome = _compare_and_persist(session)
+        outcome = _compare_and_persist(session, cfg)
 
     result = outcome.compare_result
     console.print(f"[green]✓[/green] Diagnosis [bold]#{outcome.diagnosis_id}[/bold] saved.")

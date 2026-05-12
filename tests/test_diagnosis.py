@@ -13,6 +13,7 @@ from likesurgeon.compare import (
     CompareResult,
     Match,
     MatchKind,
+    Stage4Evidence,
     UnmatchedItem,
 )
 from likesurgeon.diagnosis import (
@@ -21,6 +22,7 @@ from likesurgeon.diagnosis import (
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
     ISSUE_YTMUSIC_ONLY,
     DiagnosisInput,
+    _match_reason,
     build_duplicate_in_source_items,
     create_diagnosis,
     diagnosis_items,
@@ -268,3 +270,50 @@ def test_latest_diagnosis_orders_by_recency(session: Session):
     session.commit()
     assert latest_diagnosis(session).id == second.id
     assert second.id != first.id
+
+
+def _stage4_match(evidence: Stage4Evidence | None) -> Match:
+    """Minimal Match for STAGE4_ENRICHMENT reason-builder tests (no DB needed)."""
+    return Match(
+        ytmusic_track_id=1,
+        youtube_track_id=2,
+        kind=MatchKind.STAGE4_ENRICHMENT,
+        confidence=1.0,
+        ytmusic_title="えがお、み~っけた！",
+        youtube_title="えがお、み~っけた！ (Official MV)",
+        evidence=evidence,
+    )
+
+
+def test_diagnosis_reason_for_stage4_drift_describes_evidence():
+    ev = Stage4Evidence(
+        channel_id="UCabcdefghij1234",
+        duration_seconds=271,
+        normalized_title="えがお、み~っけた！",
+    )
+    reason = _match_reason(_stage4_match(ev))
+
+    assert "UCabcdef" in reason
+    assert "271s" in reason
+    assert "normalized title match" in reason
+    assert "fuzzy" not in reason
+
+
+def test_diagnosis_reason_for_stage_2_3_fuzzy_drift_unchanged():
+    match = Match(
+        ytmusic_track_id=1,
+        youtube_track_id=2,
+        kind=MatchKind.FUZZY,
+        confidence=0.92,
+        ytmusic_title="Imagine",
+        youtube_title="Imagine - John Lennon (Official MV)",
+    )
+    reason = _match_reason(match)
+
+    assert reason.startswith("fuzzy match (score ")
+
+
+def test_diagnosis_reason_for_stage4_without_evidence_falls_back():
+    reason = _match_reason(_stage4_match(evidence=None))
+
+    assert reason == "enriched drift match"
