@@ -45,6 +45,11 @@ class _Itemish(Protocol):
     artists: Any
     canonical_key: str
     is_music_candidate: bool | None
+    # ``is_available`` is only populated for ``youtube_liked_videos`` items
+    # (via stage-1 ``videos.list`` ghost detection). ``True`` = playable,
+    # ``False`` = ghost (deleted/private/region-blocked), ``None`` = unknown
+    # (e.g. unchecked, or ytmusic items where availability isn't tracked).
+    is_available: bool | None
 
 
 class _VideoIdPositioned(Protocol):
@@ -330,8 +335,17 @@ def compare_likes(inp: CompareInput) -> CompareResult:
             _record_match(yt_idx, ytm_idx, MatchKind.FUZZY, score / 100.0)
 
     # Build unmatched lists at row level — surplus rows survive intact.
+    # Exclude YouTube ghosts (``is_available is False``) from possibly_missing:
+    # those are dead videos the user wants gone (unavailable_video finding),
+    # not "missing from ytmusic" candidates. Surfacing them here triggered a
+    # destructive conflict in 0.4-0.6 sync — ``yt_unlike`` would unlike the
+    # ghost, then ``ytm_like`` on the same vid would cross-propagate the
+    # like back to YouTube via ytmusic, reverting the unlike. See
+    # ``docs/ARCHITECTURE.md`` (0.6.1 fix).
     possibly_missing = [
-        _to_unmatched(yt) for yt_idx, yt in youtube_music if yt_idx not in used_yt_idx
+        _to_unmatched(yt)
+        for yt_idx, yt in youtube_music
+        if yt_idx not in used_yt_idx and getattr(yt, "is_available", None) is not False
     ]
     ytmusic_only = [
         _to_unmatched(ytm) for ytm_idx, ytm in enumerate(inp.ytmusic) if ytm_idx not in used_ytm_idx
