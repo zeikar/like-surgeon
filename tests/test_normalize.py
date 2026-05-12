@@ -1,4 +1,9 @@
-from likesurgeon.normalize import canonical_key, normalize_artists, normalize_title
+from likesurgeon.normalize import (
+    canonical_key,
+    normalize_artists,
+    normalize_for_match,
+    normalize_title,
+)
 
 
 def test_normalize_title_strips_official_music_video():
@@ -49,3 +54,29 @@ def test_canonical_key_distinguishes_different_songs():
     a = canonical_key("Song A", ["Artist"])
     b = canonical_key("Song B", ["Artist"])
     assert a != b
+
+
+def test_normalize_for_match_unifies_tilde_variants():
+    result_wave = normalize_for_match("えがお、み〜っけた！")  # U+301C wave dash
+    result_full = normalize_for_match("えがお、み～っけた！")  # U+FF5E fullwidth tilde
+    result_ascii = normalize_for_match("えがお、み~っけた！")  # ASCII tilde
+    assert result_wave == result_full == result_ascii
+    assert "~" in result_wave
+    assert "〜" not in result_wave
+    assert "～" not in result_wave
+
+
+def test_normalize_for_match_nfkc_fullwidth_alpha():
+    assert normalize_for_match("ＡＢＣ") == "abc"
+
+
+def test_normalize_for_match_strip_and_casefold():
+    assert normalize_for_match("  Hello  ") == "hello"
+
+
+def test_normalize_for_match_preserves_kana():
+    assert normalize_for_match("カタカナ") == "カタカナ"
+
+
+def test_normalize_for_match_empty_string():
+    assert normalize_for_match("") == ""

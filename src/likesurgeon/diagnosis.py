@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .compare import CompareResult, Match, UnmatchedItem
+from .compare import CompareResult, Match, MatchKind, UnmatchedItem
 from .drift import DriftFinding
 from .models import Diagnosis, DiagnosisItem, SnapshotItem
 
@@ -85,6 +85,21 @@ def _unmatched_item(
     )
 
 
+def _match_reason(match: Match) -> str:
+    if match.kind is MatchKind.STAGE4_ENRICHMENT:
+        ev = match.evidence
+        if ev is None:
+            return "enriched drift match"
+        return (
+            f"enriched: channel={ev.channel_id[:8]}… + duration={ev.duration_seconds}s"
+            f" + normalized title match"
+        )
+    return (
+        f"fuzzy match (score {match.confidence * 100:.0f}/100): "
+        f"YT '{match.youtube_title}' ↔ YT Music '{match.ytmusic_title}'"
+    )
+
+
 def _match_item(
     diagnosis_id: int,
     match: Match,
@@ -94,10 +109,7 @@ def _match_item(
         diagnosis_id=diagnosis_id,
         issue_type=issue_type,
         confidence=match.confidence,
-        reason=(
-            f"fuzzy match (score {match.confidence * 100:.0f}/100): "
-            f"YT '{match.youtube_title}' ↔ YT Music '{match.ytmusic_title}'"
-        ),
+        reason=_match_reason(match),
         source_track_id=match.youtube_track_id,
         related_track_id=match.ytmusic_track_id,
         status="open",
@@ -110,16 +122,26 @@ def _unmatched_reason(item: UnmatchedItem) -> str:
 
 
 def build_unavailable_video_items(
-    diagnosis_id: int, snapshot_items: list[SnapshotItem]
+    diagnosis_id: int,
+    snapshot_items: list[SnapshotItem],
+    *,
+    exclude_yt_indices: frozenset[int] | None = None,
 ) -> list[DiagnosisItem]:
     """Build DiagnosisItem rows for SnapshotItems with is_available=False.
 
     ``confidence=1.0`` because availability is a fact, not a probability —
     using a lower confidence would let ``--min-confidence`` filters hide
     real ghosts.
+
+    ``exclude_yt_indices`` skips the items at the given positions in
+    ``snapshot_items`` (by enumerate index). Stage 4 passes its
+    ``consumed_original_yt_indices`` here so promoted drift rows don't
+    also surface as ghost findings.
     """
     out: list[DiagnosisItem] = []
-    for item in snapshot_items:
+    for i, item in enumerate(snapshot_items):
+        if exclude_yt_indices is not None and i in exclude_yt_indices:
+            continue
         if item.is_available is not False:
             continue
         out.append(

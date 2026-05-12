@@ -17,6 +17,7 @@ silently refresh that token.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,24 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from .compare import CanonicalMetadata
+
 LIKED_VIDEOS_FALLBACK_PLAYLIST_ID = "LL"
+
+_DURATION_RE = re.compile(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
+
+
+def _iso8601_duration_to_seconds(s: str) -> int | None:
+    m = _DURATION_RE.fullmatch(s)
+    if m is None:
+        return None
+    h, mn, sec = m.groups()
+    if h is None and mn is None and sec is None:
+        # bare "PT" — no captured components, treat as invalid
+        return None
+    return (int(h or 0) * 3600) + (int(mn or 0) * 60) + int(sec or 0)
+
+
 WRITE_SCOPE = "https://www.googleapis.com/auth/youtube"
 SCOPES = [WRITE_SCOPE]
 
@@ -464,6 +482,36 @@ class YouTubeClient:
         # error (e.g. 401 auth, 400 bad request). 404 is handled in-loop
         # with an immediate `return "404"`, so it never reaches this point.
         return "failed"
+
+    def _canonical_metadata_videos_list(self, *, ids: list[str]) -> dict[str, Any]:
+        service = self._service()
+        return service.videos().list(part="snippet,contentDetails", id=",".join(ids)).execute()
+
+    def fetch_canonical_metadata(self, video_ids: list[str]) -> dict[str, CanonicalMetadata]:
+        if not video_ids:
+            return {}
+        result: dict[str, CanonicalMetadata] = {}
+        for i in range(0, len(video_ids), self._STATUS_BATCH_SIZE):
+            chunk = video_ids[i : i + self._STATUS_BATCH_SIZE]
+            response = self._canonical_metadata_videos_list(ids=chunk)
+            for item in response.get("items", []):
+                snippet = item.get("snippet", {})
+                channel_id = snippet.get("channelId", "")
+                if not channel_id:
+                    continue
+                title = snippet.get("title", "")
+                duration_iso = item.get("contentDetails", {}).get("duration", "")
+                duration = _iso8601_duration_to_seconds(duration_iso)
+                if duration is None:
+                    continue
+                video_id = item["id"]
+                result[video_id] = CanonicalMetadata(
+                    video_id=video_id,
+                    title=title,
+                    channel_id=channel_id,
+                    duration_seconds=duration,
+                )
+        return result
 
     def fetch_video_statuses(
         self, video_ids: list[str], *, user_region: str | None = None

@@ -23,6 +23,7 @@ to expose row-level ids on their items.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ from enum import StrEnum
 from typing import Any, Protocol, TypeVar
 
 from rapidfuzz import fuzz
+
+from .normalize import normalize_for_match
 
 
 class _Itemish(Protocol):
@@ -105,6 +108,53 @@ class MatchKind(StrEnum):
     VIDEO_ID = "video_id"
     CANONICAL_KEY = "canonical_key"
     FUZZY = "fuzzy"
+    STAGE4_ENRICHMENT = "stage4_enrichment"
+
+
+@dataclass(frozen=True)
+class Stage4Evidence:
+    """Evidence captured by Stage 4 drift detection — used for diagnosis reason strings."""
+
+    channel_id: str  # videos.list snippet.channelId of the matched pair
+    duration_seconds: int  # ytmusic-side duration; yt-side is within ±2s of this
+    normalized_title: str  # normalize_for_match(canonical_title)
+
+
+@dataclass(frozen=True)
+class Stage4Candidate:
+    """Stage 4 input — primitive data carrier (no SnapshotItem dependency)."""
+
+    original_index: int  # index into the FULL ytm_items / yt_items list
+    track_id: int  # used to construct Match downstream
+    video_id: str  # used for metadata lookup + UnmatchedItem bucket filter
+    title: str  # used for Match construction (raw snapshot title)
+
+
+@dataclass(frozen=True)
+class Stage4Match:
+    """One promoted drift pair from Stage 4. Carries all fields needed to:
+    (a) construct a Match downstream, and
+    (b) filter UnmatchedItem buckets + ghost findings by video_id / original_index.
+    """
+
+    ytmusic_track_id: int
+    youtube_track_id: int
+    ytmusic_video_id: str
+    youtube_video_id: str
+    ytmusic_title: str
+    youtube_title: str
+    evidence: Stage4Evidence
+    original_ytm_index: int
+    original_yt_index: int
+
+
+@dataclass(frozen=True)
+class Stage4Result:
+    """Output of stage4_enrich_drift."""
+
+    new_pairs: list[Stage4Match]
+    consumed_original_ytm_indices: frozenset[int]
+    consumed_original_yt_indices: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -115,6 +165,7 @@ class Match:
     confidence: float  # 1.0 for exact stages; 0.0–1.0 for fuzzy
     ytmusic_title: str
     youtube_title: str
+    evidence: Stage4Evidence | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +202,26 @@ class CompareResult:
     ytmusic_only_likes: list[UnmatchedItem] = field(default_factory=list)
     # Subset of ``matched``: rows that matched only via fuzzy stage.
     pointer_drift_candidates: list[Match] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CanonicalMetadata:
+    """Authoritative metadata for a YouTube video, fetched via videos.list.
+
+    Distinct from playlistItems.list data — at the videos.list endpoint,
+    snippet.channelId IS the video uploader (there's no videoOwnerChannelId
+    field). The playlistItems-side equivalent is snippet.videoOwnerChannelId
+    (snippet.channelId there is the playlist owner, NOT the uploader).
+    """
+
+    video_id: str
+    title: str
+    channel_id: str
+    duration_seconds: int
+
+
+class MetadataLookup(Protocol):
+    def fetch_canonical_metadata(self, video_ids: list[str]) -> dict[str, CanonicalMetadata]: ...
 
 
 def _to_unmatched(item: _Itemish) -> UnmatchedItem:
@@ -275,4 +346,134 @@ def compare_likes(inp: CompareInput) -> CompareResult:
         possibly_missing_from_ytmusic=possibly_missing,
         ytmusic_only_likes=ytmusic_only,
         pointer_drift_candidates=pointer_drift,
+    )
+
+
+def stage4_enrich_drift(
+    *,
+    ytm_candidates: list[Stage4Candidate],
+    yt_candidates: list[Stage4Candidate],
+    metadata: dict[str, CanonicalMetadata],
+) -> Stage4Result:
+    """Pure post-process drift detection — see plan v2-r3 Locked decision 6."""
+    if not metadata or not ytm_candidates:
+        return Stage4Result(
+            new_pairs=[],
+            consumed_original_ytm_indices=frozenset(),
+            consumed_original_yt_indices=frozenset(),
+        )
+
+    # Build yt-side index: (channel_id, normalized_title) → list[(yt_candidate, duration_seconds)]
+    yt_index: dict[tuple[str, str], list[tuple[Stage4Candidate, int]]] = {}
+    for c in yt_candidates:
+        meta = metadata.get(c.video_id)
+        if meta is None or not meta.channel_id:
+            continue
+        norm_title = normalize_for_match(meta.title)
+        if not norm_title:  # safety: skip if normalization produces empty
+            continue
+        key = (meta.channel_id, norm_title)
+        yt_index.setdefault(key, []).append((c, meta.duration_seconds))
+
+    new_pairs: list[Stage4Match] = []
+    consumed_ytm: set[int] = set()
+    consumed_yt: set[int] = set()
+
+    for ytm_cand in ytm_candidates:
+        meta = metadata.get(ytm_cand.video_id)
+        if meta is None or not meta.channel_id:
+            continue
+        norm_title = normalize_for_match(meta.title)
+        if not norm_title:
+            continue
+        key = (meta.channel_id, norm_title)
+        yt_entries = yt_index.get(key, [])
+
+        # Filter to ±2s tolerance, dedupe by original_index, exclude already-consumed.
+        in_tolerance: dict[int, tuple[Stage4Candidate, int]] = {}
+        for yt_cand, yt_dur in yt_entries:
+            if yt_cand.original_index in consumed_yt:
+                continue
+            if abs(yt_dur - meta.duration_seconds) > 2:
+                continue
+            in_tolerance[yt_cand.original_index] = (yt_cand, yt_dur)
+
+        if len(in_tolerance) != 1:
+            continue  # 0 candidates or ambiguous (2+)
+
+        yt_cand, yt_dur = next(iter(in_tolerance.values()))
+        evidence = Stage4Evidence(
+            channel_id=meta.channel_id,
+            duration_seconds=meta.duration_seconds,
+            normalized_title=norm_title,
+        )
+        new_pairs.append(
+            Stage4Match(
+                ytmusic_track_id=ytm_cand.track_id,
+                youtube_track_id=yt_cand.track_id,
+                ytmusic_video_id=ytm_cand.video_id,
+                youtube_video_id=yt_cand.video_id,
+                ytmusic_title=ytm_cand.title,
+                youtube_title=yt_cand.title,
+                evidence=evidence,
+                original_ytm_index=ytm_cand.original_index,
+                original_yt_index=yt_cand.original_index,
+            )
+        )
+        consumed_ytm.add(ytm_cand.original_index)
+        consumed_yt.add(yt_cand.original_index)
+
+    return Stage4Result(
+        new_pairs=new_pairs,
+        consumed_original_ytm_indices=frozenset(consumed_ytm),
+        consumed_original_yt_indices=frozenset(consumed_yt),
+    )
+
+
+def apply_stage4_result(
+    compare_result: CompareResult,
+    stage4: Stage4Result,
+) -> CompareResult:
+    """Apply Stage 4 promotions to a CompareResult, returning a fresh instance.
+
+    No SnapshotItem dependency — all fields needed come from Stage4Match.
+    """
+    if not stage4.new_pairs:
+        return compare_result
+
+    # Build Match objects from Stage4Match.
+    new_matches: list[Match] = []
+    for pair in stage4.new_pairs:
+        new_matches.append(
+            Match(
+                ytmusic_track_id=pair.ytmusic_track_id,
+                youtube_track_id=pair.youtube_track_id,
+                kind=MatchKind.STAGE4_ENRICHMENT,
+                confidence=0.95,
+                ytmusic_title=pair.ytmusic_title,
+                youtube_title=pair.youtube_title,
+                evidence=pair.evidence,
+            )
+        )
+
+    # Pre-compute consumed video_id sets for UnmatchedItem filtering.
+    consumed_ytm_vids = {p.ytmusic_video_id for p in stage4.new_pairs}
+    consumed_yt_vids = {p.youtube_video_id for p in stage4.new_pairs}
+
+    # Filter UnmatchedItem buckets.
+    filtered_possibly_missing = [
+        u
+        for u in compare_result.possibly_missing_from_ytmusic
+        if u.video_id not in consumed_yt_vids
+    ]
+    filtered_ytmusic_only = [
+        u for u in compare_result.ytmusic_only_likes if u.video_id not in consumed_ytm_vids
+    ]
+
+    return dataclasses.replace(
+        compare_result,
+        matched=list(compare_result.matched) + new_matches,
+        pointer_drift_candidates=list(compare_result.pointer_drift_candidates) + new_matches,
+        possibly_missing_from_ytmusic=filtered_possibly_missing,
+        ytmusic_only_likes=filtered_ytmusic_only,
     )
