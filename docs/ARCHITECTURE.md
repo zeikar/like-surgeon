@@ -104,4 +104,5 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 - **0.3.1**: region-aware ghost detection (`regionRestriction` + `config.json`)
 - **0.4**: write actions for cross-source like sync (source-of-truth = YouTube)
 - **0.5**: `sync` learns `duplicate_in_source` (ytmusic source, N=2) — one `rate_song("INDIFFERENT")` per finding, terminal after attempt
+- **0.6**: `compare-likes` Stage 4 — `videos.list` enrichment of unmatched candidates on both sides + triple-match `(channel_id, duration_seconds ±2s, normalize_for_match(title))` promotes `pointer_drift_candidates`. Catches label re-upload drift that stages 1-3 miss. Snapshots stay frozen.
 - **1.0**: local web UI / Electron app

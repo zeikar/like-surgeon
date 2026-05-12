@@ -2,7 +2,7 @@
 
 > Sync, backup, and repair your YouTube Music liked songs.
 
-**Status:** MVP 0.5 — adds ytmusic in-source dedupe to `sync` (N=2) on top of 0.4's cross-source write-back. Local-first, no server.
+**Status:** MVP 0.6 — adds Stage 4 drift detection via YouTube enrichment on top of 0.5's dedupe + 0.4's cross-source write-back. Local-first, no server.
 
 ## What it does today
 
@@ -29,6 +29,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | **0.3.1**   | Region-aware ghost detection: `videos.list?part=status,contentDetails` checks `regionRestriction` against the user's configured ISO 3166-1 alpha-2 region (`config.json` or `--region` flag). Region-blocked videos surface as `unavailable_video` findings with `unavailable_reason="region_blocked"`. No new commands, quota cost unchanged. |
 | **0.4**     | `sync` command: applies the latest diagnosis's actionable findings to YouTube (`videos.rate`) and YT Music (`rate_song`). New `SyncAttempt` audit table records every HTTP call without overwriting the diagnosis-time `reason`. OAuth scope upgraded to `youtube` (write); `authorize()` re-prompts consent when a cached token only has `youtube.readonly`. |
 | **0.5**     | `sync` learns `duplicate_in_source` (ytmusic source, count=2): one `rate_song("INDIFFERENT")` per finding, terminal after attempt. Routing via regex-validated reason parsing — YouTube-source and N≥3 dups produce `SkipRecord`. Carve-out from "applied = full success" invariant because `INDIFFERENT` is non-idempotent; auto-retry would risk over-removal. |
+| **0.6**     | `compare-likes` learns Stage 4: when YouTube auth is configured, fetches `videos.list snippet,contentDetails` (~5 quota units) for unmatched candidates on both sides and promotes pairs matching `(channel_id, duration_seconds ±2s, normalize_for_match(title))` into `pointer_drift_candidates`. Catches the dominant label re-upload drift pattern (same Topic channel, slightly different title — wave-dash vs fullwidth-tilde, EN subtitle, etc.) that stages 1-3 miss. Snapshots stay frozen; no schema change; consumed yt indices filter ghost finding generation so the same row doesn't surface as both drift and unavailable. |
 | 1.0         | Local web UI / Electron app                                           |
 
 ## Install
