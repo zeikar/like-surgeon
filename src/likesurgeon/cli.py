@@ -908,8 +908,10 @@ def sync(
 
         # Always construct (cheap); only the write-scope check and write method calls are
         # gated on needs_youtube.
-        # ytm_dedupe is ytmusic-only; not in needs_youtube
-        needs_youtube = any(a.kind in {"yt_unlike", "yt_relike"} for a in actions)
+        # ytm_dedupe is ytmusic-only; not in needs_youtube.
+        # ytm_like uses YouTube rate_video (unlike+relike) to cross-prop into LM,
+        # so it needs YouTube write scope too.
+        needs_youtube = any(a.kind in {"yt_unlike", "yt_relike", "ytm_like"} for a in actions)
         from .youtube_client import YouTubeClient
 
         yt = YouTubeClient(

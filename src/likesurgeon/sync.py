@@ -23,6 +23,7 @@ Invariants:
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -40,9 +41,17 @@ from .diagnosis import (
 from .models import DiagnosisItem, SyncAttempt, Track
 from .snapshot import YTMUSIC_LIKED_SONGS
 from .youtube_client import YouTubeClient, YouTubeWriteError
-from .ytmusic_client import YTMusicClient, YTMusicWriteError
+from .ytmusic_client import (
+    AuthFileMissingError,
+    UnexpectedResponseError,
+    YTMusicClient,
+    YTMusicWriteError,
+)
 
 ActionKind = Literal["yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe"]
+_DispatchOutcome = Literal["applied", "skipped", "failed"]
+
+_YTM_LIKE_VERIFY_WAIT_SECONDS = 5
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -319,7 +328,8 @@ _PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe")
 # Drift's worst case = 100 (like 50 + unlike 50 if the like succeeds).
 _QUOTA_COST: dict[ActionKind, int] = {
     "yt_unlike": 50,
-    "ytm_like": 0,
+    # rate-none + rate-like (verify reads are free; client retries are transparent)
+    "ytm_like": 100,
     "yt_relike": 100,
     "ytm_dedupe": 0,
 }
@@ -398,9 +408,13 @@ def execute(
         if item is None:
             continue
 
-        ok = _dispatch(action, ytm=ytm, yt=yt, session=session)
-        if ok:
+        outcome = _dispatch(action, ytm=ytm, yt=yt, session=session)
+        if outcome == "applied":
             applied += 1
+            item.status = "applied"
+        elif outcome == "skipped":
+            skipped += 1
+            item.status = "skipped"
         else:
             failed += 1
         # ytm_dedupe is non-idempotent — terminal-on-attempt regardless of success.
@@ -408,7 +422,7 @@ def execute(
         # from "server didn't process", so auto-retry would risk over-removal.
         # Genuine failures self-correct via the next compare-likes (lingering dup
         # → new finding → new attempt).
-        if ok or action.kind == "ytm_dedupe":
+        if outcome == "failed" and action.kind == "ytm_dedupe":
             item.status = "applied"
         session.commit()
 
@@ -421,18 +435,21 @@ def _dispatch(
     ytm: YTMusicClient,
     yt: YouTubeClient,
     session: Session,
-) -> bool:
-    """Run ``action``'s HTTP call(s), record SyncAttempt rows, return success.
+) -> _DispatchOutcome:
+    """Run ``action``'s HTTP call(s), record SyncAttempt rows, return outcome.
 
-    ``True`` iff every call for the action succeeded — i.e. the dispatcher
-    is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
+    ``"applied"`` iff every call for the action succeeded — i.e. the
+    dispatcher is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
+    ``"skipped"`` is a terminal non-failure outcome (currently only
+    ``ytm_like`` post-verify when cross-prop didn't observe the song);
+    ``"failed"`` is anything else.
 
-    Note: for ``ytm_dedupe``, the bool return is used only for
-    ``ExecResult`` counting. Terminality (``status='applied'`` regardless
-    of success) is handled by ``execute()``, not here.
+    Note: for ``ytm_dedupe``, the outcome is used only for ``ExecResult``
+    counting. Terminality (``status='applied'`` regardless of success) is
+    handled by ``execute()``, not here.
     """
     if action.kind == "yt_unlike":
-        return _try_yt_rate(
+        ok = _try_yt_rate(
             session,
             action.item_id,
             kind="yt_unlike",
@@ -440,12 +457,14 @@ def _dispatch(
             video_id=action.primary_video_id,
             rating="none",
         )
+        return "applied" if ok else "failed"
 
     if action.kind == "ytm_like":
         return _try_ytm_like(
             session,
             action.item_id,
             ytm=ytm,
+            yt=yt,
             video_id=action.primary_video_id,
         )
 
@@ -462,12 +481,12 @@ def _dispatch(
             rating="like",
         )
         if not like_ok:
-            return False
+            return "failed"
         # Defensive — planner always provides secondary for yt_relike,
         # but the type signature permits None.
         if action.secondary_video_id is None:
-            return True
-        return _try_yt_rate(
+            return "applied"
+        ok = _try_yt_rate(
             session,
             action.item_id,
             kind="yt_relike_unlike",
@@ -475,18 +494,20 @@ def _dispatch(
             video_id=action.secondary_video_id,
             rating="none",
         )
+        return "applied" if ok else "failed"
 
     if action.kind == "ytm_dedupe":
-        return _try_ytm_unlike(
+        ok = _try_ytm_unlike(
             session,
             action.item_id,
             ytm=ytm,
             video_id=action.primary_video_id,
         )
+        return "applied" if ok else "failed"
 
     # Unreachable for the closed ActionKind set, but keeps the function
     # total for static analyzers.
-    return False
+    return "failed"
 
 
 def _try_yt_rate(
@@ -526,29 +547,107 @@ def _try_ytm_like(
     item_id: int,
     *,
     ytm: YTMusicClient,
+    yt: YouTubeClient,
     video_id: str,
-) -> bool:
+) -> _DispatchOutcome:
+    """Cross-prop like: YouTube unlike → relike → wait → verify on YT Music.
+
+    YT Music has no first-class API to like a song from outside the
+    YouTube property. The reliable observed path is to toggle the YouTube
+    like off then back on, which YouTube propagates to the YT Music
+    "Liked songs" playlist within a few seconds. We then re-fetch LM and
+    check for the ``video_id`` to confirm.
+
+    Outcomes (each step records a SyncAttempt row with a distinct kind):
+      * ``"applied"`` — both YouTube calls + verify all succeeded and
+        the song is now in LM.
+      * ``"skipped"`` — both YouTube calls succeeded but the song wasn't
+        observed in LM within the verify window. Cross-prop didn't fire
+        (e.g. song is YouTube-only). Terminal: retrying just repeats the
+        same outcome.
+      * ``"failed"`` — any HTTP/auth failure. ``DiagnosisItem.status``
+        stays ``"open"`` so the next run retries. Note: if the unlike
+        succeeded but the relike failed, the video is left unliked on
+        YouTube; manual relike may be needed (rare).
+    """
+    # Step 1: YouTube unlike
     try:
-        ytm.like_song(video_id)
-    except YTMusicWriteError as exc:
+        yt.rate_video(video_id, "none")
+    except YouTubeWriteError as exc:
         session.add(
             SyncAttempt(
                 diagnosis_item_id=item_id,
-                kind="ytm_like",
+                kind="ytm_like_yt_unlike",
                 status="failed",
                 reason=str(exc),
             )
         )
-        return False
+        return "failed"
     session.add(
         SyncAttempt(
             diagnosis_item_id=item_id,
-            kind="ytm_like",
+            kind="ytm_like_yt_unlike",
             status="applied",
-            reason="ok",
+            reason="rate(none) ok",
         )
     )
-    return True
+
+    # Step 2: YouTube relike
+    try:
+        yt.rate_video(video_id, "like")
+    except YouTubeWriteError as exc:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="ytm_like_yt_relike",
+                status="failed",
+                reason=str(exc),
+            )
+        )
+        # vid left unliked on YouTube; rare, manual relike if needed
+        return "failed"
+    session.add(
+        SyncAttempt(
+            diagnosis_item_id=item_id,
+            kind="ytm_like_yt_relike",
+            status="applied",
+            reason="rate(like) ok",
+        )
+    )
+
+    # Step 3: cross-prop wait + verify
+    time.sleep(_YTM_LIKE_VERIFY_WAIT_SECONDS)
+    try:
+        present = ytm.is_in_liked_songs(video_id)
+    except (UnexpectedResponseError, AuthFileMissingError) as exc:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="ytm_like_verify",
+                status="failed",
+                reason=str(exc),
+            )
+        )
+        return "failed"
+    if present:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="ytm_like_verify",
+                status="applied",
+                reason="present in ytmusic library",
+            )
+        )
+        return "applied"
+    session.add(
+        SyncAttempt(
+            diagnosis_item_id=item_id,
+            kind="ytm_like_verify",
+            status="skipped",
+            reason="not observed within first 10000 liked songs after +5s",
+        )
+    )
+    return "skipped"
 
 
 def _try_ytm_unlike(
