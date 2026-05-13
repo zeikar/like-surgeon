@@ -20,10 +20,12 @@ from likesurgeon.diagnosis import (
     ISSUE_DUPLICATE_IN_SOURCE,
     ISSUE_POINTER_DRIFT,
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
+    ISSUE_UNAVAILABLE_VIDEO,
     ISSUE_YTMUSIC_ONLY,
     DiagnosisInput,
     _match_reason,
     build_duplicate_in_source_items,
+    build_unavailable_video_items,
     create_diagnosis,
     diagnosis_items,
     latest_diagnosis,
@@ -317,3 +319,32 @@ def test_diagnosis_reason_for_stage4_without_evidence_falls_back():
     reason = _match_reason(_stage4_match(evidence=None))
 
     assert reason == "enriched drift match"
+
+
+class _FakeSnapshotItem:
+    """Duck-typed stand-in for SnapshotItem; only the fields read by
+    build_unavailable_video_items matter."""
+
+    def __init__(self, *, track_id: int, is_available: bool | None, unavailable_reason: str | None):
+        self.track_id = track_id
+        self.is_available = is_available
+        self.unavailable_reason = unavailable_reason
+
+
+def test_build_unavailable_video_items_skips_region_blocked():
+    """Region-blocked vids must NOT produce ghost findings — the video still
+    exists and may become available again when the restriction lifts."""
+    items = [
+        _FakeSnapshotItem(track_id=1, is_available=False, unavailable_reason="deleted"),
+        _FakeSnapshotItem(track_id=2, is_available=False, unavailable_reason="region_blocked"),
+        _FakeSnapshotItem(track_id=3, is_available=False, unavailable_reason="private"),
+        _FakeSnapshotItem(track_id=4, is_available=True, unavailable_reason=None),
+    ]
+
+    result = build_unavailable_video_items(diagnosis_id=1, snapshot_items=items)
+
+    assert [it.source_track_id for it in result] == [1, 3]
+    assert all(it.issue_type == ISSUE_UNAVAILABLE_VIDEO for it in result)
+    assert all(it.status == "open" for it in result)
+    assert "deleted" in result[0].reason
+    assert "private" in result[1].reason

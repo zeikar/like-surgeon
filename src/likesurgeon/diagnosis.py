@@ -137,12 +137,21 @@ def build_unavailable_video_items(
     ``snapshot_items`` (by enumerate index). Stage 4 passes its
     ``consumed_original_yt_indices`` here so promoted drift rows don't
     also surface as ghost findings.
+
+    ``region_blocked`` videos are skipped — the video still exists and may
+    become available again when the region restriction lifts (or the user
+    travels / VPNs). Unliking these would permanently lose the like if the
+    restriction is later removed. Only genuinely-unavailable reasons
+    (deleted, private, rejected, unavailable, missing_from_videos_list)
+    produce ghost findings.
     """
     out: list[DiagnosisItem] = []
     for i, item in enumerate(snapshot_items):
         if exclude_yt_indices is not None and i in exclude_yt_indices:
             continue
         if item.is_available is not False:
+            continue
+        if item.unavailable_reason == "region_blocked":
             continue
         out.append(
             DiagnosisItem(
