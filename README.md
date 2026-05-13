@@ -30,6 +30,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | **0.4**     | `sync` command: applies the latest diagnosis's actionable findings to YouTube (`videos.rate`) and YT Music (`rate_song`). New `SyncAttempt` audit table records every HTTP call without overwriting the diagnosis-time `reason`. OAuth scope upgraded to `youtube` (write); `authorize()` re-prompts consent when a cached token only has `youtube.readonly`. |
 | **0.5**     | `sync` learns `duplicate_in_source` (ytmusic source, count=2): one `rate_song("INDIFFERENT")` per finding, terminal after attempt. Routing via regex-validated reason parsing — YouTube-source and N≥3 dups produce `SkipRecord`. Carve-out from "applied = full success" invariant because `INDIFFERENT` is non-idempotent; auto-retry would risk over-removal. |
 | **0.6**     | `compare-likes` learns Stage 4: when YouTube auth is configured, fetches `videos.list snippet,contentDetails` (~5 quota units) for unmatched candidates on both sides and promotes pairs matching `(channel_id, duration_seconds ±2s, normalize_for_match(title))` into `pointer_drift_candidates`. Catches the dominant label re-upload drift pattern (same Topic channel, slightly different title — wave-dash vs fullwidth-tilde, EN subtitle, etc.) that stages 1-3 miss. Snapshots stay frozen; no schema change; consumed yt indices filter ghost finding generation so the same row doesn't surface as both drift and unavailable. |
+| **0.7**     | `possibly_missing_from_ytmusic` sync rewrite: replaces silent-no-op `rate_song("LIKE")` with `videos.rate("none") → videos.rate("like") → 5s wait → is_in_liked_songs verify`. 3-way outcome (`applied` / `skipped` / `failed`); terminal `skipped` on verify-miss prevents the 0.4-0.6 re-fire-on-every-sync noise. `YouTubeClient.rate_video` gains transparent retry (2× on 5xx/429, backoff 0.5s/1.0s). |
 | 1.0         | Local web UI / Electron app                                           |
 
 ## Install
@@ -158,7 +159,7 @@ uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence 
 | `issue_type` | Action | YouTube call | YT Music call | Auto-apply | Notes |
 |---|---|---|---|---|---|
 | `unavailable_video` | YouTube unlike | `videos.rate(rating="none")` | — | always | Removes ghosts (private / deleted / region-blocked) from your Liked videos. |
-| `possibly_missing_from_ytmusic` | YT Music like | — | `rate_song("LIKE")` | always | Adds a YouTube-only like into YT Music. Non-music videos may return 200 OK but won't appear in the YT Music library — they'll re-surface on the next `compare-likes` until manually deduped. |
+| `possibly_missing_from_ytmusic` | YouTube unlike → relike (cross-prop) → 5s wait → YT Music verify | `videos.rate("none")` then `videos.rate("like")` (transparent retry on 5xx/429) | `is_in_liked_songs` read (verify, free) | always | Triggers cross-propagation: unlike then re-like on YouTube, waits 5s, then verifies the video appears in YT Music. `applied` = verify found; `skipped` = verify-miss (terminal — prevents re-fire noise; flip `DiagnosisItem.status` to `'open'` via SQL to retry); `failed` = HTTP error (retried next sync). 100 quota units (rate × 2; verify reads are free). |
 | `possible_pointer_drift` | YouTube like → unlike | `videos.rate("like")` then `videos.rate("none")` | — | `confidence >= --drift-min-confidence` (default 0.95) | Re-points the YouTube like at the YT Music track's video_id. Like first, then unlike — a partial failure leaves a duplicate like (cleaned up on the next run) instead of losing the original. |
 | `ytmusic_only` | — | — | — | never | Informational only. Reverse-direction sync (YT Music → YouTube) is out of scope for 0.4. |
 | `metadata_drift` | — | — | — | never | Informational only. Title/artist drift is signal for the user, not a write target. |
@@ -175,7 +176,7 @@ uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence 
 
 #### Quota
 
-`videos.rate` is **50 units per call**. A drift fix is two calls (= 100 units). The default daily YouTube quota is 10,000 units. The plan summary prints the estimate before the prompt; if it exceeds your remaining quota, slice across days with `--limit`.
+`videos.rate` is **50 units per call**. A drift fix is two calls (= 100 units). A `ytm_like` cross-prop fix is also two `videos.rate` calls (= 100 units; the `is_in_liked_songs` verify read is free). The default daily YouTube quota is 10,000 units. The plan summary prints the estimate before the prompt; if it exceeds your remaining quota, slice across days with `--limit`.
 
 #### Safety
 
