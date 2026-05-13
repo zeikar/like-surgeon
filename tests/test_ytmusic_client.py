@@ -75,6 +75,42 @@ def test_fetch_liked_songs_raises_when_tracks_not_list():
         client.fetch_liked_songs()
 
 
+def test_is_in_liked_songs_present() -> None:
+    """Returns True when the video_id appears in any track dict."""
+    payload = {
+        "tracks": [
+            {"videoId": "other", "title": "X"},
+            {"videoId": "target", "title": "Y"},
+        ]
+    }
+    client = _FakeClient(payload)
+    assert client.is_in_liked_songs("target") is True
+
+
+def test_is_in_liked_songs_absent() -> None:
+    """Returns False when no track dict matches the video_id."""
+    payload = {"tracks": [{"videoId": "other", "title": "X"}]}
+    client = _FakeClient(payload)
+    assert client.is_in_liked_songs("target") is False
+
+
+def test_is_in_liked_songs_non_dict_elements() -> None:
+    """ytmusicapi has historically returned ``None`` / non-dict entries for
+    unavailable tracks. Those must be skipped, not raise ``AttributeError``,
+    so a present videoId is still detected alongside garbage entries."""
+    payload = {"tracks": [None, "oops", {"videoId": "song"}]}
+    client = _FakeClient(payload)
+    assert client.is_in_liked_songs("song") is True
+
+
+def test_is_in_liked_songs_propagates_unexpected_response() -> None:
+    """``UnexpectedResponseError`` from ``fetch_liked_songs`` must propagate —
+    callers need to distinguish "song not in LM" from "we couldn't check"."""
+    client = _FakeClient({})  # missing 'tracks' → UnexpectedResponseError
+    with pytest.raises(UnexpectedResponseError, match="missing 'tracks'"):
+        client.is_in_liked_songs("anything")
+
+
 class _RatingFakeYTMusic:
     """Records ``rate_song`` calls; optionally raises a chosen exception."""
 
@@ -95,27 +131,6 @@ class _RatingClient(YTMusicClient):
 
     def _build(self) -> Any:
         return self.fake
-
-
-def test_like_song_calls_rate_song_with_LIKE() -> None:
-    """``like_song`` is a thin wrapper that always passes ``"LIKE"`` — no
-    other rating values flow through this method."""
-    fake = _RatingFakeYTMusic()
-    client = _RatingClient(fake)
-    client.like_song("vid42")
-    assert fake.calls == [("vid42", "LIKE")]
-
-
-def test_like_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
-    """ytmusicapi can raise a wide range of exception types from rate_song
-    (network, parse, auth). Surface them all as ``YTMusicWriteError`` so the
-    dispatcher's failure path doesn't have to fingerprint each one."""
-    fake = _RatingFakeYTMusic(raise_with=RuntimeError("boom"))
-    client = _RatingClient(fake)
-    with pytest.raises(YTMusicWriteError) as exc_info:
-        client.like_song("vid99")
-    assert exc_info.value.video_id == "vid99"
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 def test_unlike_song_calls_rate_song_with_INDIFFERENT() -> None:

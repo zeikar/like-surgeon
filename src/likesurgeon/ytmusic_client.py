@@ -206,19 +206,6 @@ class YTMusicClient:
             "Run `likesurgeon auth ytmusic` and follow the printed instructions."
         )
 
-    def like_song(self, video_id: str) -> None:
-        """Like a song on YT Music via ``rate_song(video_id, "LIKE")``.
-
-        Wraps any error from ytmusicapi as ``YTMusicWriteError`` so the
-        dispatcher can attribute failures without leaking ytmusicapi
-        internals.
-        """
-        client = self._build()
-        try:
-            client.rate_song(video_id, "LIKE")
-        except Exception as exc:  # noqa: BLE001 — system-boundary catch
-            raise YTMusicWriteError(video_id, str(exc)) from exc
-
     def unlike_song(self, video_id: str) -> None:
         """Remove ONE LM-playlist entry for ``video_id`` via ``rate_song(..., "INDIFFERENT")``.
 
@@ -280,6 +267,22 @@ class YTMusicClient:
                 f"{type(tracks).__name__}, expected a list."
             )
         return list(tracks)
+
+    def is_in_liked_songs(self, video_id: str, *, limit: int = 10000) -> bool:
+        """Whether ``video_id`` appears in the user's current LM playlist.
+
+        Delegates to ``fetch_liked_songs`` so ``UnexpectedResponseError`` and
+        ``AuthFileMissingError`` propagate untouched — callers need to
+        distinguish "song not in LM" from "we couldn't check" to decide
+        whether retry / re-auth is appropriate.
+
+        Non-dict entries in the tracks list (defensive: ytmusicapi has
+        historically returned ``None`` for unavailable tracks) are skipped
+        rather than raising — a malformed entry shouldn't make a present
+        ``video_id`` look absent.
+        """
+        tracks = self.fetch_liked_songs(limit=limit)
+        return any(isinstance(t, dict) and t.get("videoId") == video_id for t in tracks)
 
 
 def write_browser_json_from_browser(browser: str, target: Path) -> None:
