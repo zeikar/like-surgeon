@@ -153,6 +153,141 @@ def test_youtube_translator_handles_missing_augmentation() -> None:
     assert rec["unavailable_reason"] is None
 
 
+def test_youtube_to_record_prefers_video_owner_channel_title() -> None:
+    """videoOwnerChannelTitle wins over empty channelTitle."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "channelTitle": "",
+            "videoOwnerChannelTitle": "Artist Name",
+            "resourceId": {"videoId": "v1"},
+        },
+        "contentDetails": {"videoId": "v1"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["Artist Name"]
+
+
+def test_youtube_to_record_strips_topic_suffix() -> None:
+    """' - Topic' suffix is stripped from artists but canonical_key uses the stripped form."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "channelTitle": "",
+            "videoOwnerChannelTitle": "Poppin'Party - Topic",
+            "resourceId": {"videoId": "v2"},
+        },
+        "contentDetails": {"videoId": "v2"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["Poppin'Party"]
+    assert rec["canonical_key"] == "poppin'party|song"
+
+
+def test_youtube_to_record_keeps_non_topic_channel() -> None:
+    """Non-Topic channel name is kept as-is in artists."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "videoOwnerChannelTitle": "irucaice / いるかアイス",
+            "resourceId": {"videoId": "v3"},
+        },
+        "contentDetails": {"videoId": "v3"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["irucaice / いるかアイス"]
+
+
+def test_youtube_to_record_falls_back_to_channel_title_when_owner_missing() -> None:
+    """Falls back to channelTitle when videoOwnerChannelTitle is absent."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "channelTitle": "ArtistVEVO",
+            "resourceId": {"videoId": "v4"},
+        },
+        "contentDetails": {"videoId": "v4"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["ArtistVEVO"]
+
+
+def test_youtube_to_record_falls_back_when_owner_is_whitespace_only() -> None:
+    """Whitespace-only videoOwnerChannelTitle is treated as absent; falls back to channelTitle."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "channelTitle": "FallbackChannel",
+            "videoOwnerChannelTitle": "   ",
+            "resourceId": {"videoId": "v5"},
+        },
+        "contentDetails": {"videoId": "v5"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["FallbackChannel"]
+
+
+def test_youtube_to_record_returns_empty_artists_when_both_missing() -> None:
+    """Neither field present → artists is empty list; canonical_key is title-only."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "resourceId": {"videoId": "v6"},
+        },
+        "contentDetails": {"videoId": "v6"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == []
+    assert rec["canonical_key"] == "|song"
+
+
+def test_youtube_to_record_strips_topic_after_trailing_whitespace() -> None:
+    """' - Topic' strip works even when trailing whitespace follows 'Topic'."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "videoOwnerChannelTitle": "Hello, happy world! - Topic   ",
+            "resourceId": {"videoId": "v7"},
+        },
+        "contentDetails": {"videoId": "v7"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["Hello, happy world!"]
+
+
+def test_youtube_to_record_topic_channel_still_classifies_as_music() -> None:
+    """A '- Topic' channel pushes a borderline title over the music threshold."""
+    from likesurgeon.snapshot import _youtube_to_record
+
+    raw = {
+        "snippet": {
+            "title": "Song",
+            "videoOwnerChannelTitle": "Poppin'Party - Topic",
+            "resourceId": {"videoId": "v8"},
+        },
+        "contentDetails": {"videoId": "v8"},
+    }
+    rec = _youtube_to_record(raw)
+    assert rec["artists"] == ["Poppin'Party"]
+    assert rec["is_music_candidate"] is True
+    assert rec["canonical_key"] == "poppin'party|song"
+    assert "topic" in rec["music_candidate_reason"].lower()
+
+
 def test_create_snapshot_persists_is_available_columns(session) -> None:
     """End-to-end: scan-shaped raw item with augmentation → SnapshotItem
     rows have is_available / unavailable_reason set, raw_json is clean."""
