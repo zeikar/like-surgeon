@@ -94,36 +94,63 @@ def _ytmusic_to_record(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strip_topic_suffix(name: str) -> str:
+    """Strip a trailing ' - Topic' suffix (case-sensitive) from a channel name.
+
+    Whitespace is trimmed from the right before checking. No-op if absent.
+    """
+    stripped = name.rstrip()
+    if stripped.endswith(" - Topic"):
+        return stripped[: -len(" - Topic")]
+    return stripped
+
+
 def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
     """Translate one YouTube playlistItems.list entry to a track record.
 
     The YouTube API shape:
       {
         "snippet": {
-            "title": ..., "channelTitle": ..., "description": ...,
-            "thumbnails": {...}, "publishedAt": ...,
+            "title": ..., "channelTitle": ..., "videoOwnerChannelTitle": ...,
+            "description": ..., "thumbnails": {...}, "publishedAt": ...,
             "resourceId": {"videoId": ...},
         },
         "contentDetails": {"videoId": ..., "videoPublishedAt": ...},
         ...
       }
-    Channel name maps to ``artists=[channel]`` so cross-source matching can
-    use the same canonical key shape. ``description`` and ``publishedAt``
-    survive in ``raw_json`` but don't get top-level columns.
+    Channel resolution: ``videoOwnerChannelTitle`` is preferred over
+    ``channelTitle`` (first non-empty after ``str(...).strip()`` wins;
+    whitespace-only values are treated as absent).
+
+    The resolved channel is used two ways:
+    - ``classification_channel`` (pre-strip) is passed to ``classify(...)``
+      so the ``" - Topic"`` music-signal heuristic still fires.
+    - ``artist_channel`` has the trailing ``" - Topic"`` suffix stripped
+      (case-sensitive) and is used for ``artists`` / ``canonical_key``.
+
+    ``description`` and ``publishedAt`` survive in ``raw_json`` but don't
+    get top-level columns.
     """
     snippet = item.get("snippet") or {}
     content_details = item.get("contentDetails") or {}
 
     video_id = content_details.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
     title = str(snippet.get("title") or "")
-    channel = str(snippet.get("channelTitle") or "").strip()
-    artists = [channel] if channel else []
     description = snippet.get("description") or ""
+
+    # Prefer videoOwnerChannelTitle; fall back to channelTitle.
+    _owner = str(snippet.get("videoOwnerChannelTitle") or "").strip()
+    _channel = str(snippet.get("channelTitle") or "").strip()
+    resolved_channel = _owner or _channel
+
+    classification_channel = resolved_channel
+    artist_channel = _strip_topic_suffix(resolved_channel)
+    artists = [artist_channel] if artist_channel else []
 
     canon = canonical_key(title, artists)
     dedupe = video_id or f"canon:{canon}"
 
-    classification = classify(title=title, channel=channel, description=description)
+    classification = classify(title=title, channel=classification_channel, description=description)
 
     augmentation = item.get("_likesurgeon_video_status") or {}
     raw = {k: v for k, v in item.items() if not k.startswith("_likesurgeon_")}
