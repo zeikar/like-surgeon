@@ -333,18 +333,25 @@ class _FakeYTMusicWrite:
     instances: list[_FakeYTMusicWrite] = []
     raise_on: set[str] = set()
     raise_on_unlike: set[str] = set()
+    in_library: set[str] = set()
 
     def __init__(self, **kwargs: Any) -> None:
-        self.calls: list[str] = []
+        self.like_song_calls: list[str] = []
         self.unlike_calls: list[str] = []
+        self.is_in_liked_songs_calls: list[tuple[str, int]] = []
         type(self).instances.append(self)
 
     def like_song(self, video_id: str) -> None:
+        """Negative-assertion guard — _try_ytm_like must NOT call this."""
         from likesurgeon.ytmusic_client import YTMusicWriteError
 
-        self.calls.append(video_id)
+        self.like_song_calls.append(video_id)
         if video_id in type(self).raise_on:
             raise YTMusicWriteError(video_id, "boom")
+
+    def is_in_liked_songs(self, video_id: str, *, limit: int = 10000) -> bool:
+        self.is_in_liked_songs_calls.append((video_id, limit))
+        return video_id in type(self).in_library
 
     def unlike_song(self, video_id: str) -> None:
         from likesurgeon.ytmusic_client import YTMusicWriteError
@@ -355,14 +362,17 @@ class _FakeYTMusicWrite:
 
 
 @pytest.fixture(autouse=True)
-def _reset_sync_fakes() -> Iterable[None]:
-    """Reset class-level recording state on the sync fakes between tests."""
+def _reset_sync_fakes(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
+    """Reset class-level recording state on the sync fakes between tests.
+    Also suppresses real sleeps in _try_ytm_like."""
+    monkeypatch.setattr("likesurgeon.sync.time.sleep", lambda _s: None)
     _FakeYouTubeWrite.instances = []
     _FakeYouTubeWrite.has_write_scope_return = True
     _FakeYouTubeWrite.rate_raise_on = set()
     _FakeYTMusicWrite.instances = []
     _FakeYTMusicWrite.raise_on = set()
     _FakeYTMusicWrite.raise_on_unlike = set()
+    _FakeYTMusicWrite.in_library = set()
     yield
 
 
@@ -627,6 +637,8 @@ def test_sync_happy_path_applies_actions(
     )
     ghost_id = ids[ISSUE_UNAVAILABLE_VIDEO]
     missing_id = ids[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC]
+    # ytm_like cross-prop: verify must find the song in LM.
+    _FakeYTMusicWrite.in_library = {"src_1"}
 
     runner = CliRunner()
     result = runner.invoke(app, ["sync", "--yes"])
@@ -638,8 +650,9 @@ def test_sync_happy_path_applies_actions(
     # Verify the actual mock arg lists.
     yt = _FakeYouTubeWrite.instances[0]
     ytm = _FakeYTMusicWrite.instances[0]
-    assert yt.rate_calls == [("src_0", "none")]
-    assert ytm.calls == ["src_1"]
+    # yt_unlike for ghost (src_0) + ytm_like cross-prop: unlike+relike for src_1.
+    assert yt.rate_calls == [("src_0", "none"), ("src_1", "none"), ("src_1", "like")]
+    assert ytm.like_song_calls == []
 
     s = _open_db(fake_home)
     try:
@@ -650,7 +663,9 @@ def test_sync_happy_path_applies_actions(
         attempts = list(s.scalars(select(SyncAttempt).order_by(SyncAttempt.id)).all())
         kinds_statuses = [(a.kind, a.status) for a in attempts]
         assert ("yt_unlike", "applied") in kinds_statuses
-        assert ("ytm_like", "applied") in kinds_statuses
+        assert ("ytm_like_yt_unlike", "applied") in kinds_statuses
+        assert ("ytm_like_yt_relike", "applied") in kinds_statuses
+        assert ("ytm_like_verify", "applied") in kinds_statuses
     finally:
         s.close()
 
@@ -706,27 +721,29 @@ def test_sync_partial_failure_exits_one(
         s.close()
 
 
-def test_sync_ytm_only_run_skips_scope_check(
+def test_sync_ytm_only_run_requires_youtube_scope(
     fake_home: Path,
     patch_sync_clients: None,
 ) -> None:
-    """Only ytm_like actions → has_write_scope() must NOT be called."""
+    """ytm_like is in needs_youtube → has_write_scope() IS called; cross-prop uses rate_video."""
     from likesurgeon.cli import app
     from likesurgeon.diagnosis import ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC
 
     _seed_diagnosis(fake_home, issue_types=[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC])
+    # ytm_like verify needs to find the song in LM.
+    _FakeYTMusicWrite.in_library = {"src_0"}
 
     runner = CliRunner()
     result = runner.invoke(app, ["sync", "--yes"])
 
     assert result.exit_code == 0, result.output
-    # YouTubeClient was still built (it's cheap), but has_write_scope was NOT consulted.
+    # has_write_scope IS consulted because ytm_like is in needs_youtube.
     assert len(_FakeYouTubeWrite.instances) == 1
-    assert _FakeYouTubeWrite.instances[0].scope_calls == 0
-    # And rate_video definitely wasn't called.
-    assert _FakeYouTubeWrite.instances[0].rate_calls == []
-    # YT Music half ran.
-    assert _FakeYTMusicWrite.instances[0].calls == ["src_0"]
+    assert _FakeYouTubeWrite.instances[0].scope_calls >= 1
+    # Cross-prop: unlike then relike via rate_video.
+    assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_0", "none"), ("src_0", "like")]
+    # like_song was NOT called (new flow uses rate_video, not like_song).
+    assert _FakeYTMusicWrite.instances[0].like_song_calls == []
 
 
 def test_sync_limit_truncates_actions_and_leaves_rest_open(
