@@ -1009,6 +1009,116 @@ def test_rate_video_wraps_transport_errors(monkeypatch) -> None:
     assert "network unreachable" in str(exc_info.value)
 
 
+def test_rate_video_retries_on_transient_5xx(monkeypatch) -> None:
+    """HttpError 503 twice then success → 3 attempts, no exception raised,
+    time.sleep called with 0.5 then 1.0."""
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import YouTubeClient
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    attempts = {"n": 0}
+
+    class _RetryingVideosRate:
+        def rate(self, **kwargs: Any) -> Any:
+            attempts["n"] += 1
+
+            class _Req:
+                def execute(self_inner) -> dict[str, Any]:  # noqa: N805
+                    if attempts["n"] < 3:
+                        raise HttpError(_FakeResp(503), b"server error")
+                    return {}
+
+            return _Req()
+
+    class _RetryingService:
+        def videos(self) -> _RetryingVideosRate:
+            return _RetryingVideosRate()
+
+    monkeypatch.setattr(client, "_service", lambda: _RetryingService())
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("likesurgeon.youtube_client.time.sleep", lambda s: sleep_calls.append(s))
+
+    client.rate_video("vid1", "like")  # must not raise
+
+    assert attempts["n"] == 3
+    assert sleep_calls == [0.5, 1.0]
+
+
+def test_rate_video_does_not_retry_on_4xx(monkeypatch) -> None:
+    """HttpError 403 → single attempt, YouTubeWriteError raised immediately."""
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import YouTubeClient, YouTubeWriteError
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    attempts = {"n": 0}
+
+    class _ForbiddenVideosRate:
+        def rate(self, **kwargs: Any) -> Any:
+            attempts["n"] += 1
+
+            class _Req:
+                def execute(self_inner) -> dict[str, Any]:  # noqa: N805
+                    raise HttpError(_FakeResp(403), b"forbidden")
+
+            return _Req()
+
+    class _ForbiddenService:
+        def videos(self) -> _ForbiddenVideosRate:
+            return _ForbiddenVideosRate()
+
+    monkeypatch.setattr(client, "_service", lambda: _ForbiddenService())
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("likesurgeon.youtube_client.time.sleep", lambda s: sleep_calls.append(s))
+
+    with pytest.raises(YouTubeWriteError):
+        client.rate_video("vid2", "none")
+
+    assert attempts["n"] == 1
+    assert sleep_calls == []
+
+
+def test_rate_video_raises_after_max_retries(monkeypatch) -> None:
+    """HttpError 503 on every attempt → 3 attempts then YouTubeWriteError."""
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import YouTubeClient, YouTubeWriteError
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    attempts = {"n": 0}
+
+    class _AlwaysFailVideosRate:
+        def rate(self, **kwargs: Any) -> Any:
+            attempts["n"] += 1
+
+            class _Req:
+                def execute(self_inner) -> dict[str, Any]:  # noqa: N805
+                    raise HttpError(_FakeResp(503), b"server error")
+
+            return _Req()
+
+    class _AlwaysFailService:
+        def videos(self) -> _AlwaysFailVideosRate:
+            return _AlwaysFailVideosRate()
+
+    monkeypatch.setattr(client, "_service", lambda: _AlwaysFailService())
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("likesurgeon.youtube_client.time.sleep", lambda s: sleep_calls.append(s))
+
+    with pytest.raises(YouTubeWriteError):
+        client.rate_video("vid3", "like")
+
+    assert attempts["n"] == 3
+    assert sleep_calls == [0.5, 1.0]
+
+
 def test_iso8601_duration_to_seconds_typical_values() -> None:
     from likesurgeon.youtube_client import _iso8601_duration_to_seconds
 

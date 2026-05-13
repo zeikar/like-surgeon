@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -239,6 +240,10 @@ def attach_video_statuses(items: list[dict[str, Any]], statuses: dict[str, Video
         }
 
 
+_RATE_VIDEO_MAX_ATTEMPTS = 3
+_RATE_VIDEO_BACKOFFS = (0.5, 1.0)
+
+
 class YouTubeClient:
     def __init__(
         self,
@@ -407,18 +412,33 @@ class YouTubeClient:
     def rate_video(self, video_id: str, rating: Literal["like", "none"]) -> None:
         """Apply a rating to a video via ``videos.rate``.
 
-        Wraps any error from auth/build/execute (HttpError, RefreshError-
-        wrapped ``AuthorizationRequiredError``, transport exceptions) as
-        ``YouTubeWriteError`` so the dispatcher's continue-on-error loop
-        records a per-item failed attempt instead of aborting the whole
-        sync. ``_service()`` is inside the try because token refresh can
-        fail at this point.
+        Retries up to ``_RATE_VIDEO_MAX_ATTEMPTS`` times on transient HTTP
+        errors (429, 500, 502, 503, 504) with sleeps from
+        ``_RATE_VIDEO_BACKOFFS``. Non-transient ``HttpError`` and non-HTTP
+        exceptions wrap once as ``YouTubeWriteError`` (no retry) so the
+        dispatcher's continue-on-error loop records a per-item failed attempt
+        instead of aborting the whole sync. ``_service()`` is inside the try
+        because token refresh can fail at this point.
         """
+        from googleapiclient.errors import HttpError
+
         try:
             service = self._service()
-            service.videos().rate(id=video_id, rating=rating).execute()
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YouTubeWriteError(video_id, rating, str(exc)) from exc
+
+        for attempt in range(1, _RATE_VIDEO_MAX_ATTEMPTS + 1):
+            try:
+                service.videos().rate(id=video_id, rating=rating).execute()
+                return
+            except HttpError as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status in {429, 500, 502, 503, 504} and attempt < _RATE_VIDEO_MAX_ATTEMPTS:
+                    time.sleep(_RATE_VIDEO_BACKOFFS[attempt - 1])
+                    continue
+                raise YouTubeWriteError(video_id, rating, str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001 — system-boundary catch
+                raise YouTubeWriteError(video_id, rating, str(exc)) from exc
 
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
