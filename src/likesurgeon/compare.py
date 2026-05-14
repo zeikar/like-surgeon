@@ -8,9 +8,11 @@ is a JSON-encoded string); tests pass a lightweight stand-in with
 list/tuple ``artists``. ``_normalize_artists`` accepts either shape.
 
 Three-stage matching, in order of confidence:
-    1. ``video_id`` exact (highest confidence) — iterates ALL YouTube rows,
-       bypassing the ``is_music_candidate`` classifier filter.
-    2. ``canonical_key`` exact (decoration-robust) — same, bypasses filter.
+    1. ``video_id`` exact (highest confidence) — two-pass: music candidates
+       first, then all YouTube rows as a fallback. Lets classifier mis-fires
+       (e.g. artist names with hyphens) still match via exact video_id, while
+       preserving music-candidate priority on collisions.
+    2. ``canonical_key`` exact (decoration-robust) — same two-pass shape.
     3. RapidFuzz fuzzy on ``"<title> | <artists>"`` (last resort) —
        classifier-filtered (``is_music_candidate=True`` only).
 
@@ -259,12 +261,19 @@ def compare_likes(inp: CompareInput) -> CompareResult:
     silently collapsed.
     """
     # Two iteration lists over inp.youtube:
-    #   youtube_all   — every row; used by Stage 1 & 2 (exact-identity) so that
-    #                   videos misclassified by the music-candidate filter (e.g.
-    #                   artist names containing hyphens) are still matched when
-    #                   an exact video_id or canonical_key exists in YT Music.
-    #   youtube_music — classifier-filtered (is_music_candidate=True); used by
-    #                   Stage 3 (fuzzy), possibly_missing, and youtube_music_count.
+    #   youtube_music — classifier-filtered (is_music_candidate=True). Used by
+    #                   Stage 3 (fuzzy), possibly_missing, youtube_music_count,
+    #                   AND as the *first pass* of Stages 1 & 2.
+    #   youtube_all   — every row. Used as the *fallback pass* of Stages 1 & 2
+    #                   so videos misclassified by the music-candidate filter
+    #                   (e.g. artist names containing hyphens) are still
+    #                   matched when an exact video_id or canonical_key exists
+    #                   in YT Music. Running youtube_music first ensures a
+    #                   classifier-true row wins a same-key collision against
+    #                   a classifier-false row, preventing a real music
+    #                   candidate from leaking into possibly_missing — which
+    #                   is sync-actionable and would trigger a spurious
+    #                   ytm_like on the unrelated video_id.
     # Original enumerate indices are preserved so both lists share the same
     # index space and non-music rows still count toward youtube_total_count.
     youtube_all: list[tuple[int, _Itemish]] = list(enumerate(inp.youtube))
@@ -302,32 +311,35 @@ def compare_likes(inp: CompareInput) -> CompareResult:
         if it.video_id:
             by_video_id_ytm.setdefault(it.video_id, []).append(idx)
 
-    for yt_idx, yt in youtube_all:
-        if yt_idx in used_yt_idx or not yt.video_id:
-            continue
-        candidates = by_video_id_ytm.get(yt.video_id)
-        if not candidates:
-            continue
-        chosen = _take_first_unused(candidates)
-        if chosen is None:
-            continue
-        _record_match(yt_idx, chosen, MatchKind.VIDEO_ID, 1.0)
+    for source in (youtube_music, youtube_all):
+        for yt_idx, yt in source:
+            if yt_idx in used_yt_idx or not yt.video_id:
+                continue
+            candidates = by_video_id_ytm.get(yt.video_id)
+            if not candidates:
+                continue
+            chosen = _take_first_unused(candidates)
+            if chosen is None:
+                continue
+            _record_match(yt_idx, chosen, MatchKind.VIDEO_ID, 1.0)
 
-    # Stage 2: canonical_key exact match — same queue-per-key shape.
+    # Stage 2: canonical_key exact match — same queue-per-key shape, same
+    # music-first / all-fallback ordering as Stage 1.
     by_canon_ytm: dict[str, list[int]] = {}
     for idx, it in enumerate(inp.ytmusic):
         by_canon_ytm.setdefault(it.canonical_key, []).append(idx)
 
-    for yt_idx, yt in youtube_all:
-        if yt_idx in used_yt_idx:
-            continue
-        candidates = by_canon_ytm.get(yt.canonical_key)
-        if not candidates:
-            continue
-        chosen = _take_first_unused(candidates)
-        if chosen is None:
-            continue
-        _record_match(yt_idx, chosen, MatchKind.CANONICAL_KEY, 1.0)
+    for source in (youtube_music, youtube_all):
+        for yt_idx, yt in source:
+            if yt_idx in used_yt_idx:
+                continue
+            candidates = by_canon_ytm.get(yt.canonical_key)
+            if not candidates:
+                continue
+            chosen = _take_first_unused(candidates)
+            if chosen is None:
+                continue
+            _record_match(yt_idx, chosen, MatchKind.CANONICAL_KEY, 1.0)
 
     # Stage 3: RapidFuzz fuzzy on "title | artists". Best-of-remaining per
     # yt row, ties go to the highest score. Each ytm row reserved on use.

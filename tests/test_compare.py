@@ -176,12 +176,14 @@ def test_canonical_key_match_when_yt_not_music_candidate():
     assert res.matched[0].kind is MatchKind.CANONICAL_KEY
 
 
-def test_canonical_key_collision_design_choice():
-    """Two YT rows share the same canonical_key; first row wins regardless of classifier.
+def test_canonical_key_collision_prefers_music_candidate():
+    """Two YT rows share the same canonical_key; the music candidate wins.
 
-    This test pins the design decision: Stage 2 claims rows in enumerate(inp.youtube)
-    order — not classifier-preference order. The music=False row is first and wins;
-    the music=True row is unmatched and falls into possibly_missing_from_ytmusic.
+    Stage 2 runs music candidates first, then all rows as a fallback. Even
+    though the music=False row appears earlier in inp.youtube, the music=True
+    row claims the YT Music match. This prevents a real music candidate from
+    landing in possibly_missing_from_ytmusic (which is sync-actionable and
+    would otherwise trigger a spurious ytm_like on the unrelated video_id).
     """
     ytm = [_ytm(1, "vmusic", "Song A", ["X"])]
     yt_non_music = _yt(2, "vy_non_music", "Song A", ["X"], music=False)
@@ -189,12 +191,13 @@ def test_canonical_key_collision_design_choice():
     res = compare_likes(CompareInput(ytmusic=ytm, youtube=[yt_non_music, yt_music]))
     assert len(res.matched) == 1
     assert res.matched[0].kind is MatchKind.CANONICAL_KEY
-    # The music=False row (first) claimed the match.
-    assert res.matched[0].youtube_track_id == 2
+    # Music-first pass beats enumerate order: the music=True row wins.
+    assert res.matched[0].youtube_track_id == 3
     assert res.ytmusic_only_likes == []
-    # The music=True row is unmatched → possibly_missing_from_ytmusic.
-    assert len(res.possibly_missing_from_ytmusic) == 1
-    assert res.possibly_missing_from_ytmusic[0].track_id == 3
+    # The music=False row is filtered out of possibly_missing_from_ytmusic by
+    # is_music_candidate; the music=True row claimed the only YTM key, so
+    # possibly_missing is empty. No spurious sync action.
+    assert res.possibly_missing_from_ytmusic == []
 
 
 def test_fuzzy_stage_still_filters_non_music_yt():
