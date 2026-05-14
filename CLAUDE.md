@@ -15,7 +15,7 @@ Cut a git tag **and** a GitHub release at every milestone bump (0.4.0, 0.4.1, 0.
 
 Procedure on `main`, after the feature PR is merged:
 
-1. Bump `version` in `pyproject.toml` (semver).
+1. Bump `version` in `pyproject.toml` AND `__version__` in `src/likesurgeon/__init__.py` (must stay in lockstep — v0.8.0 shipped with `__init__.py` stale at `0.7.1`, fixed in 0.9.0).
 2. Commit `chore: bump version to <X.Y.Z>`.
 3. Tag the commit `v<X.Y.Z>` (with the `v` prefix).
 4. `git push && git push --tags`.
@@ -47,3 +47,4 @@ Feature work goes through a PR (squash merge to main, see PR #7 for the template
 - Duplicate dedupe (`ytm_dedupe`) is **one `rate_song(INDIFFERENT)` per finding, ytmusic-source + N=2 only**. `rate_song(LIKE)` is non-idempotent (every call appends to LM), so our 0.4 drift sync was the dup producer in the first place. Propagation is minute-scale; the hazard is running `scan ytmusic` → `compare-likes` → `sync` cycle before propagation settles (stale snapshot recreates the finding → over-remove). **Always re-scan ytmusic + compare-likes immediately before a dedupe sync** — a stale finding can also remove the only remaining LM entry if the dup was fixed manually or by propagation since the previous diagnosis.
 - `ytm_like` cross-prop: verify-miss (video not found in YT Music after 5s) flips `DiagnosisItem.status` to `'skipped'` (code-set by `execute()`, not a manual override). This is intentional — prevents the 0.4-0.6 silent-no-op `rate_song("LIKE")` re-fire-on-every-sync noise. Operator can flip status to `'open'` via SQL (`UPDATE diagnosis_items SET status='open' WHERE ...`) to force retry. Rare partial-failure: `rate(none)` succeeds but `rate(like)` fails after client-level retries — the video is left unliked on YouTube. Manual relike required to recover.
 - **0.8**: one-time `scan youtube-likes` required to repopulate `artists` from `videoOwnerChannelTitle`. The **first** post-0.8 `compare-likes` will show a `metadata_drift` spike caused by the ingestion change itself; this spike won't clear on a re-run of `compare-likes` alone — verify it was migration noise by running a **second** `scan youtube-likes` + `compare-likes` so drift detection compares two post-0.8 snapshots.
+- **0.9**: `fuzzy_threshold` config key (default `85`, integer in `[0, 100]`) tunes the cross-source RapidFuzz cutoff. Default is the safe choice — lowering raises `possible_pointer_drift` false-positive risk, which feeds drift sync (like-then-unlike, fail-safe ordering limits but does not eliminate mis-match harm).
