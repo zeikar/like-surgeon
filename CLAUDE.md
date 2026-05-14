@@ -15,7 +15,7 @@ Cut a git tag **and** a GitHub release at every milestone bump (0.4.0, 0.4.1, 0.
 
 Procedure on `main`, after the feature PR is merged:
 
-1. Bump `version` in `pyproject.toml` AND `__version__` in `src/likesurgeon/__init__.py` (must stay in lockstep — v0.8.0 shipped with `__init__.py` stale at `0.7.1`, fixed in 0.9.0).
+1. Bump `version` in `pyproject.toml` **and** `__version__` in `src/likesurgeon/__init__.py` — these two must stay in lockstep (v0.8.0 shipped with `__init__.py` stale at `0.7.1`, fixed in 0.9.0).
 2. Commit `chore: bump version to <X.Y.Z>`.
 3. Tag the commit `v<X.Y.Z>` (with the `v` prefix).
 4. `git push && git push --tags`.

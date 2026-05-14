@@ -119,7 +119,10 @@ Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) c
 You can also tune the RapidFuzz cross-source match cutoff with `fuzzy_threshold` (default `85`, range `[0, 100]`):
 
 ```json
-{"region": "KR", "fuzzy_threshold": 80}
+{
+  "region": "KR",
+  "fuzzy_threshold": 80
+}
 ```
 
 Lowering `fuzzy_threshold` increases recall on real drift but also raises false-positive `possible_pointer_drift` risk.
