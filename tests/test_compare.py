@@ -151,6 +151,77 @@ def test_non_music_youtube_videos_excluded():
     assert res.pointer_drift_candidates == []
 
 
+def test_video_id_match_when_yt_not_music_candidate():
+    """Stage 1 matches a non-music-candidate YT row via video_id.
+
+    Real example: S.I.D-Sound - 겨울요정 — classifier says not music, but
+    the YTM side has the same video_id so it should pair regardless.
+    """
+    ytm = [_ytm(1, "v1", "겨울요정", ["S.I.D-Sound"])]
+    yt = [_yt(2, "v1", "겨울요정 (MV)", ["S.I.D-Sound"], music=False)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt))
+    assert len(res.matched) == 1
+    assert res.matched[0].kind is MatchKind.VIDEO_ID
+    assert res.ytmusic_only_likes == []
+    assert res.youtube_music_count == 0
+    assert res.possibly_missing_from_ytmusic == []
+
+
+def test_canonical_key_match_when_yt_not_music_candidate():
+    """Stage 2 matches a non-music-candidate YT row via canonical_key."""
+    ytm = [_ytm(1, "vmusic", "Song A", ["X"])]
+    yt = [_yt(2, "vyoutube", "Song A", ["X"], music=False)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt))
+    assert len(res.matched) == 1
+    assert res.matched[0].kind is MatchKind.CANONICAL_KEY
+
+
+def test_canonical_key_collision_design_choice():
+    """Two YT rows share the same canonical_key; first row wins regardless of classifier.
+
+    This test pins the design decision: Stage 2 claims rows in enumerate(inp.youtube)
+    order — not classifier-preference order. The music=False row is first and wins;
+    the music=True row is unmatched and falls into possibly_missing_from_ytmusic.
+    """
+    ytm = [_ytm(1, "vmusic", "Song A", ["X"])]
+    yt_non_music = _yt(2, "vy_non_music", "Song A", ["X"], music=False)
+    yt_music = _yt(3, "vy_music", "Song A", ["X"], music=True)
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=[yt_non_music, yt_music]))
+    assert len(res.matched) == 1
+    assert res.matched[0].kind is MatchKind.CANONICAL_KEY
+    # The music=False row (first) claimed the match.
+    assert res.matched[0].youtube_track_id == 2
+    assert res.ytmusic_only_likes == []
+    # The music=True row is unmatched → possibly_missing_from_ytmusic.
+    assert len(res.possibly_missing_from_ytmusic) == 1
+    assert res.possibly_missing_from_ytmusic[0].track_id == 3
+
+
+def test_fuzzy_stage_still_filters_non_music_yt():
+    """Stage 3 (fuzzy) does NOT match a non-music-candidate YT row.
+
+    "Imagine cover" vs "Imagine" with same artist would score well above 80
+    threshold via token_set_ratio, but since the YT row has music=False it
+    must be excluded from the fuzzy stage entirely.
+    """
+    ytm = [_ytm(1, "vm", "Imagine", ["John Lennon"])]
+    yt = [_yt(2, "vy", "Imagine cover", ["John Lennon"], music=False)]
+    res = compare_likes(CompareInput(ytmusic=ytm, youtube=yt, fuzzy_threshold=80))
+    assert res.matched == []
+    assert len(res.ytmusic_only_likes) == 1
+    assert res.ytmusic_only_likes[0].track_id == 1
+    assert res.pointer_drift_candidates == []
+
+
+def test_non_music_yt_excluded_from_possibly_missing():
+    """A non-music-candidate YT row with no YTM counterpart stays out of
+    possibly_missing_from_ytmusic and does not count toward youtube_music_count."""
+    yt = [_yt(2, "vy", "Some random vlog", ["VlogChannel"], music=False)]
+    res = compare_likes(CompareInput(ytmusic=[], youtube=yt))
+    assert res.possibly_missing_from_ytmusic == []
+    assert res.youtube_music_count == 0
+
+
 def test_pointer_drift_candidates_collect_fuzzy_matches():
     """Fuzzy matches should also surface as pointer_drift_candidates."""
     ytm = [_ytm(1, "vm", "Imagine", ["John Lennon"])]
