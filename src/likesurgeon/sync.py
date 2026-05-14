@@ -10,11 +10,15 @@ Invariants:
     detail (errors, threshold notes, missing video_ids) lives on
     ``SyncAttempt.reason`` instead.
   * ``DiagnosisItem.status`` flips to ``"applied"`` only when every API
-    call for the action succeeded (drift = both halves). Anything else
-    (failure, skip) leaves it as ``"open"`` so the next ``sync`` run
-    re-evaluates it. Exception: ``ytm_dedupe`` is non-idempotent and
-    flips to ``"applied"`` after any attempt (success or failure) to
-    prevent auto-retry over-removal.
+    call for the action succeeded (drift = both halves). Failures leave it
+    as ``"open"`` so the next ``sync`` run re-evaluates. Exception:
+    ``ytm_dedupe`` is non-idempotent and flips to ``"applied"`` after any
+    attempt (success or failure) to prevent auto-retry over-removal.
+    ``"skipped"`` is a terminal non-failure outcome: set by the planner
+    for plan-time skips (no video_id, below confidence threshold, etc.)
+    and code-set by ``_try_ytm_like`` / ``_try_yt_like`` on cross-prop
+    verify-miss. Items at ``"skipped"`` are not re-attempted on the next
+    run; flip ``DiagnosisItem.status`` to ``"open"`` via SQL to retry.
   * Per-action commit cadence: a crash mid-run preserves prior actions'
     SyncAttempt rows AND any status updates already committed. Drift's
     two HTTP calls count as one action (one commit).
@@ -168,10 +172,13 @@ def plan(
     Items with ``status`` in {``'applied'``, ``'skipped'``} are silently
     dropped (terminal at item level — re-running sync must not re-attempt
     them, and there's nothing to record). ``'applied'`` is set by ``execute``
-    when every API call for an action succeeded; ``'skipped'`` is reserved
-    for an explicit manual override ("I never want to act on this finding"
-    — e.g. a private/deleted YouTube ghost that ``videos.rate`` can't
-    unlike anyway, so retrying would just noise the audit log forever).
+    when every API call for an action succeeded. ``'skipped'`` is a terminal
+    non-failure status: it is set either by the operator as a manual override
+    (e.g. a private/deleted YouTube ghost that ``videos.rate`` can't unlike
+    anyway) or code-set by ``execute`` on cross-prop verify-miss (``ytm_like``
+    and ``yt_like`` actions). Both are treated the same here: skipped items
+    are not re-planned. Flip ``DiagnosisItem.status`` to ``'open'`` via SQL
+    to retry a code-set skip.
     Findings of type ``metadata_drift`` are silently
     dropped (informational, not actionable in 0.5).
     ``duplicate_in_source`` maps to ``ytm_dedupe`` only when the parsed
@@ -398,8 +405,11 @@ def execute(
     ``open``). The per-call detail lives in the ``SyncAttempt`` rows.
 
     Commit cadence: per-action. A crash mid-run preserves all prior
-    commits — the next ``sync`` re-evaluates anything not at
-    ``status='applied'``.
+    commits — the next ``sync`` re-evaluates anything at ``status='open'``.
+    Items at ``status='skipped'`` are terminal (code-set on cross-prop
+    verify-miss for ``ytm_like`` and ``yt_like``, or set manually by the
+    operator). The planner drops both ``'applied'`` and ``'skipped'`` items
+    silently — neither is re-attempted.
 
     Carve-out: ``ytm_dedupe`` flips ``item.status`` to ``"applied"``
     regardless of success. The call is non-idempotent — auto-retrying
@@ -463,9 +473,10 @@ def _dispatch(
 
     ``"applied"`` iff every call for the action succeeded — i.e. the
     dispatcher is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
-    ``"skipped"`` is a terminal non-failure outcome (currently only
-    ``ytm_like`` post-verify when cross-prop didn't observe the song);
-    ``"failed"`` is anything else.
+    ``"skipped"`` is a terminal non-failure outcome — returned by
+    ``_try_ytm_like`` when cross-prop didn't observe the song in YT Music,
+    and by ``_try_yt_like`` when the video was not observed in YouTube Liked
+    Videos, both after a 5s wait; ``"failed"`` is anything else.
 
     Note: for ``ytm_dedupe``, the outcome is used only for ``ExecResult``
     counting. Terminality (``status='applied'`` regardless of success) is

@@ -194,12 +194,16 @@ class DiagnosisItem(Base):
 class SyncAttempt(Base):
     """One row per ``sync`` API call (or skip decision).
 
-    ``kind`` is one of ``yt_unlike``, ``ytm_like``, ``yt_relike_like``,
-    ``yt_relike_unlike``, ``ytm_dedupe`` — the two halves of a drift fix get separate rows
-    so the audit trail stays atomic per HTTP call. ``status`` is one of
-    ``applied``, ``failed``, ``skipped``. ``reason`` carries sync-side
-    detail (error message, threshold note, missing video_id, etc.) — the
-    originating ``DiagnosisItem.reason`` is never overwritten.
+    ``kind`` identifies the specific HTTP call (or skip decision). Known
+    values: ``yt_unlike``, ``ytm_like_yt_unlike``, ``ytm_like_yt_relike``,
+    ``ytm_like_verify``, ``yt_like_yt_rate``, ``yt_like_verify``,
+    ``yt_relike_like``, ``yt_relike_unlike``, ``ytm_dedupe``. Multi-step
+    actions (``ytm_like``, ``yt_like``, ``yt_relike``) emit one row per
+    step so the audit trail stays atomic per HTTP call. See ``sync.py``
+    for the authoritative list. ``status`` is one of ``applied``,
+    ``failed``, ``skipped``. ``reason`` carries sync-side detail (error
+    message, threshold note, missing video_id, etc.) — the originating
+    ``DiagnosisItem.reason`` is never overwritten.
     """
 
     __tablename__ = "sync_attempts"
