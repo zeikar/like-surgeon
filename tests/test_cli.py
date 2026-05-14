@@ -1337,6 +1337,128 @@ def test_compare_likes_raw_total_counts_include_duplicates(
 
 
 # ---------------------------------------------------------------------------
+# fuzzy_threshold wiring — _compare_and_persist passes cfg.fuzzy_threshold
+# through to CompareInput, and _safe_config_load converts out-of-range values
+# to a clean exit-2 before any pipeline logic runs.
+# ---------------------------------------------------------------------------
+
+
+def _seed_minimal_snapshots(home: Path) -> None:
+    """Seed one ytmusic row and one youtube row so _compare_and_persist
+    doesn't short-circuit on a missing snapshot."""
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(home)
+    try:
+        create_snapshot(s, "ytmusic_liked_songs", [_ytm_raw("ytm1", "A Song", ["Artist"])])
+        create_snapshot(s, "youtube_liked_videos", [_yt_raw("yt1", "A Song", "ArtistVEVO")])
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_compare_and_persist_passes_fuzzy_threshold_from_config(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_compare_and_persist must forward cfg.fuzzy_threshold to CompareInput."""
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.compare import CompareInput, CompareResult
+    from likesurgeon.config import Config
+
+    _seed_minimal_snapshots(fake_home)
+
+    captured: list[CompareInput] = []
+
+    def _fake_compare_likes(inp: CompareInput) -> CompareResult:
+        captured.append(inp)
+        return CompareResult(
+            ytmusic_count=0,
+            youtube_total_count=0,
+            youtube_music_count=0,
+            matched=[],
+            possibly_missing_from_ytmusic=[],
+        )
+
+    monkeypatch.setattr(_cli_mod, "compare_likes", _fake_compare_likes)
+
+    cfg = Config(
+        app_dir=fake_home,
+        db_path=fake_home / "like-surgeon.sqlite",
+        ytmusic_browser_path=fake_home / "browser.json",
+        youtube_oauth_client_path=fake_home / "youtube-oauth-client.json",
+        youtube_token_path=fake_home / "youtube-token.json",
+        region=None,
+        fuzzy_threshold=80,
+    )
+
+    s = _open_db(fake_home)
+    try:
+        _cli_mod._compare_and_persist(s, cfg)
+        s.rollback()
+    finally:
+        s.close()
+
+    assert len(captured) == 1
+    assert captured[0].fuzzy_threshold == 80
+
+
+def test_compare_and_persist_uses_default_85_when_cfg_is_none(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When cfg=None, _compare_and_persist must use DEFAULT_FUZZY_THRESHOLD (85)."""
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.compare import DEFAULT_FUZZY_THRESHOLD, CompareInput, CompareResult
+
+    _seed_minimal_snapshots(fake_home)
+
+    captured: list[CompareInput] = []
+
+    def _fake_compare_likes(inp: CompareInput) -> CompareResult:
+        captured.append(inp)
+        return CompareResult(
+            ytmusic_count=0,
+            youtube_total_count=0,
+            youtube_music_count=0,
+            matched=[],
+            possibly_missing_from_ytmusic=[],
+        )
+
+    monkeypatch.setattr(_cli_mod, "compare_likes", _fake_compare_likes)
+
+    s = _open_db(fake_home)
+    try:
+        _cli_mod._compare_and_persist(s, cfg=None)
+        s.rollback()
+    finally:
+        s.close()
+
+    assert len(captured) == 1
+    assert captured[0].fuzzy_threshold == DEFAULT_FUZZY_THRESHOLD
+    assert DEFAULT_FUZZY_THRESHOLD == 85
+
+
+def test_invalid_fuzzy_threshold_in_config_exits_2_cleanly(
+    fake_home: Path,
+) -> None:
+    """A fuzzy_threshold of 150 in config.json must produce exit code 2
+    with the invalid value in output and no traceback."""
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KR", "fuzzy_threshold": 150}))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 2
+    assert "150" in result.output
+    assert "Traceback" not in result.output
+
+
+# ---------------------------------------------------------------------------
 # Stage 4 enrichment — compare-likes pipeline.
 #
 # These tests exercise the Stage 4 drift-detection path wired into
