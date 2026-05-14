@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
 from .compare import CompareInput, CompareResult, compare_likes, dedupe_by_video_id
-from .config import Config, InvalidRegionError, _validate_region
+from .config import Config, InvalidFuzzyThresholdError, InvalidRegionError, _validate_region
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diff import diff_snapshots
 from .doctor import health_summary
@@ -59,7 +59,7 @@ def _safe_config_load() -> Config:
     """
     try:
         return Config.load()
-    except InvalidRegionError as e:
+    except (InvalidRegionError, InvalidFuzzyThresholdError) as e:
         _fail(str(e), code=2)
 
 
@@ -536,7 +536,13 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
     ytm_items = dedupe_by_video_id(ytm_items_raw)
 
     # Stage A — existing cross-source matcher (over canonicalized items).
-    cmp_result = compare_likes(CompareInput(ytmusic=ytm_items, youtube=yt_items))
+    cmp_result = compare_likes(
+        CompareInput(
+            ytmusic=ytm_items,
+            youtube=yt_items,
+            **({"fuzzy_threshold": cfg.fuzzy_threshold} if cfg is not None else {}),
+        )
+    )
 
     # === Stage 4: drift detection via YouTube enrichment ===
     from .compare import (
