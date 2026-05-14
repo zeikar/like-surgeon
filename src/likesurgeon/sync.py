@@ -48,7 +48,7 @@ from .ytmusic_client import (
     YTMusicWriteError,
 )
 
-ActionKind = Literal["yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe"]
+ActionKind = Literal["yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedupe"]
 _DispatchOutcome = Literal["applied", "skipped", "failed"]
 
 _YTM_LIKE_VERIFY_WAIT_SECONDS = 5
@@ -171,7 +171,7 @@ def plan(
     for an explicit manual override ("I never want to act on this finding"
     — e.g. a private/deleted YouTube ghost that ``videos.rate`` can't
     unlike anyway, so retrying would just noise the audit log forever).
-    Findings of type ``ytmusic_only`` or ``metadata_drift`` are silently
+    Findings of type ``metadata_drift`` are silently
     dropped (informational, not actionable in 0.5).
     ``duplicate_in_source`` maps to ``ytm_dedupe`` only when the parsed
     reason validates as ytmusic-source + N=2 + matching position count.
@@ -255,8 +255,28 @@ def plan(
                 )
             )
 
-        elif item.issue_type in {ISSUE_YTMUSIC_ONLY, ISSUE_METADATA_DRIFT}:
-            # Informational findings — no record, no action.
+        elif item.issue_type == ISSUE_YTMUSIC_ONLY:
+            primary = _video_id_for(video_ids, item.source_track_id)
+            if primary is None:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="yt_like",
+                        reason="no video_id available for source track",
+                    )
+                )
+                continue
+            actions.append(
+                PlannedAction(
+                    item_id=item.id,
+                    kind="yt_like",
+                    primary_video_id=primary,
+                    secondary_video_id=None,
+                )
+            )
+
+        elif item.issue_type == ISSUE_METADATA_DRIFT:
+            # Informational finding — no record, no action.
             continue
 
         elif item.issue_type == ISSUE_DUPLICATE_IN_SOURCE:
@@ -322,7 +342,7 @@ def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None
     return video_ids.get(track_id)
 
 
-_PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_relike", "ytm_dedupe")
+_PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedupe")
 
 # Quota cost per action kind (YouTube `videos.rate` = 50 units; ytm is free).
 # Drift's worst case = 100 (like 50 + unlike 50 if the like succeeds).
@@ -330,6 +350,8 @@ _QUOTA_COST: dict[ActionKind, int] = {
     "yt_unlike": 50,
     # rate-none + rate-like (verify reads are free; client retries are transparent)
     "ytm_like": 100,
+    # videos.rate (50) + videos.getRating verify (1)
+    "yt_like": 51,
     "yt_relike": 100,
     "ytm_dedupe": 0,
 }
