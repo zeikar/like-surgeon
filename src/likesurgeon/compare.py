@@ -182,11 +182,14 @@ class UnmatchedItem:
     canonical_key: str
 
 
+DEFAULT_FUZZY_THRESHOLD: int = 85
+
+
 @dataclass(frozen=True)
 class CompareInput:
     ytmusic: list[_Itemish]
     youtube: list[_Itemish]
-    fuzzy_threshold: int = 85  # RapidFuzz score 0–100; >= threshold counts
+    fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD  # RapidFuzz score 0–100; >= threshold counts
 
 
 @dataclass(frozen=True)
