@@ -1119,6 +1119,105 @@ def test_rate_video_raises_after_max_retries(monkeypatch) -> None:
     assert sleep_calls == [0.5, 1.0]
 
 
+class _FakeVideosGetRating:
+    """Mimics ``service.videos().getRating(id=...).execute()``.
+
+    ``response`` is returned by ``.execute()``; set ``raise_with`` to inject
+    an exception on ``.execute()`` to drive the error-wrap path.
+    """
+
+    def __init__(
+        self,
+        response: dict[str, Any] | None = None,
+        raise_with: Exception | None = None,
+    ) -> None:
+        self._response = response or {}
+        self._raise = raise_with
+        self.calls: list[dict[str, Any]] = []
+
+    def getRating(self, **kwargs: Any) -> _FakeRequest:  # noqa: N802 (mirrors google API)
+        self.calls.append(kwargs)
+        if self._raise is not None:
+            exc = self._raise
+
+            class _RaisingRequest:
+                def execute(self_inner) -> dict[str, Any]:  # noqa: N805
+                    raise exc
+
+            return _RaisingRequest()  # type: ignore[return-value]
+        return _FakeRequest(self._response)
+
+
+class _FakeServiceWithGetRating:
+    def __init__(self, videos: _FakeVideosGetRating) -> None:
+        self._videos = videos
+
+    def videos(self) -> _FakeVideosGetRating:
+        return self._videos
+
+
+def test_is_in_liked_videos_returns_true_when_rating_is_like(monkeypatch) -> None:
+    """items[0].rating == 'like' → True."""
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    fake_videos = _FakeVideosGetRating(response={"items": [{"videoId": "vid1", "rating": "like"}]})
+    monkeypatch.setattr(client, "_service", lambda: _FakeServiceWithGetRating(fake_videos))
+
+    assert client.is_in_liked_videos("vid1") is True
+    assert fake_videos.calls == [{"id": "vid1"}]
+
+
+def test_is_in_liked_videos_returns_false_when_rating_is_none(monkeypatch) -> None:
+    """items[0].rating == 'none' → False."""
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    fake_videos = _FakeVideosGetRating(response={"items": [{"videoId": "vid1", "rating": "none"}]})
+    monkeypatch.setattr(client, "_service", lambda: _FakeServiceWithGetRating(fake_videos))
+
+    assert client.is_in_liked_videos("vid1") is False
+
+
+def test_is_in_liked_videos_returns_false_on_empty_items(monkeypatch) -> None:
+    """Empty items list → False (defensive, no IndexError)."""
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    fake_videos = _FakeVideosGetRating(response={"items": []})
+    monkeypatch.setattr(client, "_service", lambda: _FakeServiceWithGetRating(fake_videos))
+
+    assert client.is_in_liked_videos("vidX") is False
+
+
+def test_is_in_liked_videos_wraps_service_auth_error(monkeypatch) -> None:
+    """_service() raising → YouTubeWriteError with rating field 'verify'."""
+    from likesurgeon.youtube_client import AuthorizationRequiredError
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def fake_service() -> Any:
+        raise AuthorizationRequiredError("no token")
+
+    monkeypatch.setattr(client, "_service", fake_service)
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        client.is_in_liked_videos("vidY")
+    assert exc_info.value.video_id == "vidY"
+    assert exc_info.value.rating == "verify"
+    assert "no token" in str(exc_info.value)
+
+
+def test_is_in_liked_videos_wraps_http_error(monkeypatch) -> None:
+    """HttpError from getRating().execute() → YouTubeWriteError with rating 'verify'."""
+    from googleapiclient.errors import HttpError
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    err = HttpError(_FakeResp(403), b"forbidden")
+    fake_videos = _FakeVideosGetRating(raise_with=err)
+    monkeypatch.setattr(client, "_service", lambda: _FakeServiceWithGetRating(fake_videos))
+
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        client.is_in_liked_videos("vidZ")
+    assert exc_info.value.video_id == "vidZ"
+    assert exc_info.value.rating == "verify"
+    assert exc_info.value.__cause__ is err
+
+
 def test_iso8601_duration_to_seconds_typical_values() -> None:
     from likesurgeon.youtube_client import _iso8601_duration_to_seconds
 

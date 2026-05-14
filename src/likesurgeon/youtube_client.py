@@ -440,6 +440,37 @@ class YouTubeClient:
             except Exception as exc:  # noqa: BLE001 — system-boundary catch
                 raise YouTubeWriteError(video_id, rating, str(exc)) from exc
 
+    def is_in_liked_videos(self, video_id: str) -> bool:
+        """Whether ``video_id`` currently has a ``"like"`` rating on YouTube.
+
+        Calls ``videos.getRating(id=video_id).execute()`` — costs 1 quota unit.
+        Returns ``True`` iff the response contains at least one item whose
+        ``rating`` field equals ``"like"``; returns ``False`` on empty ``items``
+        or any other rating value (``"none"``, ``"dislike"``, ``"unspecified"``).
+
+        Used by ``_try_yt_like`` as the cross-propagation verify step (mirror of
+        ``YTMusicClient.is_in_liked_songs``). ``_service()`` auth errors and
+        ``HttpError`` / transport exceptions are wrapped as
+        ``YouTubeWriteError(video_id, "verify", ...)`` so the dispatcher's
+        continue-on-error loop can attribute the failure to the specific action
+        rather than aborting the whole run.
+        """
+        from googleapiclient.errors import HttpError
+
+        try:
+            service = self._service()
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
+
+        try:
+            resp = service.videos().getRating(id=video_id).execute()
+        except HttpError as exc:
+            raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
+
+        return any(item.get("rating") == "like" for item in resp.get("items", []))
+
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2
 
