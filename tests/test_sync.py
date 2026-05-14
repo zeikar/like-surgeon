@@ -47,16 +47,32 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class FakeYouTube:
     """Records every ``rate_video`` call. Configure ``raise_on`` to inject
-    a ``YouTubeWriteError`` for a specific (video_id, rating) pair."""
+    a ``YouTubeWriteError`` for a specific (video_id, rating) pair.
 
-    def __init__(self, raise_on: set[tuple[str, str]] | None = None) -> None:
+    ``in_likes`` controls which video ids are returned as present by
+    ``is_in_liked_videos``. ``raise_is_in_liked_videos`` injects an exception
+    from that method (mirrors ``FakeYTMusic.raise_is_in_liked_songs``)."""
+
+    def __init__(
+        self,
+        raise_on: set[tuple[str, str]] | None = None,
+        in_likes: set[str] | None = None,
+        raise_is_in_liked_videos: Exception | None = None,
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
         self._raise_on = raise_on or set()
+        self._in_likes: set[str] = set(in_likes or ())
+        self._raise_is_in_liked_videos = raise_is_in_liked_videos
 
     def rate_video(self, video_id: str, rating: str) -> None:
         self.calls.append((video_id, rating))
         if (video_id, rating) in self._raise_on:
             raise YouTubeWriteError(video_id, rating, "boom")
+
+    def is_in_liked_videos(self, video_id: str) -> bool:
+        if self._raise_is_in_liked_videos is not None:
+            raise self._raise_is_in_liked_videos
+        return video_id in self._in_likes
 
 
 class FakeYTMusic:
@@ -438,29 +454,68 @@ def test_plan_missing_video_id_emits_skip_with_action_kind(session: Session) -> 
         assert "no video_id" in s.reason
 
 
-def test_plan_ignores_ytmusic_only_and_metadata_drift(session: Session) -> None:
-    """Informational findings: planner must produce neither action nor skip."""
+def test_plan_maps_ytmusic_only_to_yt_like(session: Session) -> None:
+    """ytmusic_only finding maps to a yt_like PlannedAction with primary_video_id from source_track_id."""
     diag = _make_diagnosis(session)
-    t1 = _make_track(session, "v1", suffix="1")
-    t2 = _make_track(session, "v2", suffix="2")
-    only = _make_item(
+    t = _make_track(session, "v1", suffix="1")
+    item = _make_item(
         session,
         diag,
         issue_type=ISSUE_YTMUSIC_ONLY,
-        source_track=t1,
+        source_track=t,
     )
+    session.commit()
+
+    actions, skips = plan([item], {t.id: "v1"}, drift_min_confidence=0.95)
+
+    assert skips == []
+    assert actions == [
+        PlannedAction(
+            item_id=item.id,
+            kind="yt_like",
+            primary_video_id="v1",
+            secondary_video_id=None,
+        )
+    ]
+
+
+def test_plan_ignores_metadata_drift(session: Session) -> None:
+    """metadata_drift is informational — planner must produce neither action nor skip."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "v2", suffix="2")
     drift = _make_item(
         session,
         diag,
         issue_type=ISSUE_METADATA_DRIFT,
-        source_track=t2,
+        source_track=t,
     )
     session.commit()
 
-    actions, skips = plan([only, drift], {t1.id: "v1", t2.id: "v2"}, drift_min_confidence=0.95)
+    actions, skips = plan([drift], {t.id: "v2"}, drift_min_confidence=0.95)
 
     assert actions == []
     assert skips == []
+
+
+def test_plan_ytmusic_only_no_video_id_skips(session: Session) -> None:
+    """Track.video_id = None → one SkipRecord with kind='yt_like', reason containing 'no video_id'."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, None, suffix="novid")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_YTMUSIC_ONLY,
+        source_track=t,
+    )
+    session.commit()
+
+    actions, skips = plan([item], {}, drift_min_confidence=0.95)
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].item_id == item.id
+    assert skips[0].kind == "yt_like"
+    assert "no video_id available for source track" in skips[0].reason
 
 
 def test_plan_duplicate_in_source_ytmusic_n2_emits_ytm_dedupe_alongside_actionable(
@@ -685,6 +740,20 @@ def test_summarize_includes_ytm_dedupe() -> None:
     assert "yt_relike: 0" in s
 
 
+def test_summarize_includes_yt_like() -> None:
+    """yt_like action appears in summarize output with per-kind count.
+    Each yt_like costs 51 quota units (rate=50 + getRating=1)."""
+    actions = [
+        PlannedAction(item_id=1, kind="yt_like", primary_video_id="v", secondary_video_id=None),
+    ]
+    skips: list[SkipRecord] = []
+
+    s = summarize(actions, skips)
+
+    assert "yt_like: 1" in s
+    assert "51" in s
+
+
 # ---------------------------------------------------------------------------
 # execute — happy paths
 # ---------------------------------------------------------------------------
@@ -883,6 +952,139 @@ def test_execute_ytm_like_verify_raises_keeps_status_open(session: Session) -> N
     assert len(rows) == 3
     assert rows[2].kind == "ytm_like_verify"
     assert rows[2].status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# execute — yt_like paths
+# ---------------------------------------------------------------------------
+
+
+def test_execute_yt_like_success(session: Session) -> None:
+    """rate_video(like) succeeds and is_in_liked_videos confirms → two applied rows, item='applied'."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="yl")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_YTMUSIC_ONLY,
+        source_track=t,
+    )
+    session.commit()
+    original_reason = item.reason
+
+    yt = FakeYouTube(in_likes={"song"})
+    ytm = FakeYTMusic()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert yt.calls == [("song", "like")]
+    session.refresh(item)
+    assert item.status == "applied"
+    assert item.reason == original_reason
+    rows = _attempts_for(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        ("yt_like_yt_rate", "applied"),
+        ("yt_like_verify", "applied"),
+    ]
+
+
+def test_execute_yt_like_cross_prop_skipped(session: Session) -> None:
+    """rate_video(like) succeeds but video not in liked videos → verify row skipped, item.status='skipped'."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="yl")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_YTMUSIC_ONLY,
+        source_track=t,
+    )
+    session.commit()
+
+    yt = FakeYouTube(in_likes=set())  # empty → is_in_liked_videos returns False
+    ytm = FakeYTMusic()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    session.refresh(item)
+    assert item.status == "skipped"
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 2
+    verify_row = rows[1]
+    assert verify_row.kind == "yt_like_verify"
+    assert verify_row.status == "skipped"
+
+
+def test_execute_yt_like_yt_rate_fails(session: Session) -> None:
+    """rate_video raises → one yt_like_yt_rate failed row, item.status stays 'open'."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="yl")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_YTMUSIC_ONLY,
+        source_track=t,
+    )
+    session.commit()
+
+    yt = FakeYouTube(raise_on={("song", "like")})
+    ytm = FakeYTMusic()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 1
+    assert rows[0].kind == "yt_like_yt_rate"
+    assert rows[0].status == "failed"
+
+
+def test_execute_yt_like_verify_raises_keeps_status_open(session: Session) -> None:
+    """is_in_liked_videos raises → two rows, yt_like_verify is failed, item.status stays 'open'."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="yl")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_YTMUSIC_ONLY,
+        source_track=t,
+    )
+    session.commit()
+
+    yt = FakeYouTube(
+        in_likes={"song"},
+        raise_is_in_liked_videos=YouTubeWriteError("song", "verify", "boom"),
+    )
+    ytm = FakeYTMusic()
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts_for(session, item.id)
+    assert len(rows) == 2
+    assert rows[1].kind == "yt_like_verify"
+    assert rows[1].status == "failed"
 
 
 def test_execute_yt_relike_both_succeed(session: Session) -> None:

@@ -304,15 +304,20 @@ def test_auth_youtube_converts_invalid_region_to_fail(
 class _FakeYouTubeWrite:
     """Stub for the `sync` write path. Records rate_video calls and
     has_write_scope queries; configurable to fail on specific (video_id, rating)
-    pairs or to report a missing scope."""
+    pairs or to report a missing scope.
+
+    ``in_liked_videos`` controls which video ids are returned as present by
+    ``is_in_liked_videos`` (set class-level between tests)."""
 
     instances: list[_FakeYouTubeWrite] = []
     has_write_scope_return: bool = True
     rate_raise_on: set[tuple[str, str]] = set()
+    in_liked_videos: set[str] = set()
 
     def __init__(self, **kwargs: Any) -> None:
         self.scope_calls: int = 0
         self.rate_calls: list[tuple[str, str]] = []
+        self.is_in_liked_videos_calls: list[str] = []
         type(self).instances.append(self)
 
     def has_write_scope(self) -> bool:
@@ -325,6 +330,10 @@ class _FakeYouTubeWrite:
         self.rate_calls.append((video_id, rating))
         if (video_id, rating) in type(self).rate_raise_on:
             raise YouTubeWriteError(video_id, rating, "boom")
+
+    def is_in_liked_videos(self, video_id: str) -> bool:
+        self.is_in_liked_videos_calls.append(video_id)
+        return video_id in type(self).in_liked_videos
 
 
 class _FakeYTMusicWrite:
@@ -369,6 +378,7 @@ def _reset_sync_fakes(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
     _FakeYouTubeWrite.instances = []
     _FakeYouTubeWrite.has_write_scope_return = True
     _FakeYouTubeWrite.rate_raise_on = set()
+    _FakeYouTubeWrite.in_liked_videos = set()
     _FakeYTMusicWrite.instances = []
     _FakeYTMusicWrite.raise_on = set()
     _FakeYTMusicWrite.raise_on_unlike = set()
@@ -498,6 +508,7 @@ def test_sync_dry_run_prints_plan_and_writes_nothing(
         ISSUE_POINTER_DRIFT,
         ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
         ISSUE_UNAVAILABLE_VIDEO,
+        ISSUE_YTMUSIC_ONLY,
     )
     from likesurgeon.models import SyncAttempt
 
@@ -507,8 +518,9 @@ def test_sync_dry_run_prints_plan_and_writes_nothing(
             ISSUE_UNAVAILABLE_VIDEO,
             ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
             ISSUE_POINTER_DRIFT,
+            ISSUE_YTMUSIC_ONLY,
         ],
-        confidences=[1.0, 0.9, 0.99],
+        confidences=[1.0, 0.9, 0.99, 1.0],
     )
 
     runner = CliRunner()
@@ -519,6 +531,7 @@ def test_sync_dry_run_prints_plan_and_writes_nothing(
     assert "yt_unlike: 1" in result.output
     assert "ytm_like: 1" in result.output
     assert "yt_relike: 1" in result.output
+    assert "yt_like: 1" in result.output
 
     s = _open_db(fake_home)
     try:
@@ -744,6 +757,79 @@ def test_sync_ytm_only_run_requires_youtube_scope(
     assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_0", "none"), ("src_0", "like")]
     # like_song was NOT called (new flow uses rate_video, not like_song).
     assert _FakeYTMusicWrite.instances[0].like_song_calls == []
+
+
+def test_sync_yt_like_missing_write_scope_blocks_run(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """yt_like is in needs_youtube → missing write scope blocks the run before any rate_video call."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
+    from likesurgeon.models import SyncAttempt
+
+    _seed_diagnosis(fake_home, issue_types=[ISSUE_YTMUSIC_ONLY])
+    _FakeYouTubeWrite.has_write_scope_return = False
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "write scope" in result.output
+    # YouTubeClient was built (for the scope check), but rate_video was not called.
+    assert len(_FakeYouTubeWrite.instances) == 1
+    assert _FakeYouTubeWrite.instances[0].rate_calls == []
+    # YTMusicClient was never built — scope failure short-circuits before that.
+    assert _FakeYTMusicWrite.instances == []
+    s = _open_db(fake_home)
+    try:
+        from sqlalchemy import select as _select
+
+        rows = list(s.scalars(_select(SyncAttempt)).all())
+    finally:
+        s.close()
+    assert rows == []
+
+
+def test_sync_yt_like_happy_path(
+    fake_home: Path,
+    patch_sync_clients: None,
+) -> None:
+    """yt_like: rate_video(like) called, is_in_liked_videos called, two SyncAttempt rows, item applied."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
+    from likesurgeon.models import DiagnosisItem, SyncAttempt
+
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_YTMUSIC_ONLY])
+    item_id = ids[ISSUE_YTMUSIC_ONLY]
+    # is_in_liked_videos must return True for src_0.
+    _FakeYouTubeWrite.in_liked_videos = {"src_0"}
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "applied=1" in result.output
+    assert "failed=0" in result.output
+
+    yt = _FakeYouTubeWrite.instances[0]
+    # rate_video(like) was called.
+    assert ("src_0", "like") in yt.rate_calls
+    # is_in_liked_videos was called.
+    assert "src_0" in yt.is_in_liked_videos_calls
+
+    s = _open_db(fake_home)
+    try:
+        item = s.get(DiagnosisItem, item_id)
+        assert item.status == "applied"
+        attempts = list(s.scalars(select(SyncAttempt).order_by(SyncAttempt.id)).all())
+        kinds_statuses = [(a.kind, a.status) for a in attempts]
+        assert ("yt_like_yt_rate", "applied") in kinds_statuses
+        assert ("yt_like_verify", "applied") in kinds_statuses
+    finally:
+        s.close()
 
 
 def test_sync_limit_truncates_actions_and_leaves_rest_open(
