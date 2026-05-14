@@ -52,6 +52,7 @@ ActionKind = Literal["yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedup
 _DispatchOutcome = Literal["applied", "skipped", "failed"]
 
 _YTM_LIKE_VERIFY_WAIT_SECONDS = 5
+_YT_LIKE_VERIFY_WAIT_SECONDS = 5
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -490,6 +491,14 @@ def _dispatch(
             video_id=action.primary_video_id,
         )
 
+    if action.kind == "yt_like":
+        return _try_yt_like(
+            session,
+            action.item_id,
+            yt=yt,
+            video_id=action.primary_video_id,
+        )
+
     if action.kind == "yt_relike":
         # like first, unlike only on like-success — see plan Decision 5
         # ("safe fail": unlike failure leaves a duplicate like the next
@@ -667,6 +676,88 @@ def _try_ytm_like(
             kind="ytm_like_verify",
             status="skipped",
             reason="not observed within first 10000 liked songs after +5s",
+        )
+    )
+    return "skipped"
+
+
+def _try_yt_like(
+    session: Session,
+    item_id: int,
+    *,
+    yt: YouTubeClient,
+    video_id: str,
+) -> _DispatchOutcome:
+    """Like a video on YouTube and verify it landed in Liked Videos.
+
+    Unlike ``_try_ytm_like``, ``videos.rate("like")`` is idempotent — no
+    unlike-then-relike toggle is required. Two ``SyncAttempt`` rows are
+    recorded (one per step).
+
+    Outcomes:
+      * ``"applied"`` — ``rate("like")`` succeeded and ``is_in_liked_videos``
+        confirmed the video is present.
+      * ``"skipped"`` — ``rate("like")`` succeeded but the video was not
+        observed in Liked Videos within the verify window. Terminal: this
+        usually means a region/license restriction prevents the like from
+        taking effect. ``DiagnosisItem.status`` flips to ``"skipped"`` via
+        the existing ``execute()`` outcome-routing — no new code in
+        ``execute()`` is needed.
+      * ``"failed"`` — any ``YouTubeWriteError`` on either step.
+        ``DiagnosisItem.status`` stays ``"open"`` so the next run retries.
+    """
+    # Step 1: YouTube rate("like")
+    try:
+        yt.rate_video(video_id, "like")
+    except YouTubeWriteError as exc:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="yt_like_yt_rate",
+                status="failed",
+                reason=str(exc),
+            )
+        )
+        return "failed"
+    session.add(
+        SyncAttempt(
+            diagnosis_item_id=item_id,
+            kind="yt_like_yt_rate",
+            status="applied",
+            reason="rate(like) ok",
+        )
+    )
+
+    # Step 2: cross-prop wait + verify
+    time.sleep(_YT_LIKE_VERIFY_WAIT_SECONDS)
+    try:
+        present = yt.is_in_liked_videos(video_id)
+    except YouTubeWriteError as exc:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="yt_like_verify",
+                status="failed",
+                reason=str(exc),
+            )
+        )
+        return "failed"
+    if present:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id,
+                kind="yt_like_verify",
+                status="applied",
+                reason="present in youtube liked videos",
+            )
+        )
+        return "applied"
+    session.add(
+        SyncAttempt(
+            diagnosis_item_id=item_id,
+            kind="yt_like_verify",
+            status="skipped",
+            reason="not observed in youtube liked videos after +5s",
         )
     )
     return "skipped"
