@@ -33,6 +33,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 | **0.7**     | `possibly_missing_from_ytmusic` sync rewrite: replaces silent-no-op `rate_song("LIKE")` with `videos.rate("none") → videos.rate("like") → 5s wait → is_in_liked_songs verify`. 3-way outcome (`applied` / `skipped` / `failed`); terminal `skipped` on verify-miss prevents the 0.4-0.6 re-fire-on-every-sync noise. `YouTubeClient.rate_video` gains transparent retry (2× on 5xx/429, backoff 0.5s/1.0s). |
 | **0.7.1**   | `unavailable_video` no longer includes `region_blocked` vids. Region restrictions can lift between scans — auto-unliking a region-blocked vid would permanently lose the like if it becomes available again. |
 | **0.8**     | YouTube ingestion switches `artists` source to `videoOwnerChannelTitle` (with `channelTitle` fallback); strips ` - Topic` suffix from `artists` for matching/display. Requires a one-time `scan youtube-likes` to repopulate `artists`; first post-upgrade `compare-likes` will show a `metadata_drift` spike (migration noise). |
+| **0.9**     | Config key `fuzzy_threshold` (in `~/.like-surgeon/config.json`) tunes the RapidFuzz cross-source match cutoff. Default `85`. Range `[0, 100]`. Lowering increases recall on real drift but also raises false-positive `possible_pointer_drift` risk — drift sync runs fail-safe (like-then-unlike) but can still mis-match. |
 | 1.0         | Local web UI / Electron app                                           |
 
 ## Install
@@ -114,6 +115,17 @@ The first run prints a 6-step setup walkthrough that ends with you placing a `yo
 ```
 
 Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) code for your country. Without this, `scan youtube-likes` prints a one-time warning and falls back to status-only ghost detection (the 0.3 behavior).
+
+You can also tune the RapidFuzz cross-source match cutoff with `fuzzy_threshold` (default `85`, range `[0, 100]`):
+
+```json
+{
+  "region": "KR",
+  "fuzzy_threshold": 80
+}
+```
+
+Lowering `fuzzy_threshold` increases recall on real drift but also raises false-positive `possible_pointer_drift` risk.
 
 ```bash
 uv run likesurgeon scan ytmusic                 # YT Music likes
