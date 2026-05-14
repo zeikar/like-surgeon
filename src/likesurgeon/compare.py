@@ -8,9 +8,11 @@ is a JSON-encoded string); tests pass a lightweight stand-in with
 list/tuple ``artists``. ``_normalize_artists`` accepts either shape.
 
 Three-stage matching, in order of confidence:
-    1. ``video_id`` exact (highest confidence)
-    2. ``canonical_key`` exact (decoration-robust)
-    3. RapidFuzz fuzzy on ``"<title> | <artists>"`` (last resort)
+    1. ``video_id`` exact (highest confidence) — iterates ALL YouTube rows,
+       bypassing the ``is_music_candidate`` classifier filter.
+    2. ``canonical_key`` exact (decoration-robust) — same, bypasses filter.
+    3. RapidFuzz fuzzy on ``"<title> | <artists>"`` (last resort) —
+       classifier-filtered (``is_music_candidate=True`` only).
 
 **Multiset semantics.** A snapshot may contain duplicate rows for the same
 ``track_id`` (Task 6 policy in 0.1: "scans are recorded faithfully"). The
@@ -256,9 +258,16 @@ def compare_likes(inp: CompareInput) -> CompareResult:
     surplus that lands in the unmatched buckets rather than getting
     silently collapsed.
     """
-    # Music-only YT candidates participate in matching, but the original
-    # positions are preserved so non-music YT rows still count toward
-    # ``youtube_total_count``.
+    # Two iteration lists over inp.youtube:
+    #   youtube_all   — every row; used by Stage 1 & 2 (exact-identity) so that
+    #                   videos misclassified by the music-candidate filter (e.g.
+    #                   artist names containing hyphens) are still matched when
+    #                   an exact video_id or canonical_key exists in YT Music.
+    #   youtube_music — classifier-filtered (is_music_candidate=True); used by
+    #                   Stage 3 (fuzzy), possibly_missing, and youtube_music_count.
+    # Original enumerate indices are preserved so both lists share the same
+    # index space and non-music rows still count toward youtube_total_count.
+    youtube_all: list[tuple[int, _Itemish]] = list(enumerate(inp.youtube))
     youtube_music: list[tuple[int, _Itemish]] = [
         (idx, it) for idx, it in enumerate(inp.youtube) if it.is_music_candidate
     ]
@@ -293,7 +302,7 @@ def compare_likes(inp: CompareInput) -> CompareResult:
         if it.video_id:
             by_video_id_ytm.setdefault(it.video_id, []).append(idx)
 
-    for yt_idx, yt in youtube_music:
+    for yt_idx, yt in youtube_all:
         if yt_idx in used_yt_idx or not yt.video_id:
             continue
         candidates = by_video_id_ytm.get(yt.video_id)
@@ -309,7 +318,7 @@ def compare_likes(inp: CompareInput) -> CompareResult:
     for idx, it in enumerate(inp.ytmusic):
         by_canon_ytm.setdefault(it.canonical_key, []).append(idx)
 
-    for yt_idx, yt in youtube_music:
+    for yt_idx, yt in youtube_all:
         if yt_idx in used_yt_idx:
             continue
         candidates = by_canon_ytm.get(yt.canonical_key)
