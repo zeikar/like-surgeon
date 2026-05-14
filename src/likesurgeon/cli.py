@@ -917,7 +917,11 @@ def sync(
         # ytm_dedupe is ytmusic-only; not in needs_youtube.
         # ytm_like uses YouTube rate_video (unlike+relike) to cross-prop into LM,
         # so it needs YouTube write scope too.
-        needs_youtube = any(a.kind in {"yt_unlike", "yt_relike", "ytm_like"} for a in actions)
+        # yt_like cross-props in the reverse direction (YT Music → YouTube) via
+        # videos.rate("like") + verify, so it also needs YouTube write scope.
+        needs_youtube = any(
+            a.kind in {"yt_unlike", "yt_relike", "ytm_like", "yt_like"} for a in actions
+        )
         from .youtube_client import YouTubeClient
 
         yt = YouTubeClient(
