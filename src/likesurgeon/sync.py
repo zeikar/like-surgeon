@@ -14,11 +14,15 @@ Invariants:
     as ``"open"`` so the next ``sync`` run re-evaluates. Exception:
     ``ytm_dedupe`` is non-idempotent and flips to ``"applied"`` after any
     attempt (success or failure) to prevent auto-retry over-removal.
-    ``"skipped"`` is a terminal non-failure outcome: set by the planner
-    for plan-time skips (no video_id, below confidence threshold, etc.)
-    and code-set by ``_try_ytm_like`` / ``_try_yt_like`` on cross-prop
-    verify-miss. Items at ``"skipped"`` are not re-attempted on the next
-    run; flip ``DiagnosisItem.status`` to ``"open"`` via SQL to retry.
+    ``"skipped"`` is a terminal non-failure outcome, code-set by
+    ``_try_ytm_like`` / ``_try_yt_like`` on cross-prop verify-miss (or set
+    manually by the operator). Items at ``"skipped"`` are not re-attempted
+    on the next run; flip ``DiagnosisItem.status`` to ``"open"`` via SQL to
+    retry. Note: a *planner-level* skip (no video_id, below confidence
+    threshold, unsupported duplicate shape) only writes a ``SyncAttempt``
+    audit row — the ``DiagnosisItem`` stays ``"open"`` and is re-evaluated
+    next run (so e.g. lowering ``--drift-min-confidence`` picks up
+    borderline drifts later). Plan-time skip ≠ terminal ``"skipped"``.
   * Per-action commit cadence: a crash mid-run preserves prior actions'
     SyncAttempt rows AND any status updates already committed. Drift's
     two HTTP calls count as one action (one commit).
