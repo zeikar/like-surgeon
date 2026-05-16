@@ -179,6 +179,25 @@ uv run likesurgeon sync --drift-min-confidence 1.0 # only apply 100%-confidence 
 | `metadata_drift` | — | — | — | never | Informational only. Title/artist drift is signal for the user, not a write target. |
 | `duplicate_in_source` | YT Music unlike (-1 entry) | — | `rate_song("INDIFFERENT")` | ytmusic source, **N=2 only** | Removes one LM entry per finding. **Non-idempotent** (validated for N=2; N≥3 unvalidated → skip). Terminal after attempt — failures are NOT auto-retried within the same Diagnosis (avoids over-removing if the server processed but the client errored). Real failures self-correct via the next `compare-likes`. Propagation is minute-scale — wait a few minutes between a dedupe `sync` and the next `scan ytmusic` / `compare-likes`. |
 
+#### Why each finding occurs
+
+Understanding the *origin* of a finding matters because several of them are different faces of the same underlying YT Music behavior.
+
+- **`unavailable_video`** — a YouTube video you liked later went private / deleted / rejected / unavailable. The like persists but points at a dead vid. (`region_blocked` is deliberately **excluded** since 0.7.1: restrictions lift between days, so unliking would permanently lose the like.)
+- **`possibly_missing_from_ytmusic`** — you liked a music video on the YouTube side (app/site) that was never liked from YT Music, so it has no YT Music Liked Song counterpart.
+- **`possible_pointer_drift`** and **`ytmusic_only`** are *two faces of the YT Music license-relink mechanism*:
+  - Song **A** is liked (video_id A, liked on both YouTube and YT Music). Its license expires → A becomes region-blocked / unplayable.
+  - YT Music auto-creates a replacement track **B** (new video_id) for the same song and **moves your YT Music like to B automatically**. YouTube keeps the old like on **A** (this is not propagated back).
+  - If B still fuzzy-matches A by title/artist → detected as **`possible_pointer_drift`** (re-point the YouTube like A → B).
+  - If B's title/artist diverged too far for the fuzzy matcher (the `fuzzy_threshold` cutoff, 0.9) → the drift is *missed* and B surfaces as a brand-new **`ytmusic_only`** instead. So a chunk of `ytmusic_only` findings are really undetected pointer drifts.
+- **`metadata_drift`** — same video_id on both sides, but the title/artist text changed (re-upload, channel rename, YT Music metadata correction). Informational only.
+- **`duplicate_in_source`** — the same video_id is liked more than once within one source's list. Two origins:
+  - *Historical*: the 0.4-era drift sync used the non-idempotent `rate_song(LIKE)`, which appends a new LM entry on every call.
+  - *Cross-prop induced (0.10)*: `yt_like` on a `ytmusic_only` track likes B on YouTube; YT Music cross-propagates that like back into Liked Songs **alongside the entry it already had**, so B ends up liked twice in YT Music.
+
+> **Known limitation (0.10.0): the `yt_like` → `duplicate_in_source` → `ytm_dedupe` cycle is self-reverting.**
+> `ytm_dedupe`'s `rate_song("INDIFFERENT")` is *rating-level*, not occurrence-level. When the duplicate was created by a still-live cross-prop link (the 0.10 origin above), setting the rating to INDIFFERENT to drop the extra LM entry **also round-trips to YouTube and removes the `yt_like` like**, returning to the original `ytmusic_only` state. Net effect: `yt_like` followed by `ytm_dedupe` of the dup it created is a no-op (quota spent, no durable change). The historical-origin dups don't have this problem because they have no live YouTube counterpart. Occurrence-level LM removal is not exposed by `ytmusicapi`, so a clean resolution is an open design question — **do not `ytm_dedupe` a `yt_like`-induced dup expecting the YouTube like to survive.** Verified live on the maintainer's library (5/5 reverted).
+
 #### State model
 
 - Each HTTP call (or skip decision) writes one `SyncAttempt` row with `kind`, `status` (`applied`/`failed`/`skipped`), and a `reason`. The originating `DiagnosisItem.reason` (the diagnosis-time evidence) is **never overwritten** — sync detail lives on `SyncAttempt.reason` instead.
