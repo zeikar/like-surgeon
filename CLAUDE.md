@@ -29,6 +29,8 @@ How that single event surfaces across `issue_type`s:
 
 Consequence for design judgement: `possible_pointer_drift`, `ytmusic_only`, `unavailable_video`, and `duplicate_in_source` are frequently **four views of the same relinked song**, not independent problems. A change that "fixes" one bucket often just moves the song into another bucket. Always reason about the full A→B lifecycle, not the single finding in front of you.
 
+**Attempted fix, PARKED — do not re-derive.** Auto-associating relink-origin `ytmusic_only` B with its dead `unavailable_video` original A (→ `possible_pointer_drift`, resolved by existing `yt_relike`) was researched/planned/reviewed twice (`.hyperclaude/`, slug `scoped-title-based-association-of`) and parked: title-only matching is an intrinsic false-positive magnet (a version-token vocabulary is unavoidable — must tell `(하루하루)` translation from `(Remix)` version decoration) and a wrong pair feeds destructive like-then-unlike drift sync. So **relink-origin `ytmusic_only` is manual-only** (user likes B / unlikes A on YouTube by hand). Don't revive title-only auto-association without solving false-positive containment first. The two YT-Music-write alternatives are also dead ends: `yt_like` self-reverts via `ytm_dedupe` (below); "2× YTM unlike + 1× YT like" is refuted — the relink-orphaned LM entry is sticky/unremovable via the YTM rating API.
+
 ## Releases
 
 Cut a git tag **and** a GitHub release at every milestone bump (0.4.0, 0.4.1, 0.5.0, ...). Without these two artifacts there's no quick changelog and no rollback target — they're cheap, do them every time.
