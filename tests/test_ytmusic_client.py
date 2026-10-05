@@ -14,7 +14,6 @@ from likesurgeon.ytmusic_client import (
     AuthFileMissingError,
     UnexpectedResponseError,
     YTMusicClient,
-    YTMusicWriteError,
 )
 
 
@@ -85,94 +84,6 @@ def test_fetch_liked_songs_raises_when_tracks_not_list():
         client.fetch_liked_songs()
 
 
-def test_is_in_liked_songs_present() -> None:
-    """Returns True when the video_id appears in any track dict."""
-    payload = {
-        "tracks": [
-            {"videoId": "other", "title": "X"},
-            {"videoId": "target", "title": "Y"},
-        ]
-    }
-    client = _FakeClient(payload)
-    assert client.is_in_liked_songs("target") is True
-
-
-def test_is_in_liked_songs_absent() -> None:
-    """Returns False when no track dict matches the video_id."""
-    payload = {"tracks": [{"videoId": "other", "title": "X"}]}
-    client = _FakeClient(payload)
-    assert client.is_in_liked_songs("target") is False
-
-
-def test_is_in_liked_songs_non_dict_elements() -> None:
-    """ytmusicapi has historically returned ``None`` / non-dict entries for
-    unavailable tracks. Those must be skipped, not raise ``AttributeError``,
-    so a present videoId is still detected alongside garbage entries."""
-    payload = {"tracks": [None, "oops", {"videoId": "song"}]}
-    client = _FakeClient(payload)
-    assert client.is_in_liked_songs("song") is True
-
-
-def test_is_in_liked_songs_propagates_unexpected_response() -> None:
-    """``UnexpectedResponseError`` from ``fetch_liked_songs`` must propagate —
-    callers need to distinguish "song not in LM" from "we couldn't check"."""
-    client = _FakeClient({})  # missing 'tracks' → UnexpectedResponseError
-    with pytest.raises(UnexpectedResponseError, match="missing 'tracks'"):
-        client.is_in_liked_songs("anything")
-
-
-class _RatingFakeYTMusic:
-    """Records ``rate_song`` calls; optionally raises a chosen exception."""
-
-    def __init__(self, raise_with: Exception | None = None) -> None:
-        self.calls: list[tuple[str, str]] = []
-        self._raise = raise_with
-
-    def rate_song(self, video_id: str, rating: str) -> None:
-        self.calls.append((video_id, rating))
-        if self._raise is not None:
-            raise self._raise
-
-
-class _RatingClient(YTMusicClient):
-    def __init__(self, fake: _RatingFakeYTMusic) -> None:
-        super().__init__(browser_path=None)
-        self.fake = fake
-
-    def _build(self) -> Any:
-        return self.fake
-
-
-def test_unlike_song_calls_rate_song_with_INDIFFERENT() -> None:
-    """``unlike_song`` always passes ``"INDIFFERENT"`` — no other rating flows through."""
-    fake = _RatingFakeYTMusic()
-    client = _RatingClient(fake)
-    client.unlike_song("vid42")
-    assert fake.calls == [("vid42", "INDIFFERENT")]
-
-
-def test_unlike_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
-    """ytmusicapi can raise a wide range of exception types from rate_song.
-    Surface them all as ``YTMusicWriteError`` so the dispatcher's failure
-    path doesn't have to fingerprint each one."""
-    fake = _RatingFakeYTMusic(raise_with=RuntimeError("boom"))
-    client = _RatingClient(fake)
-    with pytest.raises(YTMusicWriteError) as exc_info:
-        client.unlike_song("vid99")
-    assert exc_info.value.video_id == "vid99"
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
-
-
-def test_unlike_song_wraps_build_failure_as_write_error() -> None:
-    """A missing auth file must surface as a per-item ``YTMusicWriteError`` —
-    the ``sync`` dispatcher only catches that, so an unwrapped
-    ``AuthFileMissingError`` would abort every remaining action."""
-    client = YTMusicClient(browser_path=Path("/nonexistent"))
-    with pytest.raises(YTMusicWriteError) as exc_info:
-        client.unlike_song("vid")
-    assert isinstance(exc_info.value.__cause__, AuthFileMissingError)
-
-
 def test_build_with_corrupt_auth_file_raises_auth_file_missing(tmp_path: Path) -> None:
     """A truncated/garbled browser.json is "no usable auth file" — same
     exception (and recovery) as the missing case, not a raw JSONDecodeError."""
@@ -191,8 +102,8 @@ def test_build_with_corrupt_auth_file_raises_auth_file_missing(tmp_path: Path) -
 )
 def test_fetch_liked_songs_wraps_request_failures_as_unexpected_response(exc) -> None:
     """Transport errors and ytmusicapi server errors (e.g. 401 on stale
-    cookies) must arrive as ``UnexpectedResponseError`` so ``sync``'s verify
-    step records a failed attempt instead of escaping the dispatcher loop."""
+    cookies) must arrive as ``UnexpectedResponseError`` so a failed ``sync`` LM
+    read stops the run cleanly instead of escaping the dispatcher loop."""
 
     class _RaisingFake:
         def get_liked_songs(self, limit: int) -> Any:
@@ -208,41 +119,6 @@ def test_fetch_liked_songs_wraps_request_failures_as_unexpected_response(exc) ->
     with pytest.raises(UnexpectedResponseError, match="request failed") as exc_info:
         _Client().fetch_liked_songs()
     assert exc_info.value.__cause__ is exc
-
-
-class _PagedClient(YTMusicClient):
-    """Serves the first ``limit`` entries of ``tracks`` and records each limit."""
-
-    def __init__(self, tracks: list[dict[str, Any]]) -> None:
-        super().__init__(browser_path=None)
-        self._tracks = tracks
-        self.limits: list[int | None] = []
-
-    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
-        self.limits.append(limit)
-        return self._tracks[:limit]
-
-
-def test_is_in_liked_songs_hit_in_first_fetch_skips_full_scan() -> None:
-    client = _PagedClient([{"videoId": "new"}] + [{"videoId": f"o{i}"} for i in range(500)])
-    assert client.is_in_liked_songs("new") is True
-    assert client.limits == [100]
-
-
-def test_is_in_liked_songs_miss_in_first_fetch_falls_back_to_full_limit() -> None:
-    """A song placed below the first page must still be found — a false miss
-    would be recorded as a terminal 'skipped'."""
-    tracks = [{"videoId": f"o{i}"} for i in range(500)] + [{"videoId": "deep"}]
-    client = _PagedClient(tracks)
-    assert client.is_in_liked_songs("deep") is True
-    assert client.limits == [100, 10000]
-    assert client.is_in_liked_songs("absent") is False
-
-
-def test_is_in_liked_songs_small_limit_fetches_once() -> None:
-    client = _PagedClient([{"videoId": "x"}])
-    assert client.is_in_liked_songs("absent", limit=50) is False
-    assert client.limits == [50]
 
 
 def test_missing_auth_raises():

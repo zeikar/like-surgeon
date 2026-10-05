@@ -72,8 +72,8 @@ class YouTubeWriteError(RuntimeError):
 class YouTubeQuotaExceededError(YouTubeWriteError):
     """The daily Data API quota is spent. Every further call this run would
     fail the same way, so ``sync`` stops instead of walking the rest of the
-    plan (which, for ``ytm_like``'s unlike→relike pair, could strand a video
-    unliked)."""
+    plan (after the action in flight finishes its YT Music check and any
+    re-like of a video it unliked)."""
 
 
 @dataclass(frozen=True)
@@ -469,8 +469,8 @@ class YouTubeClient:
         ``rating`` field equals ``"like"``; returns ``False`` on empty ``items``
         or any other rating value (``"none"``, ``"dislike"``, ``"unspecified"``).
 
-        Used by ``_try_yt_like`` as the cross-propagation verify step (mirror of
-        ``YTMusicClient.is_in_liked_songs``). ``_service()`` auth errors and
+        Used by ``sync`` to confirm each ``videos.rate`` actually changed the
+        rating — a 2xx doesn't guarantee it. ``_service()`` auth errors and
         ``HttpError`` / transport exceptions are wrapped as
         ``YouTubeWriteError(video_id, "verify", ...)`` so the dispatcher's
         continue-on-error loop can attribute the failure to the specific action

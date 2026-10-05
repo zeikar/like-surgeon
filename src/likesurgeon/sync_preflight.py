@@ -1,7 +1,7 @@
 """Read-only DB checks the ``sync`` command runs before planning/writing.
 
 Kept apart from ``sync.py`` so the planner stays pure: these query the DB and
-hand ``sync.plan`` plain values (a video-id set) or the CLI warning strings.
+hand the CLI plain values (video ids, counts) or warning strings.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt
 from .snapshot import YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS, latest_snapshot
 from .sync import _video_ids_for_tracks
+from .sync_dispatch import QUOTA_REJECTED
 
 STALE_AFTER = timedelta(hours=1)
 
@@ -23,62 +24,80 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
-# Attempt kinds whose success means "we liked this video on YouTube".
-_YT_LIKE_KINDS = ("yt_like_yt_rate", "yt_relike_like")
+# Once A's unlike call has started, the newest of these rows per track says
+# whether A may be liked nowhere. Pre-alignment rows: the ``ytm_like`` re-like.
+_UNLIKE_KINDS = ("repoint_unlike", "unlike_shadow_unlike")
+_SETTLING_KINDS = (
+    *_UNLIKE_KINDS,
+    "interrupted",
+    "lm_check",
+    "restore_like",
+    "restore_verify",
+    "ytm_like_yt_relike",
+)
 
 
-def youtube_liked_video_ids(session: Session, diag: Diagnosis) -> frozenset[str] | None:
-    """Video ids the DB knows to be liked on YouTube, or ``None`` if unknown.
-
-    Union of the diagnosis's YouTube snapshot and every video a past
-    ``sync`` liked on YouTube (``yt_like`` / ``yt_relike``) — the latter
-    covers likes made after that snapshot was taken, which is exactly when
-    the ``yt_like`` → ``duplicate_in_source`` → ``ytm_dedupe`` loop starts.
-    ``None`` when the diagnosis has no YouTube snapshot (deleted): the set
-    would be incomplete, and the planner then treats every dedupe as unsafe.
-    Likes made by hand after the scan are invisible here — hence the
-    scan-age warning in ``diagnosis_staleness``.
-    """
-    if diag.youtube_snapshot_id is None:
-        return None
-    snapshot_vids = session.scalars(
-        select(SnapshotItem.video_id).where(SnapshotItem.snapshot_id == diag.youtube_snapshot_id)
-    )
-    ids = {vid for vid in snapshot_vids if vid}
-    rows = session.execute(
-        select(SyncAttempt.kind, DiagnosisItem.source_track_id, DiagnosisItem.related_track_id)
-        .join(DiagnosisItem, SyncAttempt.diagnosis_item_id == DiagnosisItem.id)
-        .where(
-            SyncAttempt.status == "applied",
-            SyncAttempt.kind.in_(_YT_LIKE_KINDS),
-        )
-    ).all()
-    # yt_like likes its ytmusic_only source track; yt_relike likes the
-    # drift's related (YT Music side) track.
-    track_ids = {src if kind == "yt_like_yt_rate" else rel for kind, src, rel in rows}
-    track_ids.discard(None)
-    ids.update(vid for vid in _video_ids_for_tracks(session, track_ids).values() if vid)
-    return frozenset(ids)
+def _may_be_unliked(kind: str, status: str, reason: str) -> bool:
+    if kind in _UNLIKE_KINDS:
+        # Nothing recorded after the unlike: the process died before its check.
+        # A quota-rejected unlike sent nothing.
+        return not reason.startswith(QUOTA_REJECTED)
+    # ``interrupted`` rows are always 'failed'. Otherwise the LM check or a
+    # re-like step came last: a failed re-like left A unliked, and a failed
+    # check that comes last never got its restore.
+    return status == "failed"
 
 
 def stranded_unliked_video_ids(session: Session) -> frozenset[str]:
-    """Videos a ``ytm_like`` unliked on YouTube whose most recent re-like failed.
+    """Videos a ``sync`` unliked on YouTube that may be liked nowhere now.
 
-    These are liked nowhere until a re-like lands (typically the quota ran
-    out between the two calls). Keyed by track across all diagnoses, so the
-    state survives a re-run of ``compare-likes``.
+    The newest settling row per track (``_may_be_unliked``) decides: an
+    ``interrupted`` row, an unlike with nothing after it (a hard kill), or a
+    failed re-like / restore. Keyed by track across all diagnoses, so the
+    state survives a re-run of ``compare-likes``. A video found in a YouTube
+    scan taken after that row has been re-liked since (by hand) and is dropped.
     """
-    last_relike_failed: dict[int, bool] = {}
-    for track_id, status in session.execute(
-        select(DiagnosisItem.source_track_id, SyncAttempt.status)
+    last_row: dict[int, tuple[bool, datetime]] = {}
+    for track_id, kind, status, reason, at in session.execute(
+        select(
+            DiagnosisItem.source_track_id,
+            SyncAttempt.kind,
+            SyncAttempt.status,
+            SyncAttempt.reason,
+            SyncAttempt.created_at,
+        )
         .join(DiagnosisItem, SyncAttempt.diagnosis_item_id == DiagnosisItem.id)
-        .where(SyncAttempt.kind == "ytm_like_yt_relike")
+        .where(SyncAttempt.kind.in_(_SETTLING_KINDS))
         .order_by(SyncAttempt.id)
     ):
         if track_id is not None:
-            last_relike_failed[track_id] = status == "failed"
-    stranded = {tid for tid, failed in last_relike_failed.items() if failed}
-    return frozenset(vid for vid in _video_ids_for_tracks(session, stranded).values() if vid)
+            last_row[track_id] = (_may_be_unliked(kind, status, reason), at)
+    unliked_at = {tid: at for tid, (unliked, at) in last_row.items() if unliked}
+    stranded = {
+        vid: unliked_at[tid]
+        for tid, vid in _video_ids_for_tracks(session, set(unliked_at)).items()
+        if vid
+    }
+    if not stranded:
+        return frozenset()
+    last_scanned_liked = dict(
+        session.execute(
+            select(SnapshotItem.video_id, func.max(Snapshot.created_at))
+            .join(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
+            .where(
+                Snapshot.source == YOUTUBE_LIKED_VIDEOS,
+                SnapshotItem.video_id.in_(list(stranded)),
+            )
+            .group_by(SnapshotItem.video_id)
+        )
+        .tuples()
+        .all()
+    )
+    return frozenset(
+        vid
+        for vid, at in stranded.items()
+        if vid not in last_scanned_liked or _as_utc(last_scanned_liked[vid]) <= _as_utc(at)
+    )
 
 
 def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> list[str]:
@@ -87,8 +106,8 @@ def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> 
     Per source: a newer scan exists than the one the diagnosis used (the
     user re-scanned but didn't re-run ``compare-likes``), or the scan it
     used is older than ``STALE_AFTER`` (likes may have changed on the
-    provider since — including a hand-made YouTube like the dedupe guard
-    can't see). Warning-only; blocking is left to the user.
+    provider since). Warning-only; blocking on our own writes is
+    ``sync_attempts_since_older_scan``.
     """
     warnings: list[str] = []
     for source, used_id in (
@@ -136,3 +155,17 @@ def sync_attempts_since(session: Session, since: datetime) -> int:
         )
         or 0
     )
+
+
+def sync_attempts_since_older_scan(session: Session, diag: Diagnosis) -> int:
+    """``sync_attempts_since`` the older of the two scans ``diag`` was built from.
+
+    A diagnosis whose scans are both gone (deleted) falls back to its own
+    creation time — after both scans, so a weaker check, but the one left.
+    """
+    scan_times = [
+        _as_utc(session.get(Snapshot, snap_id).created_at)
+        for snap_id in (diag.youtube_snapshot_id, diag.ytmusic_snapshot_id)
+        if snap_id is not None
+    ]
+    return sync_attempts_since(session, min(scan_times, default=_as_utc(diag.created_at)))

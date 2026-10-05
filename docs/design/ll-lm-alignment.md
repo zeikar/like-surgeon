@@ -69,8 +69,8 @@ For an LL video A rendered as B (availability from scan time):
 1. `videos.rate(B, like)`; wait 5 s; `getRating(B)` must be `like`, else stop (A untouched).
 2. `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
 
-**unlike shadow (A behind B)** — 51 units
-1. `getRating(B)` must be `like`; `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
+**unlike shadow (A behind B)** — 52 units
+1. `getRating(B)` must be `like` and LM must currently show B at least twice; `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
 
 **Post-action LM check (both actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1. If LM doesn't match (re-read once after 15 s), **re-like A** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting).
 

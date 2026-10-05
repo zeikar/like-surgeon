@@ -34,15 +34,6 @@ class UnexpectedResponseError(RuntimeError):
     """
 
 
-class YTMusicWriteError(RuntimeError):
-    """Raised when a write call (e.g. ``rate_song``) fails."""
-
-    def __init__(self, video_id: str, message: str) -> None:
-        super().__init__(f"YT Music write failed for {video_id}: {message}")
-        self.video_id = video_id
-        self.message = message
-
-
 class CookieExtractionError(RuntimeError):
     """Raised when we can't pull usable YouTube cookies from a browser.
 
@@ -74,8 +65,6 @@ SUPPORTED_BROWSERS = (
     "lynx",
 )
 
-
-_VERIFY_FIRST_FETCH = 100
 
 _YTM_ORIGIN = "https://music.youtube.com"
 _YTM_HOST = "music.youtube.com"
@@ -218,23 +207,6 @@ class YTMusicClient:
                 f"({type(exc).__name__}: {exc}). Re-run `likesurgeon auth ytmusic`."
             ) from exc
 
-    def unlike_song(self, video_id: str) -> None:
-        """Remove ONE LM-playlist entry for ``video_id`` via ``rate_song(..., "INDIFFERENT")``.
-
-        This is the only viable dedupe path: ``LIKE`` is non-idempotent (every call
-        appends to LM), and ``setVideoId`` isn't returned by ``get_liked_songs`` so
-        ``remove_playlist_items`` can't target a specific occurrence. Propagation is
-        eventually consistent on the order of minutes — see callers' cooldown notes.
-
-        ``_build()`` sits inside the try so an auth failure is recorded as a
-        per-item write failure instead of aborting the whole ``sync`` loop.
-        """
-        try:
-            client = self._build()
-            client.rate_song(video_id, "INDIFFERENT")
-        except Exception as exc:  # noqa: BLE001 — system-boundary catch
-            raise YTMusicWriteError(video_id, str(exc)) from exc
-
     def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Fetch up to ``limit`` liked songs (``None``: all). Returns the raw track dicts.
 
@@ -291,30 +263,6 @@ class YTMusicClient:
                 f"{type(tracks).__name__}, expected a list."
             )
         return list(tracks)
-
-    def is_in_liked_songs(self, video_id: str, *, limit: int = 10000) -> bool:
-        """Whether ``video_id`` appears in the user's current LM playlist.
-
-        Delegates to ``fetch_liked_songs`` so ``UnexpectedResponseError`` and
-        ``AuthFileMissingError`` propagate untouched — callers need to
-        distinguish "song not in LM" from "we couldn't check" to decide
-        whether retry / re-auth is appropriate.
-
-        Non-dict entries in the tracks list (defensive: ytmusicapi has
-        historically returned ``None`` for unavailable tracks) are skipped
-        rather than raising — a malformed entry shouldn't make a present
-        ``video_id`` look absent.
-
-        A fresh like lands at the top of LM, so a short first fetch settles
-        the common case; the full ``limit`` fetch only runs on a miss, which
-        keeps a non-top placement from being reported as absent.
-        """
-        tiers = (_VERIFY_FIRST_FETCH, limit) if limit > _VERIFY_FIRST_FETCH else (limit,)
-        for lim in tiers:
-            tracks = self.fetch_liked_songs(limit=lim)
-            if any(isinstance(t, dict) and t.get("videoId") == video_id for t in tracks):
-                return True
-        return False
 
 
 def write_browser_json_from_browser(browser: str, target: Path) -> None:

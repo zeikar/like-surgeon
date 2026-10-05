@@ -162,10 +162,8 @@ class DiagnosisItem(Base):
         of one source with meaningfully different title or artists.
       - ``duplicate_in_source`` — the same ``video_id`` appears more than
         once in a single snapshot (ytmusic accumulates these over time).
-        Actionable via ``ytm_dedupe`` (ytmusic source, N=2 only) as of 0.5.
-        Non-idempotent — ``status='applied'`` is set after attempt regardless
-        of outcome (carve-out from the standard 'applied = full success'
-        invariant; see ``sync.execute()`` docstring).
+        ``sync`` no longer acts on it: the ``ytm_dedupe`` action was removed
+        with the LL → LM alignment redesign.
     """
 
     __tablename__ = "diagnosis_items"
@@ -192,17 +190,19 @@ class DiagnosisItem(Base):
 
 
 class SyncAttempt(Base):
-    """One row per ``sync`` API call (or skip decision).
+    """One row per ``sync`` API call, LM check, or skip decision.
 
-    ``kind`` identifies the specific HTTP call (or skip decision). Known
-    values: ``yt_unlike``, ``ytm_like_yt_unlike``, ``ytm_like_yt_relike``,
-    ``ytm_like_verify``, ``yt_like_yt_rate``, ``yt_like_verify``,
-    ``yt_relike_like``, ``yt_relike_verify``, ``yt_relike_unlike``, ``ytm_dedupe``. Multi-step
-    actions (``ytm_like``, ``yt_like``, ``yt_relike``) emit one row per
-    step so the audit trail stays atomic per HTTP call. See ``sync.py``
-    for the authoritative list. ``status`` is one of ``applied``,
+    ``kind`` names the step: ``repoint_like``, ``repoint_verify``,
+    ``repoint_unlike``, ``repoint_unlike_verify``; ``unlike_shadow_precheck``,
+    ``unlike_shadow_unlike``, ``unlike_shadow_verify``; ``lm_check``;
+    ``restore_like``, ``restore_verify``; or the action kind (``repoint`` /
+    ``unlike_shadow``) for a plan-time skip, and ``interrupted`` when an action
+    stopped after A's unlike call started. See ``sync_dispatch.py`` for the
+    authoritative list. Rows written before the LL → LM alignment redesign may
+    carry legacy kinds (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``,
+    ``yt_relike_*``, ``ytm_dedupe``). ``status`` is one of ``applied``,
     ``failed``, ``skipped``. ``reason`` carries sync-side detail (error
-    message, threshold note, missing video_id, etc.) — the originating
+    message, LM diff, missing video_id, etc.) — the originating
     ``DiagnosisItem.reason`` is never overwritten.
     """
 

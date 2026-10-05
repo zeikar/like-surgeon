@@ -22,6 +22,8 @@ from typer.testing import CliRunner
 import likesurgeon.youtube_client as _yt_mod
 from likesurgeon.youtube_client import VideoStatus
 
+from .fake_account import FakeAccount
+
 
 def test_resolve_region_prefers_cli_over_config() -> None:
     from likesurgeon.cli import _resolve_region
@@ -351,28 +353,21 @@ def test_auth_youtube_converts_invalid_region_to_fail(
 # what we wrote. Clients are stubbed module-side so the function-local
 # `from .youtube_client import YouTubeClient` inside `sync` resolves to
 # the fake (matches the existing `scan_youtube_likes` pattern). YTMusicClient
-# is module-level on cli.py, so it's monkeypatched directly there.
+# is module-level on cli.py, so it's monkeypatched directly there. Both fakes
+# act on one ``FakeAccount`` (tests/fake_account.py).
 # ---------------------------------------------------------------------------
 
 
 class _FakeYouTubeWrite:
-    """Stub for the `sync` write path. Records rate_video calls and
-    has_write_scope queries; configurable to fail on specific (video_id, rating)
-    pairs or to report a missing scope.
-
-    ``in_liked_videos`` controls which video ids are returned as present by
-    ``is_in_liked_videos`` (set class-level between tests)."""
+    """``YouTubeClient`` for `sync`: likes live on the shared ``account``;
+    ``has_write_scope_return`` fakes a token without the write scope."""
 
     instances: list[_FakeYouTubeWrite] = []
     has_write_scope_return: bool = True
-    rate_raise_on: set[tuple[str, str]] = set()
-    rate_quota_on: set[tuple[str, str]] = set()
-    in_liked_videos: set[str] = set()
+    account: FakeAccount
 
     def __init__(self, **kwargs: Any) -> None:
-        self.scope_calls: int = 0
-        self.rate_calls: list[tuple[str, str]] = []
-        self.is_in_liked_videos_calls: list[str] = []
+        self.scope_calls = 0
         type(self).instances.append(self)
 
     def has_write_scope(self) -> bool:
@@ -380,131 +375,65 @@ class _FakeYouTubeWrite:
         return type(self).has_write_scope_return
 
     def rate_video(self, video_id: str, rating: str) -> None:
-        from likesurgeon.youtube_client import YouTubeWriteError
-
-        self.rate_calls.append((video_id, rating))
-        if (video_id, rating) in type(self).rate_quota_on:
-            from likesurgeon.youtube_client import YouTubeQuotaExceededError
-
-            raise YouTubeQuotaExceededError(video_id, rating, "quotaExceeded")
-        if (video_id, rating) in type(self).rate_raise_on:
-            raise YouTubeWriteError(video_id, rating, "boom")
+        type(self).account.rate_video(video_id, rating)
 
     def is_in_liked_videos(self, video_id: str) -> bool:
-        self.is_in_liked_videos_calls.append(video_id)
-        return video_id in type(self).in_liked_videos
+        return type(self).account.is_in_liked_videos(video_id)
 
 
 class _FakeYTMusicWrite:
-    """Stub for the YT Music half of `sync`. Records like_song and unlike_song calls."""
+    """``YTMusicClient`` for `sync`: liked songs are read off the shared ``account``."""
 
     instances: list[_FakeYTMusicWrite] = []
-    probe_error: Exception | None = None
-    raise_on: set[str] = set()
-    raise_on_unlike: set[str] = set()
-    in_library: set[str] = set()
+    account: FakeAccount
 
     def __init__(self, **kwargs: Any) -> None:
-        self.like_song_calls: list[str] = []
-        self.unlike_calls: list[str] = []
-        self.is_in_liked_songs_calls: list[tuple[str, int]] = []
         type(self).instances.append(self)
 
-    def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """The sync pre-flight auth probe."""
-        if type(self).probe_error is not None:
-            raise type(self).probe_error
-        return []
-
-    def like_song(self, video_id: str) -> None:
-        """Negative-assertion guard — _try_ytm_like must NOT call this."""
-        from likesurgeon.ytmusic_client import YTMusicWriteError
-
-        self.like_song_calls.append(video_id)
-        if video_id in type(self).raise_on:
-            raise YTMusicWriteError(video_id, "boom")
-
-    def is_in_liked_songs(self, video_id: str, *, limit: int = 10000) -> bool:
-        self.is_in_liked_songs_calls.append((video_id, limit))
-        return video_id in type(self).in_library
-
-    def unlike_song(self, video_id: str) -> None:
-        from likesurgeon.ytmusic_client import YTMusicWriteError
-
-        self.unlike_calls.append(video_id)
-        if video_id in type(self).raise_on_unlike:
-            raise YTMusicWriteError(video_id, "boom")
+    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        return type(self).account.fetch_liked_songs(limit)
 
 
 @pytest.fixture(autouse=True)
 def _reset_sync_fakes(monkeypatch: pytest.MonkeyPatch) -> Iterable[None]:
-    """Reset class-level recording state on the sync fakes between tests.
-    Also suppresses real sleeps in _try_ytm_like."""
-    monkeypatch.setattr("likesurgeon.sync.time.sleep", lambda _s: None)
+    """Reset class-level state on the sync fakes; no real sleeps in sync."""
+    monkeypatch.setattr("likesurgeon.sync_dispatch.time.sleep", lambda _s: None)
     _FakeYouTubeWrite.instances = []
     _FakeYouTubeWrite.has_write_scope_return = True
-    _FakeYouTubeWrite.rate_raise_on = set()
-    _FakeYouTubeWrite.rate_quota_on = set()
-    _FakeYouTubeWrite.in_liked_videos = set()
     _FakeYTMusicWrite.instances = []
-    _FakeYTMusicWrite.probe_error = None
-    _FakeYTMusicWrite.raise_on = set()
-    _FakeYTMusicWrite.raise_on_unlike = set()
-    _FakeYTMusicWrite.in_library = set()
     yield
 
 
 @pytest.fixture
-def patch_sync_clients(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Swap YouTubeClient / YTMusicClient with the sync fakes.
+def patch_sync_clients(monkeypatch: pytest.MonkeyPatch) -> FakeAccount:
+    """Swap YouTubeClient / YTMusicClient for the sync fakes, both backed by
+    the returned (empty) account.
 
     YouTubeClient is patched on the `youtube_client` module (function-local
     import). YTMusicClient is patched on `cli` (module-level import there).
     """
     import likesurgeon.cli as _cli_mod
 
+    account = FakeAccount([])
+    _FakeYouTubeWrite.account = account
+    _FakeYTMusicWrite.account = account
     monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakeYouTubeWrite)
     monkeypatch.setattr(_cli_mod, "YTMusicClient", _FakeYTMusicWrite)
+    return account
 
 
-_STAGE4_REASON = "enriched: channel=UCabcdef… + duration=200s + normalized title match"
-
-
-def _seed_diagnosis(
-    home: Path,
-    *,
-    issue_types: list[str],
-    confidences: list[float] | None = None,
-    reasons: list[str] | None = None,
-) -> dict[str, int]:
-    """Build a diagnosis on the CLI's on-disk DB and return item-id mapping.
-
-    Each issue type creates one DiagnosisItem with a fresh Track (and a
-    related Track for drift). Returns ``{issue_type: item_id}``.
-    """
-    from likesurgeon.db import init_db, make_engine, make_session_factory
-    from likesurgeon.diagnosis import (
-        ISSUE_POINTER_DRIFT,
-    )
+def _seed_diagnosis(home: Path, *, issue_types: list[str]) -> dict[str, int]:
+    """A diagnosis without scans on the CLI's on-disk DB, one item per issue
+    type, each with a fresh source Track. Returns ``{issue_type: item_id}``."""
     from likesurgeon.models import Diagnosis, DiagnosisItem, Track
 
-    home.mkdir(parents=True, exist_ok=True)
-    from likesurgeon.config import DEFAULT_DB_FILENAME
-
-    db_path = home / DEFAULT_DB_FILENAME
-    engine = make_engine(db_path)
-    init_db(engine)
-    factory = make_session_factory(engine)
-    confs = confidences or [1.0] * len(issue_types)
-    rsns = reasons or ["diagnosis-time evidence"] * len(issue_types)
-
     out: dict[str, int] = {}
-    s = factory()
+    s = _open_db(home)
     try:
         diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=None)
         s.add(diag)
         s.flush()
-        for i, (issue_type, conf, reason) in enumerate(zip(issue_types, confs, rsns, strict=True)):
+        for i, issue_type in enumerate(issue_types):
             src = Track(
                 source="youtube_liked_videos",
                 video_id=f"src_{i}",
@@ -515,26 +444,13 @@ def _seed_diagnosis(
             )
             s.add(src)
             s.flush()
-            related_id = None
-            if issue_type == ISSUE_POINTER_DRIFT:
-                rel = Track(
-                    source="ytmusic_liked_songs",
-                    video_id=f"rel_{i}",
-                    title=f"rel-{i}",
-                    artists="[]",
-                    canonical_key=f"rk-{i}",
-                    dedupe_key=f"rd-{i}",
-                )
-                s.add(rel)
-                s.flush()
-                related_id = rel.id
             item = DiagnosisItem(
                 diagnosis_id=diag.id,
                 issue_type=issue_type,
-                confidence=conf,
-                reason=reason,
+                confidence=1.0,
+                reason="diagnosis-time evidence",
                 source_track_id=src.id,
-                related_track_id=related_id,
+                related_track_id=None,
                 status="open",
             )
             s.add(item)
@@ -555,15 +471,92 @@ def _open_db(home: Path) -> Session:
     return make_session_factory(engine)()
 
 
+def _seed_pairs(home: Path, pairs: list[tuple[str, str, str, bool | None]]) -> list[int]:
+    """Real LL / LM scans and a diagnosis built from them, with one write-eligible
+    pair finding per ``(issue_type, A, B, A's availability)``. LL holds the A's
+    (availability as scanned; None = unknown), LM the B's. Returns item ids."""
+    from sqlalchemy import select
+
+    from likesurgeon.models import Diagnosis, DiagnosisItem, Track
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(home)
+    try:
+        ll_raw = []
+        for _, a, _, available in pairs:
+            raw = _yt_raw(a, f"Song {a}")
+            if available is not None:
+                raw["_likesurgeon_video_status"] = {
+                    "is_available": available,
+                    "reason": None if available else "deleted",
+                }
+            ll_raw.append(raw)
+        ll = create_snapshot(s, "youtube_liked_videos", ll_raw)
+        lm = create_snapshot(
+            s, "ytmusic_liked_songs", [_ytm_raw(b, f"Song {b}", ["X"]) for _, _, b, _ in pairs]
+        )
+        diag = Diagnosis(youtube_snapshot_id=ll.id, ytmusic_snapshot_id=lm.id)
+        s.add(diag)
+        s.flush()
+        track = {(t.source, t.video_id): t.id for t in s.scalars(select(Track))}
+        items = [
+            DiagnosisItem(
+                diagnosis_id=diag.id,
+                issue_type=issue_type,
+                confidence=1.0,
+                reason="diagnosis-time evidence",
+                source_track_id=track["youtube_liked_videos", a],
+                related_track_id=track["ytmusic_liked_songs", b],
+                status="open",
+            )
+            for issue_type, a, b, _ in pairs
+        ]
+        s.add_all(items)
+        s.commit()
+        return [it.id for it in items]
+    finally:
+        s.close()
+
+
+def _sync_rows(home: Path) -> tuple[dict[int, str], list[tuple[int, str, str]]]:
+    """Every finding's status, and every sync attempt as (item id, kind, status)."""
+    from sqlalchemy import select
+
+    from likesurgeon.models import DiagnosisItem, SyncAttempt
+
+    s = _open_db(home)
+    try:
+        statuses = {it.id: it.status for it in s.scalars(select(DiagnosisItem))}
+        attempts = [
+            (a.diagnosis_item_id, a.kind, a.status)
+            for a in s.scalars(select(SyncAttempt).order_by(SyncAttempt.id))
+        ]
+        return statuses, attempts
+    finally:
+        s.close()
+
+
+def _out(result: Any) -> str:
+    return " ".join(result.output.split())  # Rich wraps at the runner's 80 columns
+
+
+_REPOINT_ROWS = [
+    "repoint_like",
+    "repoint_verify",
+    "repoint_unlike",
+    "repoint_unlike_verify",
+    "lm_check",
+]
+
+
 def test_sync_no_diagnosis_exits_one(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
     """Empty DB → friendly message + exit 1, no clients ever instantiated."""
     from likesurgeon.cli import app
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync"])
+    result = CliRunner().invoke(app, ["sync"])
 
     assert result.exit_code == 1, result.output
     assert "No diagnosis yet" in result.output
@@ -571,626 +564,446 @@ def test_sync_no_diagnosis_exits_one(
     assert _FakeYTMusicWrite.instances == []
 
 
+@pytest.mark.parametrize("args", [["--dry-run"], ["--dry-run", "--yes"]])
 def test_sync_dry_run_prints_plan_and_writes_nothing(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
+    args: list[str],
 ) -> None:
-    """--dry-run: summary printed, exit 0, zero SyncAttempt rows, no client calls."""
     from likesurgeon.cli import app
     from likesurgeon.diagnosis import (
-        ISSUE_POINTER_DRIFT,
-        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-        ISSUE_UNAVAILABLE_VIDEO,
-        ISSUE_YTMUSIC_ONLY,
+        ISSUE_RELINKED,
+        ISSUE_RENDERED_AS_OTHER,
+        ISSUE_SHADOW_DUPLICATE,
     )
-    from likesurgeon.models import SyncAttempt
 
-    _seed_diagnosis(
+    _seed_pairs(
         fake_home,
-        issue_types=[
-            ISSUE_UNAVAILABLE_VIDEO,
-            ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-            ISSUE_POINTER_DRIFT,
-            ISSUE_YTMUSIC_ONLY,
+        [
+            (ISSUE_RELINKED, "A1", "B1", False),
+            (ISSUE_SHADOW_DUPLICATE, "A2", "B2", False),
+            (ISSUE_RENDERED_AS_OTHER, "A3", "B3", True),  # playable: needs the opt-in
         ],
-        confidences=[1.0, 0.9, 0.99, 1.0],
-        reasons=["r", "r", _STAGE4_REASON, "r"],
     )
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--dry-run"])
+    result = CliRunner().invoke(app, ["sync", *args])
 
     assert result.exit_code == 0, result.output
     assert "Sync plan" in result.output
-    assert "yt_unlike: 1" in result.output
-    assert "ytm_like: 1" in result.output
-    # Action line (2-space indent), not the 4-space skip-breakdown line.
-    assert "\n  yt_relike: 1" in result.output
-    assert "yt_like: 1" in result.output
-
-    s = _open_db(fake_home)
-    try:
-        from sqlalchemy import select as _select
-
-        rows = list(s.scalars(_select(SyncAttempt)).all())
-    finally:
-        s.close()
-    assert rows == []
-
-
-def test_sync_dry_run_with_yes_is_harmless(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    """--dry-run --yes: dry-run wins; --yes is ignored, no error."""
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import SyncAttempt
-
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO])
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--dry-run", "--yes"])
-
-    assert result.exit_code == 0, result.output
-    s = _open_db(fake_home)
-    try:
-        from sqlalchemy import select as _select
-
-        rows = list(s.scalars(_select(SyncAttempt)).all())
-    finally:
-        s.close()
-    assert rows == []
-    # No clients should have been built — dry-run returns before client init.
+    # Action lines (2-space indent), not the 4-space skip-breakdown lines.
+    assert "\n  repoint: 1" in result.output
+    assert "\n  unlike_shadow: 1" in result.output
+    assert "skipped: 1" in result.output
+    assert "154 units" in result.output
+    assert _sync_rows(fake_home)[1] == []
     assert _FakeYouTubeWrite.instances == []
     assert _FakeYTMusicWrite.instances == []
 
 
 def test_sync_confirmation_no_aborts(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """Default flow: prompt declined → typer.Abort, no SyncAttempt rows, no calls."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
 
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO])
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync"], input="n\n")
+    result = CliRunner().invoke(app, ["sync"], input="n\n")
 
     assert result.exit_code != 0
-    s = _open_db(fake_home)
-    try:
-        from sqlalchemy import select as _select
-
-        rows = list(s.scalars(_select(SyncAttempt)).all())
-    finally:
-        s.close()
-    assert rows == []
+    assert _sync_rows(fake_home)[1] == []
     assert _FakeYouTubeWrite.instances == []
     assert _FakeYTMusicWrite.instances == []
 
 
+def test_sync_rejects_removed_flags(fake_home: Path) -> None:
+    from likesurgeon.cli import app
+
+    for args in (["--include-fuzzy-drift"], ["--drift-min-confidence", "0.9"]):
+        result = CliRunner().invoke(app, ["sync", *args])
+        assert result.exit_code == 2, result.output
+        assert "No such option" in result.output
+
+
 def test_sync_missing_write_scope_blocks_run(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """--yes set but has_write_scope() returns False → exit 1, no rate_video calls."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
 
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO])
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
     _FakeYouTubeWrite.has_write_scope_return = False
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
+    result = CliRunner().invoke(app, ["sync", "--yes"])
 
     assert result.exit_code == 1, result.output
     assert "write scope" in result.output
-    # YouTubeClient was built (for the scope check), but rate_video was not called.
-    assert len(_FakeYouTubeWrite.instances) == 1
-    assert _FakeYouTubeWrite.instances[0].rate_calls == []
-    # YTMusicClient was never built — scope failure short-circuits before that.
+    assert patch_sync_clients.rate_calls == []
+    # YTMusicClient was never built — the scope failure short-circuits first.
     assert _FakeYTMusicWrite.instances == []
-    s = _open_db(fake_home)
-    try:
-        from sqlalchemy import select as _select
-
-        rows = list(s.scalars(_select(SyncAttempt)).all())
-    finally:
-        s.close()
-    assert rows == []
+    assert _sync_rows(fake_home)[1] == []
 
 
-def test_sync_happy_path_applies_actions(
+@pytest.mark.parametrize("missing_file", [True, False])
+def test_sync_failing_ytmusic_auth_blocks_run(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
+    missing_file: bool,
 ) -> None:
-    """--yes + write scope OK + clients succeed → SyncAttempt rows + status='applied' + exit 0."""
-    from sqlalchemy import select
-
+    """Every action reads YT Music liked songs before and after it: missing
+    or expired cookies are refused up front."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import (
-        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-        ISSUE_UNAVAILABLE_VIDEO,
-    )
-    from likesurgeon.models import DiagnosisItem, SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.ytmusic_client import AuthFileMissingError, UnexpectedResponseError
 
-    ids = _seed_diagnosis(
-        fake_home,
-        issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
-    )
-    ghost_id = ids[ISSUE_UNAVAILABLE_VIDEO]
-    missing_id = ids[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC]
-    # ytm_like cross-prop: verify must find the song in LM.
-    _FakeYTMusicWrite.in_library = {"src_1"}
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    patch_sync_clients.lm_read_errors = {
+        1: AuthFileMissingError("No YouTube Music auth file found. Run `likesurgeon auth ytmusic`")
+        if missing_file
+        else UnexpectedResponseError("ytmusicapi request failed (HTTP 401)")
+    }
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "auth check failed" in result.output
+    assert patch_sync_clients.rate_calls == []
+    assert _sync_rows(fake_home) == ({item_id: "open"}, [])
+
+
+def test_sync_repoints_a_relinked_pair(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["x", "A"], {"A": "B"}
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert "applied=2" in result.output
-    assert "failed=0" in result.output
-
-    # Verify the actual mock arg lists.
-    yt = _FakeYouTubeWrite.instances[0]
-    ytm = _FakeYTMusicWrite.instances[0]
-    # yt_unlike for ghost (src_0) + ytm_like cross-prop: unlike+relike for src_1.
-    assert yt.rate_calls == [("src_0", "none"), ("src_1", "none"), ("src_1", "like")]
-    assert ytm.like_song_calls == []
-
-    s = _open_db(fake_home)
-    try:
-        ghost_item = s.get(DiagnosisItem, ghost_id)
-        missing_item = s.get(DiagnosisItem, missing_id)
-        assert ghost_item.status == "applied"
-        assert missing_item.status == "applied"
-        attempts = list(s.scalars(select(SyncAttempt).order_by(SyncAttempt.id)).all())
-        kinds_statuses = [(a.kind, a.status) for a in attempts]
-        assert ("yt_unlike", "applied") in kinds_statuses
-        assert ("ytm_like_yt_unlike", "applied") in kinds_statuses
-        assert ("ytm_like_yt_relike", "applied") in kinds_statuses
-        assert ("ytm_like_verify", "applied") in kinds_statuses
-    finally:
-        s.close()
+    assert "applied=1 failed=0 skipped=0 restored=0" in _out(result)
+    assert _FakeYouTubeWrite.instances[0].scope_calls == 1
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    statuses, attempts = _sync_rows(fake_home)
+    assert statuses == {item_id: "applied"}
+    assert [kind for _, kind, status in attempts if status == "applied"] == _REPOINT_ROWS
 
 
 def test_sync_partial_failure_exits_one(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """One rate_video raises → that item stays 'open', other applied, exit 1."""
-    from sqlalchemy import select
-
+    """One action's write errors → that finding stays 'open', the next still runs."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem, SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.models import DiagnosisItem
 
-    _seed_diagnosis(
-        fake_home,
-        issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_UNAVAILABLE_VIDEO],
+    ids = _seed_pairs(
+        fake_home, [(ISSUE_RELINKED, "A1", "B1", False), (ISSUE_RELINKED, "A2", "B2", False)]
     )
-    # _seed_diagnosis returns one entry per unique issue_type, so for two
-    # ghosts we need to fish the ids out of the DB.
-    s = _open_db(fake_home)
-    try:
-        rows = list(s.scalars(select(DiagnosisItem).order_by(DiagnosisItem.id)).all())
-        item_ids = [r.id for r in rows]
-    finally:
-        s.close()
-    assert len(item_ids) == 2
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A1", "A2"], {"A1": "B1", "A2": "B2"}
+    acct.rate_errors = {("B1", "like")}
 
-    # Fail on the second video only.
-    _FakeYouTubeWrite.rate_raise_on = {("src_1", "none")}
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
+    result = CliRunner().invoke(app, ["sync", "--yes"])
 
     assert result.exit_code == 1, result.output
-    assert "applied=1" in result.output
-    assert "failed=1" in result.output
-
+    assert "applied=1 failed=1" in _out(result)
+    statuses, _ = _sync_rows(fake_home)
+    assert statuses == {ids[0]: "open", ids[1]: "applied"}
     s = _open_db(fake_home)
     try:
-        items = {r.id: r for r in s.scalars(select(DiagnosisItem)).all()}
-        # First applied, second failed → still 'open'.
-        assert items[item_ids[0]].status == "applied"
-        assert items[item_ids[1]].status == "open"
         # Reason is the diagnosis-time evidence, not the failure detail.
-        assert items[item_ids[1]].reason == "diagnosis-time evidence"
-        attempts = list(s.scalars(select(SyncAttempt).order_by(SyncAttempt.id)).all())
-        by_item = {a.diagnosis_item_id: a for a in attempts}
-        assert by_item[item_ids[0]].status == "applied"
-        assert by_item[item_ids[1]].status == "failed"
+        assert s.get(DiagnosisItem, ids[0]).reason == "diagnosis-time evidence"
     finally:
         s.close()
 
 
-def test_sync_ytm_only_run_requires_youtube_scope(
+def test_sync_include_playable_repoints_rendered_as_other(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """ytm_like is in needs_youtube → has_write_scope() IS called; cross-prop uses rate_video."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC
+    from likesurgeon.diagnosis import ISSUE_RENDERED_AS_OTHER
 
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC])
-    # ytm_like verify needs to find the song in LM.
-    _FakeYTMusicWrite.in_library = {"src_0"}
-
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RENDERED_AS_OTHER, "MV", "T", True)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["MV"], {"MV": "T"}
     runner = CliRunner()
+
     result = runner.invoke(app, ["sync", "--yes"])
-
     assert result.exit_code == 0, result.output
-    # has_write_scope IS consulted because ytm_like is in needs_youtube.
-    assert len(_FakeYouTubeWrite.instances) == 1
-    assert _FakeYouTubeWrite.instances[0].scope_calls >= 1
-    # Cross-prop: unlike then relike via rate_video.
-    assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_0", "none"), ("src_0", "like")]
-    # like_song was NOT called (new flow uses rate_video, not like_song).
-    assert _FakeYTMusicWrite.instances[0].like_song_calls == []
+    assert acct.rate_calls == []
+    # A plan-time skip is no write, so it doesn't block the next run.
+    assert _sync_rows(fake_home) == ({item_id: "open"}, [(item_id, "repoint", "skipped")])
+
+    result = runner.invoke(app, ["sync", "--yes", "--include-playable"])
+    assert result.exit_code == 0, result.output
+    assert acct.rate_calls == [("T", "like"), ("MV", "none")]
+    assert _sync_rows(fake_home)[0] == {item_id: "applied"}
 
 
-def test_sync_yt_like_missing_write_scope_blocks_run(
+def test_sync_unlikes_shadows_by_the_scanned_availability_of_a(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """yt_like is in needs_youtube → missing write scope blocks the run before any rate_video call."""
+    """The availability map comes from the diagnosis's YouTube scan: only the
+    unavailable A is unliked by default, a playable one needs the opt-in, and
+    an unknown one never."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
+    from likesurgeon.diagnosis import ISSUE_SHADOW_DUPLICATE
+
+    ids = _seed_pairs(
+        fake_home,
+        [
+            (ISSUE_SHADOW_DUPLICATE, "A0", "B0", False),
+            (ISSUE_SHADOW_DUPLICATE, "A1", "B1", True),
+            (ISSUE_SHADOW_DUPLICATE, "A2", "B2", None),
+        ],
+    )
+    acct = patch_sync_clients
+    acct.liked = ["A0", "B0", "A1", "B1", "A2", "B2"]
+    acct.renders = {"A0": "B0", "A1": "B1", "A2": "B2"}
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["sync", "--dry-run", "--include-playable"])
+    assert result.exit_code == 0, result.output
+    assert "\n  unlike_shadow: 2" in result.output
+
+    result = runner.invoke(app, ["sync", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert acct.rate_calls == [("A0", "none")]
+    statuses, attempts = _sync_rows(fake_home)
+    assert statuses == {ids[0]: "applied", ids[1]: "open", ids[2]: "open"}
+    assert (ids[1], "unlike_shadow", "skipped") in attempts
+    assert (ids[2], "unlike_shadow", "skipped") in attempts
+
+
+def test_sync_refuses_when_a_sync_ran_after_the_older_scan(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    """Spec §5.1: one of our writes after the older scan means the diagnosis
+    may misalign or be outdated — refuse before any client is built."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
     from likesurgeon.models import SyncAttempt
 
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_YTMUSIC_ONLY])
-    _FakeYouTubeWrite.has_write_scope_return = False
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code == 1, result.output
-    assert "write scope" in result.output
-    # YouTubeClient was built (for the scope check), but rate_video was not called.
-    assert len(_FakeYouTubeWrite.instances) == 1
-    assert _FakeYouTubeWrite.instances[0].rate_calls == []
-    # YTMusicClient was never built — scope failure short-circuits before that.
-    assert _FakeYTMusicWrite.instances == []
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
     s = _open_db(fake_home)
     try:
-        from sqlalchemy import select as _select
-
-        rows = list(s.scalars(_select(SyncAttempt)).all())
+        s.add(
+            SyncAttempt(diagnosis_item_id=item_id, kind="repoint_like", status="applied", reason="")
+        )
+        s.commit()
     finally:
         s.close()
-    assert rows == []
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "Refusing to sync: 1 sync attempt(s) ran after the older of the two scans" in out
+    assert "Re-scan both sources" in out
+    assert _FakeYouTubeWrite.instances == []
+    assert len(_sync_rows(fake_home)[1]) == 1
 
 
-def test_sync_yt_like_happy_path(
+def test_sync_warns_when_newer_scan_exists(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """yt_like: rate_video(like) called, is_in_liked_videos called, two SyncAttempt rows, item applied."""
     from sqlalchemy import select
 
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
-    from likesurgeon.models import DiagnosisItem, SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.models import Diagnosis
+    from likesurgeon.snapshot import create_snapshot
 
-    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_YTMUSIC_ONLY])
-    item_id = ids[ISSUE_YTMUSIC_ONLY]
-    # is_in_liked_videos must return True for src_0.
-    _FakeYouTubeWrite.in_liked_videos = {"src_0"}
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code == 0, result.output
-    assert "applied=1" in result.output
-    assert "failed=0" in result.output
-
-    yt = _FakeYouTubeWrite.instances[0]
-    # rate_video(like) was called.
-    assert ("src_0", "like") in yt.rate_calls
-    # is_in_liked_videos was called.
-    assert "src_0" in yt.is_in_liked_videos_calls
-
+    _seed_diagnosis(fake_home, issue_types=[ISSUE_RELINKED])
     s = _open_db(fake_home)
     try:
-        item = s.get(DiagnosisItem, item_id)
-        assert item.status == "applied"
-        attempts = list(s.scalars(select(SyncAttempt).order_by(SyncAttempt.id)).all())
-        kinds_statuses = [(a.kind, a.status) for a in attempts]
-        assert ("yt_like_yt_rate", "applied") in kinds_statuses
-        assert ("yt_like_verify", "applied") in kinds_statuses
+        used = create_snapshot(s, "ytmusic_liked_songs", [])
+        create_snapshot(s, "ytmusic_liked_songs", [])
+        s.scalars(select(Diagnosis)).one().ytmusic_snapshot_id = used.id
+        s.commit()
     finally:
         s.close()
+
+    result = CliRunner().invoke(app, ["sync", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Stale diagnosis" in result.output
+    assert "newer ytmusic_liked_songs scan" in result.output
+
+
+def test_sync_lists_videos_stranded_by_an_earlier_run(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    """An earlier run's restore failed: say so, by video id, on every run."""
+    from datetime import UTC, datetime, timedelta
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.models import SyncAttempt
+
+    old = _seed_diagnosis(fake_home, issue_types=[ISSUE_RELINKED])[ISSUE_RELINKED]
+    s = _open_db(fake_home)
+    try:
+        s.add(
+            SyncAttempt(
+                diagnosis_item_id=old,
+                kind="restore_like",
+                status="failed",
+                reason="quotaExceeded",
+                # Before the scans below, so this run isn't refused.
+                created_at=datetime.now(UTC) - timedelta(days=1),
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+
+    result = CliRunner().invoke(app, ["sync", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "without confirming the result: src_0. For each, check whether the song" in out
+    assert "if it isn't, re-like that original YouTube video by hand." in out
+
+
+def test_sync_quota_exhaustion_stops_and_says_to_rescan(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(
+        fake_home, [(ISSUE_RELINKED, "A1", "B1", False), (ISSUE_RELINKED, "A2", "B2", False)]
+    )
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A1", "A2"], {"A1": "B1", "A2": "B2"}
+    acct.quota_after = 0
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "quota exhausted" in out
+    assert "1 action(s) not attempted" in out
+    assert "re-scan both sources" in out
+    assert acct.rate_calls == [("B1", "like")]
+
+
+def test_sync_reports_an_action_undone_by_its_lm_check(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A", "D"], {"A": "C", "D": "B"}  # A really shows as C
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "applied=0 failed=0 skipped=1 restored=1" in out
+    assert "1 action(s) were undone" in out
+    assert "A" in acct.liked
+    assert _sync_rows(fake_home)[0] == {item_id: "skipped"}
+
+
+def test_sync_names_videos_left_unliked(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A", "D"], {"A": "C", "D": "B"}
+    acct.rate_errors = {("A", "like")}  # the restore fails
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "they may be liked nowhere right now: A Re-like them on YouTube by hand." in out
+
+
+def test_sync_stops_when_liked_songs_cannot_be_read(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A"], {"A": "B"}
+    # Read 1 is the auth probe; read 2 the baseline before the first action.
+    acct.lm_read_errors = {2: UnexpectedResponseError("HTTP 500 [server]")}
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "Stopped early: could not read YT Music liked songs" in out
+    assert "HTTP 500 [server]" in out
+    assert "1 action(s) not attempted" in out
+    assert acct.rate_calls == []
 
 
 def test_sync_limit_truncates_actions_and_leaves_rest_open(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """--limit N processes only the first N actions; the rest stay 'open'
-    so the next sync run picks them up. Used for ramped first runs."""
-    from sqlalchemy import select
-
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem, SyncAttempt
+    from likesurgeon.diagnosis import ISSUE_RELINKED
 
-    _seed_diagnosis(
-        fake_home,
-        issue_types=[ISSUE_UNAVAILABLE_VIDEO] * 5,
-    )
+    ids = _seed_pairs(fake_home, [(ISSUE_RELINKED, f"A{i}", f"B{i}", False) for i in range(3)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A0", "A1", "A2"], {f"A{i}": f"B{i}" for i in range(3)}
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes", "--limit", "2"])
+    result = CliRunner().invoke(app, ["sync", "--yes", "--limit", "2"])
 
     assert result.exit_code == 0, result.output
-    assert "applying first 2 of 5" in result.output
+    assert "applying first 2 of 3" in result.output
     assert "applied=2" in result.output
-
-    yt = _FakeYouTubeWrite.instances[0]
-    assert len(yt.rate_calls) == 2
-    assert yt.rate_calls == [("src_0", "none"), ("src_1", "none")]
-
-    s = _open_db(fake_home)
-    try:
-        items = list(s.scalars(select(DiagnosisItem).order_by(DiagnosisItem.id)).all())
-        # First two applied; remaining three stay 'open' for next run.
-        assert [it.status for it in items] == ["applied", "applied", "open", "open", "open"]
-        attempts = list(s.scalars(select(SyncAttempt)).all())
-        assert len(attempts) == 2
-    finally:
-        s.close()
+    assert acct.rate_calls == [("B0", "like"), ("A0", "none"), ("B1", "like"), ("A1", "none")]
+    assert _sync_rows(fake_home)[0] == {ids[0]: "applied", ids[1]: "applied", ids[2]: "open"}
 
 
 def test_sync_limit_above_action_count_is_noop(
     fake_home: Path,
-    patch_sync_clients: None,
+    patch_sync_clients: FakeAccount,
 ) -> None:
-    """--limit N where N >= total actions doesn't print a truncation notice
-    and processes everything normally."""
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
+    from likesurgeon.diagnosis import ISSUE_RELINKED
 
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO] * 2)
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A"], {"A": "B"}
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes", "--limit", "10"])
+    result = CliRunner().invoke(app, ["sync", "--yes", "--limit", "10"])
 
     assert result.exit_code == 0, result.output
     assert "applying first" not in result.output
-    assert "applied=2" in result.output
-
-
-def _seed_dedupe_item(home: Path, *, video_id: str, source: str = "ytmusic_liked_songs") -> int:
-    """Seed a Diagnosis with one ISSUE_DUPLICATE_IN_SOURCE item. Returns item id."""
-    from likesurgeon.config import DEFAULT_DB_FILENAME
-    from likesurgeon.db import init_db, make_engine, make_session_factory
-    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE
-    from likesurgeon.models import Diagnosis, DiagnosisItem, Snapshot, Track
-
-    home.mkdir(parents=True, exist_ok=True)
-    db_path = home / DEFAULT_DB_FILENAME
-    engine = make_engine(db_path)
-    init_db(engine)
-    factory = make_session_factory(engine)
-
-    s = factory()
-    try:
-        # An (empty) YouTube scan behind the diagnosis: without one the
-        # dedupe guard can't rule out a YouTube like and skips every dedupe.
-        yt_snap = Snapshot(source="youtube_liked_videos", raw_count=0)
-        s.add(yt_snap)
-        s.flush()
-        diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=yt_snap.id)
-        s.add(diag)
-        s.flush()
-
-        track = Track(
-            source=source,
-            video_id=video_id,
-            title="dup title",
-            artists="[]",
-            canonical_key="ck-dup",
-            dedupe_key="dk-dup",
-        )
-        s.add(track)
-        s.flush()
-
-        item = DiagnosisItem(
-            diagnosis_id=diag.id,
-            issue_type=ISSUE_DUPLICATE_IN_SOURCE,
-            confidence=1.0,
-            reason=f"appears 2 times in {source} snapshot (positions: 0, 1)",
-            source_track_id=track.id,
-            related_track_id=None,
-            status="open",
-        )
-        s.add(item)
-        s.flush()
-        item_id = item.id
-        s.commit()
-    finally:
-        s.close()
-    return item_id
-
-
-def test_sync_ytm_only_dedupe_success_no_youtube_method_calls(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    """ytm_dedupe-only plan: unlike_song is called, has_write_scope and rate_video are NOT."""
-    from sqlalchemy import select
-
-    from likesurgeon.cli import app
-    from likesurgeon.models import SyncAttempt
-
-    _seed_dedupe_item(fake_home, video_id="dup_vid")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code == 0, result.output
-
-    yt = _FakeYouTubeWrite.instances[0]
-    assert yt.scope_calls == 0, "has_write_scope must not be called for ytm_dedupe-only runs"
-    assert yt.rate_calls == [], "rate_video must not be called for ytm_dedupe-only runs"
-
-    ytm = _FakeYTMusicWrite.instances[0]
-    assert ytm.unlike_calls == ["dup_vid"]
-
-    assert "ytm_dedupe: 1" in result.output
-
-    s = _open_db(fake_home)
-    try:
-        attempts = list(s.scalars(select(SyncAttempt)).all())
-        assert len(attempts) == 1
-        assert attempts[0].kind == "ytm_dedupe"
-        assert attempts[0].status == "applied"
-    finally:
-        s.close()
-
-
-def test_sync_ytm_only_dedupe_failure_exits_nonzero_but_marks_applied(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    """ytm_dedupe that raises: exit non-zero, no YouTube calls, item.status='applied' (terminal-on-attempt)."""
-    from sqlalchemy import select
-
-    from likesurgeon.cli import app
-    from likesurgeon.models import DiagnosisItem, SyncAttempt
-
-    item_id = _seed_dedupe_item(fake_home, video_id="dup_vid")
-    _FakeYTMusicWrite.raise_on_unlike = {"dup_vid"}
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code != 0
-
-    yt = _FakeYouTubeWrite.instances[0]
-    assert yt.scope_calls == 0
-    assert yt.rate_calls == []
-
-    s = _open_db(fake_home)
-    try:
-        item = s.get(DiagnosisItem, item_id)
-        assert item.status == "applied", "ytm_dedupe is terminal-on-attempt even on failure"
-        attempts = list(s.scalars(select(SyncAttempt)).all())
-        assert len(attempts) == 1
-        assert attempts[0].kind == "ytm_dedupe"
-        assert attempts[0].status == "failed"
-    finally:
-        s.close()
-
-
-def test_sync_limit_with_mixed_dedupe_and_unlike(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    """--limit 1 with one ytm_dedupe + one yt_unlike: exactly one action runs, other stays open."""
-    from sqlalchemy import select
-
-    from likesurgeon.cli import app
-    from likesurgeon.config import DEFAULT_DB_FILENAME
-    from likesurgeon.db import init_db, make_engine, make_session_factory
-    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE, ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import Diagnosis, DiagnosisItem, Snapshot, SyncAttempt, Track
-
-    # Seed a diagnosis with two items in one transaction so they share one Diagnosis row.
-    fake_home.mkdir(parents=True, exist_ok=True)
-    db_path = fake_home / DEFAULT_DB_FILENAME
-    engine = make_engine(db_path)
-    init_db(engine)
-    factory = make_session_factory(engine)
-
-    s = factory()
-    try:
-        yt_snap = Snapshot(source="youtube_liked_videos", raw_count=0)
-        s.add(yt_snap)
-        s.flush()
-        diag = Diagnosis(ytmusic_snapshot_id=None, youtube_snapshot_id=yt_snap.id)
-        s.add(diag)
-        s.flush()
-
-        track_dup = Track(
-            source="ytmusic_liked_songs",
-            video_id="dup_vid",
-            title="dup",
-            artists="[]",
-            canonical_key="ck-dup",
-            dedupe_key="dk-dup",
-        )
-        track_ghost = Track(
-            source="youtube_liked_videos",
-            video_id="ghost_vid",
-            title="ghost",
-            artists="[]",
-            canonical_key="ck-ghost",
-            dedupe_key="dk-ghost",
-        )
-        s.add_all([track_dup, track_ghost])
-        s.flush()
-
-        item_dup = DiagnosisItem(
-            diagnosis_id=diag.id,
-            issue_type=ISSUE_DUPLICATE_IN_SOURCE,
-            confidence=1.0,
-            reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 1)",
-            source_track_id=track_dup.id,
-            related_track_id=None,
-            status="open",
-        )
-        item_ghost = DiagnosisItem(
-            diagnosis_id=diag.id,
-            issue_type=ISSUE_UNAVAILABLE_VIDEO,
-            confidence=1.0,
-            reason="unavailable",
-            source_track_id=track_ghost.id,
-            related_track_id=None,
-            status="open",
-        )
-        s.add_all([item_dup, item_ghost])
-        s.flush()
-        dup_id = item_dup.id
-        ghost_id = item_ghost.id
-        s.commit()
-    finally:
-        s.close()
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["sync", "--yes", "--limit", "1"])
-
-    assert result.exit_code == 0, result.output
-
-    ytm = _FakeYTMusicWrite.instances[0]
-    yt = _FakeYouTubeWrite.instances[0]
-
-    dedupe_ran = len(ytm.unlike_calls) == 1
-    unlike_ran = len(yt.rate_calls) == 1
-    # Exactly one of the two actions ran.
-    assert dedupe_ran ^ unlike_ran, (
-        f"Expected exactly one action; got unlike_calls={ytm.unlike_calls}, rate_calls={yt.rate_calls}"
-    )
-
-    s = _open_db(fake_home)
-    try:
-        items = {r.id: r for r in s.scalars(select(DiagnosisItem)).all()}
-        applied_statuses = [v.status for v in items.values() if v.status == "applied"]
-        open_statuses = [v.status for v in items.values() if v.status == "open"]
-        assert len(applied_statuses) == 1, "exactly one item should be applied"
-        assert len(open_statuses) == 1, "exactly one item should remain open"
-
-        attempts = list(s.scalars(select(SyncAttempt)).all())
-        assert len(attempts) == 1, "exactly one SyncAttempt row expected"
-    finally:
-        s.close()
-
-    _ = dup_id, ghost_id  # referenced above via items dict; kept for clarity
+    assert "applied=1" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1569,120 +1382,6 @@ def test_doctor_reports_alignment_counts_and_lm_backed_share(
     assert "Match-rate" not in out
 
 
-# ---------------------------------------------------------------------------
-# sync: review-fix wiring (fuzzy opt-in, YT Music auth pre-flight, stale
-# warning, quota stop, input validation)
-# ---------------------------------------------------------------------------
-
-_FUZZY_REASON = "fuzzy match (score 100/100): YT 'Song' ↔ YT Music 'Song (Remix)'"
-
-
-def test_sync_fuzzy_drift_needs_include_flag(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT
-
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_POINTER_DRIFT], reasons=[_FUZZY_REASON])
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sync", "--yes"])
-    assert result.exit_code == 0, result.output
-    assert _FakeYouTubeWrite.instances[0].rate_calls == []
-
-    _FakeYouTubeWrite.in_liked_videos = {"rel_0"}  # the like on B lands
-    result = runner.invoke(app, ["sync", "--yes", "--include-fuzzy-drift"])
-    assert result.exit_code == 0, result.output
-    assert _FakeYouTubeWrite.instances[1].rate_calls == [("rel_0", "like"), ("src_0", "none")]
-
-
-@pytest.mark.parametrize("missing_file", [True, False])
-def test_sync_failing_ytmusic_auth_blocks_run(
-    fake_home: Path,
-    patch_sync_clients: None,
-    missing_file: bool,
-) -> None:
-    """With missing or expired YT Music auth a dedupe would 'fail' and still be
-    marked applied (terminal on attempt) — refuse up front instead."""
-    from likesurgeon.cli import app
-    from likesurgeon.ytmusic_client import AuthFileMissingError, UnexpectedResponseError
-
-    item_id = _seed_dedupe_item(fake_home, video_id="dupvid")
-    _FakeYTMusicWrite.probe_error = (
-        AuthFileMissingError("No YouTube Music auth file found. Run `likesurgeon auth ytmusic`")
-        if missing_file
-        else UnexpectedResponseError("ytmusicapi request failed (HTTP 401)")
-    )
-
-    result = CliRunner().invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code == 1, result.output
-    assert "auth check failed" in result.output
-    assert _FakeYTMusicWrite.instances[0].unlike_calls == []
-    s = _open_db(fake_home)
-    try:
-        from likesurgeon.models import DiagnosisItem
-
-        assert s.get(DiagnosisItem, item_id).status == "open"
-    finally:
-        s.close()
-
-
-def test_sync_warns_when_newer_scan_exists(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    from sqlalchemy import select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import Diagnosis
-    from likesurgeon.snapshot import create_snapshot
-
-    _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO])
-    s = _open_db(fake_home)
-    try:
-        used = create_snapshot(s, "ytmusic_liked_songs", [])
-        create_snapshot(s, "ytmusic_liked_songs", [])
-        s.scalars(select(Diagnosis)).one().ytmusic_snapshot_id = used.id
-        s.commit()
-    finally:
-        s.close()
-
-    result = CliRunner().invoke(app, ["sync", "--dry-run"])
-
-    assert result.exit_code == 0, result.output
-    assert "Stale diagnosis" in result.output
-    assert "newer ytmusic_liked_songs scan" in result.output
-
-
-def test_sync_quota_exhaustion_stops_and_names_stranded_videos(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC, ISSUE_UNAVAILABLE_VIDEO
-
-    _seed_diagnosis(
-        fake_home,
-        issue_types=[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC, ISSUE_UNAVAILABLE_VIDEO],
-        confidences=[1.0, 0.5],  # keep ytm_like first in plan order
-    )
-    _FakeYouTubeWrite.rate_quota_on = {("src_0", "like")}
-
-    result = CliRunner().invoke(app, ["sync", "--yes"])
-
-    assert result.exit_code == 1, result.output
-    out = " ".join(result.output.split())  # Rich wraps at the runner's 80 columns
-    assert "quota exhausted" in out
-    assert "1 action(s) left open" in out
-    assert "liked nowhere" in out
-    assert "src_0" in out
-    # The ghost unlike after the quota hit was never attempted.
-    assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_0", "none"), ("src_0", "like")]
-
-
 def test_issues_rejects_unknown_type(fake_home: Path) -> None:
     from likesurgeon.cli import app
 
@@ -1692,65 +1391,11 @@ def test_issues_rejects_unknown_type(fake_home: Path) -> None:
     assert "Unknown issue type" in result.output
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["sync", "--limit", "-1"],
-        ["sync", "--drift-min-confidence", "1.5"],
-    ],
-)
-def test_out_of_range_numeric_options_are_rejected(fake_home: Path, args: list[str]) -> None:
+def test_out_of_range_numeric_options_are_rejected(fake_home: Path) -> None:
     from likesurgeon.cli import app
 
-    result = CliRunner().invoke(app, args)
+    result = CliRunner().invoke(app, ["sync", "--limit", "-1"])
     assert result.exit_code == 2, result.output
-
-
-def test_sync_surfaces_and_prioritizes_videos_stranded_by_an_earlier_run(
-    fake_home: Path,
-    patch_sync_clients: None,
-) -> None:
-    """A previous quota stop left src_1 unliked: this run must say so and put
-    its re-like first, ahead of higher-confidence actions."""
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC, ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import SyncAttempt
-
-    ids = _seed_diagnosis(
-        fake_home,
-        issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
-        confidences=[1.0, 0.9],
-    )
-    s = _open_db(fake_home)
-    try:
-        s.add_all(
-            [
-                SyncAttempt(
-                    diagnosis_item_id=ids[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
-                    kind="ytm_like_yt_unlike",
-                    status="applied",
-                    reason="rate(none) ok",
-                ),
-                SyncAttempt(
-                    diagnosis_item_id=ids[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
-                    kind="ytm_like_yt_relike",
-                    status="failed",
-                    reason="quotaExceeded",
-                ),
-            ]
-        )
-        s.commit()
-    finally:
-        s.close()
-    _FakeYTMusicWrite.in_library = {"src_1"}
-
-    result = CliRunner().invoke(app, ["sync", "--yes", "--limit", "1"])
-
-    assert result.exit_code == 0, result.output
-    out = " ".join(result.output.split())
-    assert "liked nowhere right now: src_1" in out
-    # --limit 1 picked the stranded re-like, not the 1.0-confidence ghost unlike.
-    assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_1", "none"), ("src_1", "like")]
 
 
 def test_skip_and_unskip_flip_latest_findings(fake_home: Path) -> None:

@@ -1,37 +1,18 @@
-"""Planner + dispatcher for the ``sync`` command (write actions).
+"""Planner for the ``sync`` command (spec §4.1): which findings become writes.
 
-Pure planner (`plan`, `summarize`) is testable without any clients; the
-dispatcher (`execute`) takes mock-friendly client objects and is the only
-thing that mutates ``DiagnosisItem.status`` and emits ``SyncAttempt`` rows.
+``plan`` and ``summarize`` are pure; ``resolve_video_ids`` looks up the video
+ids ``plan`` needs. A write-eligible pair finding (A = the YouTube video whose
+like backs an LM entry, B = the ``videoId`` that entry shows) becomes one of
+two actions, which ``sync_dispatch.execute`` runs:
 
-Invariants:
-  * ``DiagnosisItem.reason`` is never modified — that field is the
-    diagnosis-time evidence and must outlive sync attempts. Sync-side
-    detail (errors, threshold notes, missing video_ids) lives on
-    ``SyncAttempt.reason`` instead.
-  * ``DiagnosisItem.status`` flips to ``"applied"`` only when every API
-    call for the action succeeded (drift = both halves). Failures leave it
-    as ``"open"`` so the next ``sync`` run re-evaluates. Exception:
-    ``ytm_dedupe`` is non-idempotent and flips to ``"applied"`` after any
-    attempt (success or failure) to prevent auto-retry over-removal.
-    ``"skipped"`` is a terminal non-failure outcome, code-set by
-    ``_try_ytm_like`` / ``_try_yt_like`` on cross-prop verify-miss (or set
-    manually by the operator). Items at ``"skipped"`` are not re-attempted
-    on the next run; ``likesurgeon unskip <id>`` re-opens one to
-    retry. Note: a *planner-level* skip (no video_id, below confidence
-    threshold, unsupported duplicate shape) only writes a ``SyncAttempt``
-    audit row — the ``DiagnosisItem`` stays ``"open"`` and is re-evaluated
-    next run (so e.g. lowering ``--drift-min-confidence`` picks up
-    borderline drifts later). Plan-time skip ≠ terminal ``"skipped"``.
-  * Per-action commit cadence: a crash mid-run preserves prior actions'
-    SyncAttempt rows AND any status updates already committed. Drift's
-    two HTTP calls count as one action (one commit).
+  * ``repoint``: like B, confirm, unlike A, confirm.
+  * ``unlike_shadow`` (B is already liked): confirm B is liked, unlike A,
+    confirm.
 """
 
 from __future__ import annotations
 
-import re
-import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
@@ -39,29 +20,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .diagnosis import (
-    ISSUE_DUPLICATE_IN_SOURCE,
-    ISSUE_METADATA_DRIFT,
-    ISSUE_POINTER_DRIFT,
-    ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-    ISSUE_UNAVAILABLE_VIDEO,
-    ISSUE_YTMUSIC_ONLY,
-    is_stage4_drift_reason,
+    ISSUE_RENDERED_AS_OTHER,
+    ISSUE_SHADOW_DUPLICATE,
+    PAIR_ISSUE_TYPES,
+    is_write_eligible,
 )
-from .models import DiagnosisItem, SyncAttempt, Track
-from .snapshot import YTMUSIC_LIKED_SONGS
-from .youtube_client import YouTubeClient, YouTubeQuotaExceededError, YouTubeWriteError
-from .ytmusic_client import (
-    AuthFileMissingError,
-    UnexpectedResponseError,
-    YTMusicClient,
-    YTMusicWriteError,
-)
+from .models import DiagnosisItem, Track
 
-ActionKind = Literal["yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedupe"]
-_DispatchOutcome = Literal["applied", "skipped", "failed"]
-
-_YTM_LIKE_VERIFY_WAIT_SECONDS = 5
-_YT_LIKE_VERIFY_WAIT_SECONDS = 5
+ActionKind = Literal["repoint", "unlike_shadow"]
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -105,10 +71,13 @@ def resolve_video_ids(session: Session, items: list[DiagnosisItem]) -> dict[int,
 
 @dataclass(frozen=True)
 class PlannedAction:
+    """A = the YouTube video to unlike; B = the YT Music track to keep —
+    liked first by ``repoint``, confirmed already liked by ``unlike_shadow``."""
+
     item_id: int
     kind: ActionKind
-    primary_video_id: str
-    secondary_video_id: str | None  # only populated for ``yt_relike``
+    a_video_id: str
+    b_video_id: str
 
 
 @dataclass(frozen=True)
@@ -125,280 +94,71 @@ class SkipRecord:
     reason: str
 
 
-@dataclass(frozen=True)
-class ExecResult:
-    applied: int
-    failed: int
-    skipped: int
-    # YouTube's daily quota ran out mid-run; the ``unattempted`` YouTube
-    # actions after that point were left 'open' without any API call.
-    quota_exhausted: bool = False
-    unattempted: int = 0
-    # ``ytm_like`` videos whose YouTube unlike landed but whose re-like
-    # didn't — liked nowhere now. Re-running sync on the same diagnosis
-    # re-likes them; re-scanning first would make them vanish from the diff.
-    left_unliked: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class _DuplicateReason:
-    count: int
-    source: str
-    positions: tuple[int, ...]
-
-
-_DUPLICATE_REASON_RE = re.compile(
-    r"^appears (?P<count>\d+) times in (?P<source>\w+) snapshot "
-    r"\(positions: (?P<positions>[\d, ]+)\)$"
-)
-
-
-def _parse_duplicate_in_source_reason(reason: str) -> _DuplicateReason | None:
-    """Parse the diagnosis-time reason emitted by ``build_duplicate_in_source_items``.
-
-    Returns ``None`` for any deviation: malformed input, multi-source
-    contamination, count-vs-positions mismatch (e.g.
-    ``"appears 2 times ... (positions: 0, 1, 5)"``). Callers MUST treat
-    ``None`` as "do not auto-act."
-    """
-    m = _DUPLICATE_REASON_RE.fullmatch(reason)
-    if m is None:
-        return None
-    count = int(m.group("count"))
-    try:
-        positions = tuple(int(p.strip()) for p in m.group("positions").split(","))
-    except ValueError:
-        return None
-    if len(positions) != count:
-        return None
-    return _DuplicateReason(count=count, source=m.group("source"), positions=positions)
-
-
 def plan(
     items: list[DiagnosisItem],
     video_ids: dict[int, str],
+    availability: dict[int, bool | None],
     *,
-    drift_min_confidence: float,
-    include_fuzzy_drift: bool = False,
-    youtube_liked_video_ids: frozenset[str] | None = frozenset(),
+    include_playable: bool = False,
 ) -> tuple[list[PlannedAction], list[SkipRecord]]:
-    """Map findings to actions / skips. Pure — no I/O, no client calls.
+    """Map pair findings to actions / skips. Pure — no I/O, no client calls.
 
-    Items with ``status`` in {``'applied'``, ``'skipped'``} are silently
-    dropped (terminal at item level — re-running sync must not re-attempt
-    them, and there's nothing to record). ``'applied'`` is set by ``execute``
-    when every API call for an action succeeded. ``'skipped'`` is a terminal
-    non-failure status: it is set either by the operator as a manual override
-    (e.g. a private/deleted YouTube ghost that ``videos.rate`` can't unlike
-    anyway) or code-set by ``execute`` on cross-prop verify-miss (``ytm_like``
-    and ``yt_like`` actions). Both are treated the same here: skipped items
-    are not re-planned. ``likesurgeon unskip <id>`` re-opens one
-    to retry a code-set skip.
-    Findings of type ``metadata_drift`` are silently
-    dropped (informational, not actionable in 0.5).
-    ``possible_pointer_drift`` auto-applies only Stage-4 pairs unless
-    ``include_fuzzy_drift`` — Stage-3 fuzzy pairs are title-only and score
-    version variants ("Song" vs "Song (Remix)") at 1.0, so a wrong pair
-    would unlike the user's original. Either way ``drift_min_confidence``
-    still gates.
-    ``duplicate_in_source`` maps to ``ytm_dedupe`` only when the parsed
-    reason validates as ytmusic-source + N=2 + matching position count,
-    and the video is not in ``youtube_liked_video_ids``: on a video liked
-    on YouTube, ``rate_song("INDIFFERENT")`` round-trips and removes that
-    YouTube like too (the ``yt_like`` → dup → dedupe self-revert loop).
-    ``None`` means YouTube likes are unknown, so no dedupe is planned.
-    All other shapes produce a ``SkipRecord`` — we never default to a
-    destructive YT Music write.
+    ``availability`` maps an LL track id (A) to ``is_available`` from the
+    diagnosis's YouTube scan. Items at ``'applied'`` / ``'skipped'`` and
+    findings other than ``PAIR_ISSUE_TYPES`` are dropped silently.
+
+      * ``relinked`` → ``repoint``.
+      * ``rendered_as_other`` (A playable) → ``repoint`` only with
+        ``include_playable``.
+      * ``shadow_duplicate`` → ``unlike_shadow`` when A was unavailable, or
+        playable with ``include_playable``; unknown availability never.
+
+    Acting on a playable A removes a like the user made, hence the opt-in.
+    Pairs that aren't write-eligible, are opted out, or lack a video id
+    become ``SkipRecord``s.
     """
     actions: list[PlannedAction] = []
     skips: list[SkipRecord] = []
 
     for item in items:
-        if item.status in ("applied", "skipped"):
+        if item.status in ("applied", "skipped") or item.issue_type not in PAIR_ISSUE_TYPES:
             continue
-
-        if item.issue_type == ISSUE_UNAVAILABLE_VIDEO:
-            primary = _video_id_for(video_ids, item.source_track_id)
-            if primary is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="yt_unlike",
-                        reason="no video_id available for source track",
-                    )
-                )
-                continue
-            actions.append(
-                PlannedAction(
+        kind: ActionKind = (
+            "unlike_shadow" if item.issue_type == ISSUE_SHADOW_DUPLICATE else "repoint"
+        )
+        a = _video_id_for(video_ids, item.source_track_id)
+        b = _video_id_for(video_ids, item.related_track_id)
+        reason = _skip_reason(item, availability, include_playable=include_playable)
+        if reason is not None:
+            skips.append(SkipRecord(item_id=item.id, kind=kind, reason=reason))
+        elif a is None or b is None:
+            skips.append(
+                SkipRecord(
                     item_id=item.id,
-                    kind="yt_unlike",
-                    primary_video_id=primary,
-                    secondary_video_id=None,
+                    kind=kind,
+                    reason="no video_id for A (YouTube video) or B (YT Music entry)",
                 )
             )
-
-        elif item.issue_type == ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC:
-            primary = _video_id_for(video_ids, item.source_track_id)
-            if primary is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_like",
-                        reason="no video_id available for source track",
-                    )
-                )
-                continue
-            actions.append(
-                PlannedAction(
-                    item_id=item.id,
-                    kind="ytm_like",
-                    primary_video_id=primary,
-                    secondary_video_id=None,
-                )
-            )
-
-        elif item.issue_type == ISSUE_POINTER_DRIFT:
-            if not include_fuzzy_drift and not is_stage4_drift_reason(item.reason):
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="yt_relike",
-                        reason=(
-                            "title-only fuzzy match; not auto-applied "
-                            "(pass --include-fuzzy-drift to opt in)"
-                        ),
-                    )
-                )
-                continue
-            if item.confidence < drift_min_confidence:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="yt_relike",
-                        reason=f"confidence {item.confidence} < {drift_min_confidence}",
-                    )
-                )
-                continue
-            primary = _video_id_for(video_ids, item.related_track_id)
-            secondary = _video_id_for(video_ids, item.source_track_id)
-            if primary is None or secondary is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="yt_relike",
-                        reason="no video_id available for source/related track",
-                    )
-                )
-                continue
-            actions.append(
-                PlannedAction(
-                    item_id=item.id,
-                    kind="yt_relike",
-                    primary_video_id=primary,
-                    secondary_video_id=secondary,
-                )
-            )
-
-        elif item.issue_type == ISSUE_YTMUSIC_ONLY:
-            primary = _video_id_for(video_ids, item.source_track_id)
-            if primary is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="yt_like",
-                        reason="no video_id available for source track",
-                    )
-                )
-                continue
-            actions.append(
-                PlannedAction(
-                    item_id=item.id,
-                    kind="yt_like",
-                    primary_video_id=primary,
-                    secondary_video_id=None,
-                )
-            )
-
-        elif item.issue_type == ISSUE_METADATA_DRIFT:
-            # Informational finding — no record, no action.
-            continue
-
-        elif item.issue_type == ISSUE_DUPLICATE_IN_SOURCE:
-            parsed = _parse_duplicate_in_source_reason(item.reason)
-            if parsed is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason="unparseable duplicate_in_source reason",
-                    )
-                )
-                continue
-            if parsed.source != YTMUSIC_LIKED_SONGS:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason=f"duplicate in {parsed.source} source; not handled in 0.5",
-                    )
-                )
-                continue
-            if parsed.count != 2:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason=(
-                            f"count={parsed.count}; only N=2 is auto-handled in 0.5. "
-                            "File an issue for higher counts."
-                        ),
-                    )
-                )
-                continue
-            primary = _video_id_for(video_ids, item.source_track_id)
-            if not primary:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason="no video_id available for source track",
-                    )
-                )
-                continue
-            if youtube_liked_video_ids is None:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason="diagnosis has no YouTube scan to rule out a YouTube like",
-                    )
-                )
-                continue
-            if primary in youtube_liked_video_ids:
-                skips.append(
-                    SkipRecord(
-                        item_id=item.id,
-                        kind="ytm_dedupe",
-                        reason=(
-                            "video is liked on YouTube; INDIFFERENT would remove that "
-                            "like too (self-revert) — dedupe by hand"
-                        ),
-                    )
-                )
-                continue
-            actions.append(
-                PlannedAction(
-                    item_id=item.id,
-                    kind="ytm_dedupe",
-                    primary_video_id=primary,
-                    secondary_video_id=None,
-                )
-            )
-
-        # Unknown future issue types fall through silently (no WARN channel
-        # — sync.plan stays pure).
+        else:
+            actions.append(PlannedAction(item_id=item.id, kind=kind, a_video_id=a, b_video_id=b))
 
     return actions, skips
+
+
+def _skip_reason(
+    item: DiagnosisItem, availability: dict[int, bool | None], *, include_playable: bool
+) -> str | None:
+    if not is_write_eligible(item):
+        return "report-only finding (pair unconfirmed or A's availability unknown; see `issues`)"
+    if item.issue_type == ISSUE_SHADOW_DUPLICATE:
+        playable = availability.get(item.source_track_id) if item.source_track_id else None
+        if playable is None:
+            return "A's availability is unknown in the YouTube scan"
+    else:
+        playable = item.issue_type == ISSUE_RENDERED_AS_OTHER
+    if playable and not include_playable:
+        return "A is a playable video you liked; pass --include-playable to act on it"
+    return None
 
 
 def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None:
@@ -407,44 +167,31 @@ def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None
     return video_ids.get(track_id)
 
 
-_PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedupe")
+_ACTION_KINDS: tuple[ActionKind, ...] = ("repoint", "unlike_shadow")
 
-# Quota cost per action kind (YouTube `videos.rate` = 50 units; ytm is free).
-# Drift's worst case = 101 (like 50 + getRating verify 1 + unlike 50).
+# YouTube quota: ``videos.rate`` = 50 units, ``videos.getRating`` = 1. A
+# restore (re-like + getRating = 51) only runs after a failed LM check, so it
+# isn't in the estimate. YT Music reads are free.
 _DAILY_QUOTA = 10000
 
 _QUOTA_COST: dict[ActionKind, int] = {
-    "yt_unlike": 50,
-    # rate-none + rate-like (verify reads are free; client retries are transparent)
-    "ytm_like": 100,
-    # videos.rate (50) + videos.getRating verify (1)
-    "yt_like": 51,
-    # like + getRating verify + unlike
-    "yt_relike": 101,
-    "ytm_dedupe": 0,
+    # like B + getRating B + unlike A + getRating A
+    "repoint": 102,
+    # getRating B + unlike A + getRating A
+    "unlike_shadow": 52,
 }
 
 
 def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
     """Human-readable plan summary. Plain text — Rich rendering belongs in cli.py."""
-    by_action: dict[str, int] = {}
-    for a in actions:
-        by_action[a.kind] = by_action.get(a.kind, 0) + 1
-    by_skip: dict[str, int] = {}
-    for s in skips:
-        by_skip[s.kind] = by_skip.get(s.kind, 0) + 1
-
+    by_action = Counter(a.kind for a in actions)
+    by_skip = Counter(s.kind for s in skips)
     quota = sum(_QUOTA_COST[a.kind] for a in actions)
 
     lines = ["Sync plan:"]
-    for kind in _PLAN_ACTION_KINDS:
-        lines.append(f"  {kind}: {by_action.get(kind, 0)}")
+    lines += [f"  {kind}: {by_action[kind]}" for kind in _ACTION_KINDS]
     lines.append(f"  skipped: {len(skips)}")
-    if by_skip:
-        for kind in _PLAN_ACTION_KINDS:
-            count = by_skip.get(kind, 0)
-            if count:
-                lines.append(f"    {kind}: {count}")
+    lines += [f"    {kind}: {by_skip[kind]}" for kind in _ACTION_KINDS if by_skip[kind]]
     lines.append(f"Estimated YouTube quota: {quota} units (daily default {_DAILY_QUOTA})")
     if quota > _DAILY_QUOTA:
         lines.append(
@@ -452,491 +199,3 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
             "out; slice it with --limit"
         )
     return "\n".join(lines)
-
-
-def execute(
-    session: Session,
-    actions: list[PlannedAction],
-    skips: list[SkipRecord],
-    *,
-    ytm: YTMusicClient,
-    yt: YouTubeClient,
-) -> ExecResult:
-    """Apply ``actions``, record one SyncAttempt per HTTP call (and per skip).
-
-    ``ExecResult`` counts FINDINGS (one tally per action / skip), not HTTP
-    calls — drift's two halves are one action. A drift where the like
-    succeeded but the unlike failed counts as ``failed`` (the item stays
-    ``open``). The per-call detail lives in the ``SyncAttempt`` rows.
-
-    Commit cadence: per-action. A crash mid-run preserves all prior
-    commits — the next ``sync`` re-evaluates anything at ``status='open'``.
-    Items at ``status='skipped'`` are terminal (code-set on cross-prop
-    verify-miss for ``ytm_like`` and ``yt_like``, or set manually by the
-    operator). The planner drops both ``'applied'`` and ``'skipped'`` items
-    silently — neither is re-attempted.
-
-    Carve-out: ``ytm_dedupe`` flips ``item.status`` to ``"applied"``
-    regardless of success. The call is non-idempotent — auto-retrying
-    a failed unlike risks over-removal because client failure can't
-    distinguish "server processed, client errored" from "server didn't
-    process". Genuine failures self-correct via the next compare-likes.
-
-    YouTube daily-quota exhaustion stops all further YouTube work: the
-    action that hit it counts as failed (its attempt rows are committed)
-    and the remaining YouTube actions stay 'open' untouched — continuing
-    would only fail them one by one. ``ytm_dedupe`` uses no YouTube quota,
-    so those still run.
-    """
-    applied = 0
-    failed = 0
-    skipped = 0
-    left_unliked: list[str] = []
-
-    for skip in skips:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=skip.item_id,
-                kind=skip.kind,
-                status="skipped",
-                reason=skip.reason,
-            )
-        )
-        skipped += 1
-        session.commit()
-
-    quota_exhausted = False
-    unattempted = 0
-    for action in actions:
-        if quota_exhausted and action.kind != "ytm_dedupe":
-            unattempted += 1
-            continue
-        item = session.get(DiagnosisItem, action.item_id)
-        # ``item`` is non-None in normal flow — the planner only emits
-        # actions for items it just iterated; defensive None-skip just
-        # in case a concurrent delete raced us.
-        if item is None:
-            continue
-
-        try:
-            outcome = _dispatch(action, ytm=ytm, yt=yt, session=session, left_unliked=left_unliked)
-        except YouTubeQuotaExceededError:
-            failed += 1
-            quota_exhausted = True
-            session.commit()
-            continue
-        if outcome == "applied":
-            applied += 1
-            item.status = "applied"
-        elif outcome == "skipped":
-            skipped += 1
-            item.status = "skipped"
-        else:
-            failed += 1
-        # ytm_dedupe is non-idempotent — terminal-on-attempt regardless of success.
-        # Client failure doesn't distinguish "server processed, client errored"
-        # from "server didn't process", so auto-retry would risk over-removal.
-        # Genuine failures self-correct via the next compare-likes (lingering dup
-        # → new finding → new attempt).
-        if outcome == "failed" and action.kind == "ytm_dedupe":
-            item.status = "applied"
-        session.commit()
-
-    return ExecResult(
-        applied=applied,
-        failed=failed,
-        skipped=skipped,
-        quota_exhausted=quota_exhausted,
-        unattempted=unattempted,
-        left_unliked=tuple(left_unliked),
-    )
-
-
-def _dispatch(
-    action: PlannedAction,
-    *,
-    ytm: YTMusicClient,
-    yt: YouTubeClient,
-    session: Session,
-    left_unliked: list[str],
-) -> _DispatchOutcome:
-    """Run ``action``'s HTTP call(s), record SyncAttempt rows, return outcome.
-
-    ``"applied"`` iff every call for the action succeeded — i.e. the
-    dispatcher is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
-    ``"skipped"`` is a terminal non-failure outcome — returned by
-    ``_try_ytm_like`` when cross-prop didn't observe the song in YT Music,
-    and by ``_try_yt_like`` / ``yt_relike`` when the like was not observed
-    on YouTube, all after a 5s wait; ``"failed"`` is anything else.
-
-    Note: for ``ytm_dedupe``, the outcome is used only for ``ExecResult``
-    counting. Terminality (``status='applied'`` regardless of success) is
-    handled by ``execute()``, not here.
-
-    ``YouTubeQuotaExceededError`` propagates (after its failed attempt row
-    is recorded) so ``execute()`` can stop the run.
-    """
-    if action.kind == "yt_unlike":
-        ok = _try_yt_rate(
-            session,
-            action.item_id,
-            kind="yt_unlike",
-            yt=yt,
-            video_id=action.primary_video_id,
-            rating="none",
-        )
-        return "applied" if ok else "failed"
-
-    if action.kind == "ytm_like":
-        return _try_ytm_like(
-            session,
-            action.item_id,
-            ytm=ytm,
-            yt=yt,
-            video_id=action.primary_video_id,
-            left_unliked=left_unliked,
-        )
-
-    if action.kind == "yt_like":
-        return _try_yt_like(
-            session,
-            action.item_id,
-            yt=yt,
-            video_id=action.primary_video_id,
-        )
-
-    if action.kind == "yt_relike":
-        # like first, unlike only on like-success — see plan Decision 5
-        # ("safe fail": unlike failure leaves a duplicate like the next
-        # run can clean up; like failure leaves the original like alone).
-        like_ok = _try_yt_rate(
-            session,
-            action.item_id,
-            kind="yt_relike_like",
-            yt=yt,
-            video_id=action.primary_video_id,
-            rating="like",
-        )
-        if not like_ok:
-            return "failed"
-        # "Success" isn't enough: a relinked B's like can silently not land,
-        # and since YT Music's B entry rides on A's like, unliking A would
-        # then drop the song from both platforms. Unlike only once the like
-        # is confirmed; a verify-miss is terminal ('skipped'), A stays liked.
-        verified = _verify_yt_liked(
-            session,
-            action.item_id,
-            kind="yt_relike_verify",
-            yt=yt,
-            video_id=action.primary_video_id,
-        )
-        if verified != "applied":
-            return verified
-        # Defensive — planner always provides secondary for yt_relike,
-        # but the type signature permits None.
-        if action.secondary_video_id is None:
-            return "applied"
-        ok = _try_yt_rate(
-            session,
-            action.item_id,
-            kind="yt_relike_unlike",
-            yt=yt,
-            video_id=action.secondary_video_id,
-            rating="none",
-        )
-        return "applied" if ok else "failed"
-
-    if action.kind == "ytm_dedupe":
-        ok = _try_ytm_unlike(
-            session,
-            action.item_id,
-            ytm=ytm,
-            video_id=action.primary_video_id,
-        )
-        return "applied" if ok else "failed"
-
-    # Unreachable for the closed ActionKind set, but keeps the function
-    # total for static analyzers.
-    return "failed"
-
-
-def _reraise_if_quota(exc: YouTubeWriteError) -> None:
-    """Quota exhaustion ends the run (see ``execute``); other write errors are per-item."""
-    if isinstance(exc, YouTubeQuotaExceededError):
-        raise exc
-
-
-def _try_yt_rate(
-    session: Session,
-    item_id: int,
-    *,
-    kind: str,
-    yt: YouTubeClient,
-    video_id: str,
-    rating: Literal["like", "none"],
-) -> bool:
-    try:
-        yt.rate_video(video_id, rating)
-    except YouTubeWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind=kind,
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        _reraise_if_quota(exc)
-        return False
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind=kind,
-            status="applied",
-            reason="ok",
-        )
-    )
-    return True
-
-
-def _try_ytm_like(
-    session: Session,
-    item_id: int,
-    *,
-    ytm: YTMusicClient,
-    yt: YouTubeClient,
-    video_id: str,
-    left_unliked: list[str],
-) -> _DispatchOutcome:
-    """Cross-prop like: YouTube unlike → relike → wait → verify on YT Music.
-
-    YT Music has no first-class API to like a song from outside the
-    YouTube property. The reliable observed path is to toggle the YouTube
-    like off then back on, which YouTube propagates to the YT Music
-    "Liked songs" playlist within a few seconds. We then re-fetch LM and
-    check for the ``video_id`` to confirm.
-
-    Outcomes (each step records a SyncAttempt row with a distinct kind):
-      * ``"applied"`` — both YouTube calls + verify all succeeded and
-        the song is now in LM.
-      * ``"skipped"`` — both YouTube calls succeeded but the song wasn't
-        observed in LM within the verify window. Cross-prop didn't fire
-        (e.g. song is YouTube-only). Terminal: retrying just repeats the
-        same outcome.
-      * ``"failed"`` — any HTTP/auth failure. ``DiagnosisItem.status``
-        stays ``"open"`` so the next run retries. If the unlike succeeded
-        but the relike failed, the video is left unliked on YouTube and is
-        appended to ``left_unliked`` so the CLI can name it.
-    """
-    # Step 1: YouTube unlike
-    try:
-        yt.rate_video(video_id, "none")
-    except YouTubeWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="ytm_like_yt_unlike",
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        _reraise_if_quota(exc)
-        return "failed"
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind="ytm_like_yt_unlike",
-            status="applied",
-            reason="rate(none) ok",
-        )
-    )
-
-    # Step 2: YouTube relike
-    try:
-        yt.rate_video(video_id, "like")
-    except YouTubeWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="ytm_like_yt_relike",
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        left_unliked.append(video_id)
-        _reraise_if_quota(exc)
-        return "failed"
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind="ytm_like_yt_relike",
-            status="applied",
-            reason="rate(like) ok",
-        )
-    )
-
-    # Step 3: cross-prop wait + verify
-    time.sleep(_YTM_LIKE_VERIFY_WAIT_SECONDS)
-    try:
-        present = ytm.is_in_liked_songs(video_id)
-    except (UnexpectedResponseError, AuthFileMissingError) as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="ytm_like_verify",
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        return "failed"
-    if present:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="ytm_like_verify",
-                status="applied",
-                reason="present in ytmusic library",
-            )
-        )
-        return "applied"
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind="ytm_like_verify",
-            status="skipped",
-            reason="not observed within first 10000 liked songs after +5s",
-        )
-    )
-    return "skipped"
-
-
-def _try_yt_like(
-    session: Session,
-    item_id: int,
-    *,
-    yt: YouTubeClient,
-    video_id: str,
-) -> _DispatchOutcome:
-    """Like a video on YouTube and verify it landed in Liked Videos.
-
-    Unlike ``_try_ytm_like``, ``videos.rate("like")`` is idempotent — no
-    unlike-then-relike toggle is required. Two ``SyncAttempt`` rows are
-    recorded (one per step).
-
-    Outcomes:
-      * ``"applied"`` — ``rate("like")`` succeeded and ``is_in_liked_videos``
-        confirmed the video is present.
-      * ``"skipped"`` — ``rate("like")`` succeeded but the video was not
-        observed in Liked Videos within the verify window. Terminal: this
-        usually means a region/license restriction prevents the like from
-        taking effect. ``DiagnosisItem.status`` flips to ``"skipped"`` via
-        the existing ``execute()`` outcome-routing — no new code in
-        ``execute()`` is needed.
-      * ``"failed"`` — any ``YouTubeWriteError`` on either step.
-        ``DiagnosisItem.status`` stays ``"open"`` so the next run retries.
-    """
-    # Step 1: YouTube rate("like")
-    try:
-        yt.rate_video(video_id, "like")
-    except YouTubeWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="yt_like_yt_rate",
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        _reraise_if_quota(exc)
-        return "failed"
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind="yt_like_yt_rate",
-            status="applied",
-            reason="rate(like) ok",
-        )
-    )
-
-    # Step 2: cross-prop wait + verify
-    return _verify_yt_liked(session, item_id, kind="yt_like_verify", yt=yt, video_id=video_id)
-
-
-def _verify_yt_liked(
-    session: Session,
-    item_id: int,
-    *,
-    kind: str,
-    yt: YouTubeClient,
-    video_id: str,
-) -> _DispatchOutcome:
-    """Wait, then confirm via ``videos.getRating`` that a like on ``video_id``
-    actually landed — a 2xx from ``videos.rate`` doesn't guarantee it.
-
-    ``"applied"`` = rating is ``like``; ``"skipped"`` = it isn't (terminal:
-    retrying repeats the same no-op); ``"failed"`` = the read errored.
-    Records one ``SyncAttempt`` of ``kind``.
-    """
-    time.sleep(_YT_LIKE_VERIFY_WAIT_SECONDS)
-    try:
-        present = yt.is_in_liked_videos(video_id)
-    except YouTubeWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind=kind,
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        _reraise_if_quota(exc)
-        return "failed"
-    if present:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind=kind,
-                status="applied",
-                reason="present in youtube liked videos",
-            )
-        )
-        return "applied"
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind=kind,
-            status="skipped",
-            reason=f"not observed in youtube liked videos after +{_YT_LIKE_VERIFY_WAIT_SECONDS}s",
-        )
-    )
-    return "skipped"
-
-
-def _try_ytm_unlike(
-    session: Session,
-    item_id: int,
-    *,
-    ytm: YTMusicClient,
-    video_id: str,
-) -> bool:
-    try:
-        ytm.unlike_song(video_id)
-    except YTMusicWriteError as exc:
-        session.add(
-            SyncAttempt(
-                diagnosis_item_id=item_id,
-                kind="ytm_dedupe",
-                status="failed",
-                reason=str(exc),
-            )
-        )
-        return False
-    session.add(
-        SyncAttempt(
-            diagnosis_item_id=item_id,
-            kind="ytm_dedupe",
-            status="applied",
-            reason="ok",
-        )
-    )
-    return True
