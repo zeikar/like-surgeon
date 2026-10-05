@@ -15,8 +15,8 @@ Each action first reads A's rating (A must still be liked — the user may have
 unliked it since the scan) and, for a repoint, B's (B must not be liked yet);
 a stale finding is skipped without writes. A repoint that leaves A liked after
 B's like may have landed (A restored, A's unlike rejected by the quota, B's
-like erroring or unconfirmed) undoes B's like, so nothing is left behind; a B
-left liked is reported in ``ExecResult.left_liked``. Any action that needs a
+like erroring or unconfirmed) attempts to undo B's like; a B whose undo fails
+or can't be confirmed is reported in ``ExecResult.left_liked``. Any action that needs a
 restore, successful or not, or whose B undo fails stops the run: a mismatch
 means an order-derived pair was wrong, and later pairs of the same diagnosis
 may be too.
@@ -453,9 +453,11 @@ class _SyncRun:
         return "failed"
 
     def _undo_b_like(self, item_id: int, b: str) -> None:
-        """Unlike the B this run liked, after A's restore (``repoint_rollback`` /
-        ``repoint_rollback_verify``). A failure doesn't change the action's
-        outcome — A is already back — but B is reported in ``left_liked``."""
+        """Try to unlike a B this run may have liked while A stays liked
+        (``repoint_rollback`` / ``repoint_rollback_verify``) — after A's restore,
+        after A's unlike was quota-rejected, or after B's like errored. A failure
+        doesn't change the action's outcome (A is liked either way), but B is
+        reported in ``left_liked`` and the run stops."""
         if (
             self._rate(item_id, "repoint_rollback", b, "none") != "ok"
             or self._has_rating(item_id, "repoint_rollback_verify", b, "none", miss="failed")
