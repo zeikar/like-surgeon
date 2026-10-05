@@ -27,8 +27,8 @@ uv run ruff format .
 
 Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<module>.py`. Three flavors:
 
-- **Unit** — pure-functional modules (`classify`, `normalize`, `compare`, `drift`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network.
-- **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
+- **Unit** — pure-functional modules (`classify`, `normalize`, `drift`, `align`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network. `test_align.py` drives the LL→LM alignment with small synthetic lists (consecutive relinks, duplicate copies, edge gaps, *k* ≠ *m*).
+- **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_pipeline`, `test_sync`, `test_sync_dispatch`, `test_sync_preflight`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
   ```python
   @pytest.fixture
   def session() -> Iterator[Session]:
@@ -46,9 +46,10 @@ Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<modul
 
 ### Fakes and isolation
 
-Two recurring patterns:
+Three recurring patterns:
 
 - **In-memory DB** — every test that touches SQL uses `session` fixture (clean schema per test). The fixture creates a fresh `:memory:` engine, calls `init_db`, and yields a session.
+- **`tests/fake_account.py`** — `FakeAccount` is one fake account seen through both sync clients (the YouTube and YT Music surfaces `sync_dispatch` uses). It holds LL ratings (newest first) plus a render map; LM is derived from LL on every read (each liked video shows as `renders.get(video, video)`, or not at all for `None`), so a write changes LM the way the rendering model says. That is what `test_sync_dispatch.py` and the `sync` tests in `test_cli.py` rely on to exercise the post-unlike LM check and restore. Knobs simulate a like that doesn't land, an unlike that lands late, write/read errors, quota exhaustion and stale or failing LM reads.
 - **`LIKE_SURGEON_HOME` override** — CLI tests set the env var to `tmp_path` so `Config.load()` reads a test-controlled directory:
   ```python
   @pytest.fixture
@@ -149,17 +150,6 @@ For larger lookups (`Track.id.in_(...)`), the CLI batches into chunks of 500 to 
 
 ## Debugging tips
 
-**Small scans.** Both scan commands accept `--limit`:
-
-```bash
-uv run likesurgeon scan youtube-likes --limit 50
-uv run likesurgeon scan ytmusic --limit 50
-```
-
-Both default to `--limit 5000`.
-
-Use small limits for quick iteration when working on classification, ghost detection, or matching changes.
-
 **Isolated home for experiments.** Set `LIKE_SURGEON_HOME` to a tmp dir to avoid polluting your real DB while testing:
 
 ```bash
@@ -173,7 +163,7 @@ rm -rf "$SCRATCH"
 **JSON output for piping.** `issues --format json` is structured for `jq` / `python3 -c '...'`:
 
 ```bash
-uv run likesurgeon issues --type unavailable_video --format json | \
+uv run likesurgeon issues --type relinked --format json | \
   python3 -c "
 import json, sys
 data = json.load(sys.stdin)

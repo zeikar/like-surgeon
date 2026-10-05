@@ -1,25 +1,28 @@
 # like-surgeon
 
-> Sync, backup, and repair your YouTube Music liked songs.
+> Diagnose and repair mismatches between your YouTube Music liked songs and YouTube likes.
 
 **Status:** Local-first CLI, no server. Per-release scope and changelog: [GitHub Releases](https://github.com/zeikar/like-surgeon/releases).
+
+**The model.** YouTube Liked videos (**LL**) is the only store of likes. YT Music Liked songs (**LM**) is a rendering of it, in the same order, and each LM entry can be shown as a different video than the YouTube video whose like backs it. Below, **A** is the YouTube video whose like backs an LM entry and **B** is the video that entry shows (relinked tracks, official MVs shown as their audio track, and duplicates all follow from this). Details: [docs/design/ll-lm-alignment.md](docs/design/ll-lm-alignment.md).
 
 ## What it does today
 
 - Authenticates with YouTube Music (`ytmusicapi`, browser-header) and YouTube Data API v3 (Google OAuth, desktop client).
 - Snapshots `ytmusic_liked_songs` (YouTube Music likes) and `youtube_liked_videos` (YouTube LL playlist) into a local SQLite DB.
 - Diffs any two snapshots, exports any snapshot to JSON.
-- Classifies YouTube liked videos as music-candidate / not via heuristics (channel ends with `- Topic`, "Provided to YouTube by …", "Official Music Video", "Lyric Video", `artist - title`, etc.; negatives like `vlog`, `tutorial`, `gameplay`).
-- `compare-likes` does a three-stage match (`video_id` → `canonical_key` → RapidFuzz fuzzy on `title | artists`) and persists findings as a `Diagnosis`. With YouTube auth, a Stage 4 pass enriches unmatched candidates via `videos.list` and promotes `(channel_id, duration ±2s, normalized title)` triple matches into pointer-drift candidates. Read-only; snapshots stay frozen.
-- Detects ghost YouTube likes (deleted, made private, region-blocked, unavailable) at scan time, and metadata drift (title or artists list changes) between snapshots — both surface through `compare-likes` and `issues`. Region-blocked detection requires setting an [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) country code (e.g. `KR`) in `~/.like-surgeon/config.json`.
+- Classifies YouTube liked videos as music-candidate / not via title and channel heuristics.
+- `compare-likes` aligns the latest LL and LM scans by order — position reveals which YouTube like backs each LM entry — and persists the findings as a `Diagnosis`. Snapshots stay frozen.
+- Detects ghost YouTube likes (deleted, private, region-blocked, unavailable) at scan time, and metadata drift (title or artists changes) between snapshots. Region-blocked detection needs a country code in `config.json` (see Scan).
+- `sync` repairs the inconsistencies the alignment finds, on YouTube only, with an LM-wide check after every unlike and an automatic re-like if YT Music doesn't change as expected.
 - `issues` lists the latest diagnosis with type/confidence filters and JSON output.
-- `doctor` is multi-source: per-source counts, latest diagnosis summary, match-rate health score.
+- `doctor` is multi-source: per-source counts, latest diagnosis, LM backed % (share of YT Music liked songs traced to the YouTube like behind them).
 
 Snapshots preserve **point-in-time metadata** — the title, channel, description, etc. that the provider returned at scan time are frozen on each `SnapshotItem`. A later rename in YouTube Music or YouTube doesn't rewrite history.
 
 ## Roadmap
 
-Shipped per-release scope and the full changelog live in [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). Next: **1.0** — local web UI / Electron app.
+Shipped per-release scope and the full changelog live in [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). Unreleased: the LL→LM alignment redesign of `compare-likes` / `sync` unreleased. Next: **1.0** — local web UI / Electron app.
 
 ## Install
 
@@ -101,22 +104,16 @@ The first run prints a 6-step setup walkthrough that ends with you placing a `yo
 
 Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) code for your country. Without this, `scan youtube-likes` prints a one-time warning and falls back to status-only ghost detection (no region check).
 
-You can also tune the RapidFuzz cross-source match cutoff with `fuzzy_threshold` (default `85`, range `[0, 100]`):
-
-```json
-{
-  "region": "KR",
-  "fuzzy_threshold": 80
-}
-```
-
-Lowering `fuzzy_threshold` increases recall on real drift but also raises false-positive `possible_pointer_drift` risk.
+> `fuzzy_threshold` in `config.json` is deprecated: it is ignored (with a warning from `compare-likes`) now that matching is order-based.
 
 ```bash
 uv run likesurgeon scan ytmusic                 # YT Music likes
 uv run likesurgeon scan youtube-likes           # YouTube LL playlist
-uv run likesurgeon scan youtube-likes --limit 200
 ```
+
+Scans always fetch the full list — there is no `--limit`, because aligning a truncated list is meaningless.
+
+> **Cookie staleness.** YT Music browser cookies extracted from Chrome went stale within about an hour in practice. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
 
 ### 4. Inspect
 
@@ -133,84 +130,80 @@ uv run likesurgeon doctor
 ```bash
 uv run likesurgeon compare-likes
 uv run likesurgeon issues
-uv run likesurgeon issues --type possibly_missing_from_ytmusic
-uv run likesurgeon issues --type unavailable_video
+uv run likesurgeon issues --type relinked
+uv run likesurgeon issues --type shadow_duplicate
 uv run likesurgeon issues --type metadata_drift
-uv run likesurgeon issues --min-confidence 0.7 --format json
+uv run likesurgeon issues --min-confidence 1.0 --format json
 ```
 
-`compare-likes` requires a snapshot from each source. It prints a bucket summary and persists the run as a `Diagnosis`. `issues` then surfaces the per-item breakdown.
+`compare-likes` requires a snapshot from each source. It aligns the two lists (LIS anchors, then in-order pairing of the gaps between them), fetches `videos.list` metadata for each aligned pair, and persists the run as a `Diagnosis`. The summary shows the LM / LL counts, how many LM entries are backed by their own video, and one row per finding type (the three pair types as `write-eligible / total`). It warns when one of our own `sync` attempts happened after the older of the two scans (re-scan both, then re-run). Without YouTube auth the metadata fetch is skipped and every pair is report-only. `issues` surfaces the per-item breakdown.
+
+| `issue_type` | Meaning | `sync` |
+|---|---|---|
+| `relinked` | A YouTube like (A, unavailable) is shown in YT Music as another video B, B not liked | repoint |
+| `rendered_as_other` | Same, but A is not known to be unavailable (usually a playable MV or fan upload; unknown availability is report-only) | repoint, only with `--include-playable` |
+| `shadow_duplicate` | A is shown as B, and B is also liked, so YT Music shows B twice | unlike A if A is unavailable; playable A only with `--include-playable` |
+| `dead_unrendered` | Unavailable YouTube like not shown in YT Music | report only (a restriction can lift) |
+| `unrendered_music` | Playable, music-looking YouTube like not shown in YT Music | report only |
+| `unbacked_lm_entry` | YT Music entry with no determinable YouTube like behind it | report only |
+| `metadata_drift` | Title/artists changed between two scans of one source | report only |
+
+A pair (A shown as B) is **write-eligible** only at confidence 1.0: it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles) and A's availability is known. Everything else is report-only. LL videos in gaps whose LM and LL counts differ get no finding.
 
 ### 6. Sync (write actions)
 
-`sync` applies the latest diagnosis's actionable findings. Default is **actually write** after a y/N prompt — use `--dry-run` to see the plan without writing, `--yes` to skip the prompt, `--limit N` to ramp. Before the prompt it warns if the diagnosis looks stale (a newer scan exists than the one it used, or a scan it used is over an hour old), and names any video an earlier run left unliked (see *Quota exhaustion* below) — those re-likes run first.
+`sync` applies the latest diagnosis's write-eligible findings, on YouTube only (it never calls YT Music `rate_song`). Default is **actually write** after a y/N prompt — use `--dry-run` to see the plan without writing, `--yes` to skip the prompt, `--limit N` to ramp, `--include-playable` to also act on playable originals. Before the prompt it prints the plan, warns if the diagnosis looks stale (a newer scan exists than the one it used, or a scan it used is over an hour old), and names any video an earlier run may have left unliked.
 
 ```bash
 uv run likesurgeon sync --dry-run                 # plan + quota estimate, no writes
 uv run likesurgeon sync                            # apply, with confirmation prompt
 uv run likesurgeon sync --yes                      # apply, no prompt
 uv run likesurgeon sync --limit 20 --yes           # apply first 20 actions only
-uv run likesurgeon sync --include-fuzzy-drift      # also apply title-only fuzzy drifts (see below)
+uv run likesurgeon sync --include-playable         # also MV / fan-upload originals
 uv run likesurgeon skip 812 813                    # keep sync off findings #812, #813 (unskip to undo)
 ```
 
-#### What each finding type does
+#### Actions
 
-| `issue_type` | Action | YouTube call | YT Music call | Auto-apply | Notes |
-|---|---|---|---|---|---|
-| `unavailable_video` | YouTube unlike | `videos.rate(rating="none")` | — | always | Removes ghosts (private / deleted / rejected / unavailable) from your Liked videos. `region_blocked` is no longer auto-unliked — the video still exists and may become available again when the restriction lifts, so unliking it would permanently lose the like. Region-blocked vids no longer surface in this finding bucket. |
-| `possibly_missing_from_ytmusic` | YouTube unlike → relike (cross-prop) → 5s wait → YT Music verify | `videos.rate("none")` then `videos.rate("like")` (transparent retry on 5xx/429/403 rate-limit) | `is_in_liked_songs` read (verify, free) | always | Triggers cross-propagation: unlike then re-like on YouTube, waits 5s, then verifies the video appears in YT Music. `applied` = verify found; `skipped` = verify-miss (terminal — prevents re-fire noise; `likesurgeon unskip <id>` to retry); `failed` = HTTP error (retried next sync). 100 quota units (rate × 2; verify reads are free). |
-| `possible_pointer_drift` | YouTube like → verify → unlike | `videos.rate("like")`, `videos.getRating` (5s later), then `videos.rate("none")` | — | Stage-4 matches (channel + duration + title agree) with `confidence >= --drift-min-confidence` (default 0.95) — including fuzzy pairs that pass the same check (`enriched (verified fuzzy …)`). Unverified fuzzy (title-only) matches only with `--include-fuzzy-drift` | Re-points the YouTube like at the YT Music track's video_id. Like first, then unlike — a partial failure leaves a duplicate like (cleaned up on the next run) instead of losing the original. The unlike only runs once `getRating` confirms the new like: on some relinked videos `videos.rate("like")` returns OK without taking effect, and because YT Music's entry for the replacement rides on the original's like, unliking the original would then drop the song from **both** platforms. A verify-miss leaves the original liked and marks the finding `skipped`. `compare-likes` re-checks every fuzzy pair against `videos.list` (same channel, duration ±2s, same video title) — this catches the common YT Music relink whose display title just gained a romanized suffix (`夢の歌` → `夢の歌 - Yume no Uta`). Unverified fuzzy matches stay opt-in because the scorer rates a version variant at 1.0 (`"Song"` vs `"Song (Remix)"` / `"(Japanese ver.)"` share every token), and a wrong pair unlikes your original — `--drift-min-confidence` can't filter those out. Stage-4 pairs are always 0.95, so a threshold above that keeps only fuzzy pairs. |
-| `ytmusic_only` | YouTube like → 5s wait → YouTube verify | `videos.rate("like")` + `videos.getRating` (verify, 1 unit) | — | always | Reverse cross-prop: likes the video on YouTube so it propagates to Liked Videos. `applied` = verify confirmed the like landed; `skipped` = verify-miss (terminal — typically a region/license restriction; `likesurgeon unskip <id>` to retry); `failed` = HTTP error (retried next sync). ~51 quota units (50 rate + 1 getRating). |
-| `metadata_drift` | — | — | — | never | Informational only. Title/artist drift is signal for the user, not a write target. |
-| `duplicate_in_source` | YT Music unlike (-1 entry) | — | `rate_song("INDIFFERENT")` | ytmusic source, **N=2 only**, video **not** liked on YouTube (none at all if the diagnosis has no YouTube scan) | Removes one LM entry per finding. **Non-idempotent** (validated for N=2; N≥3 unvalidated → skip). Terminal after attempt — failures are NOT auto-retried within the same Diagnosis (avoids over-removing if the server processed but the client errored). Real failures self-correct via the next `compare-likes`. Propagation is minute-scale — wait a few minutes between a dedupe `sync` and the next `scan ytmusic` / `compare-likes`. |
+| Action | For | Steps | Quota (`videos.rate` 50 units, `getRating` 1) |
+|---|---|---|---|
+| repoint | `relinked`; `rendered_as_other` with `--include-playable` | like B, confirm via `getRating`, unlike A, confirm, full-LM check | 102 units |
+| unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, unlike A, confirm, full-LM check | 52 units |
 
-#### Why each finding occurs
+**LM check and restore.** After each unlike `sync` reads the whole LM again: repoint expects it unchanged, unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed. Unliking a wrongly paired A would otherwise silently drop an unrelated song. A restore re-like (~51 units) only happens after a failed check and isn't in the plan's estimate. The default daily YouTube quota is 10,000 units; the plan prints the estimate (warning above 10,000), and `--limit` slices a run.
 
-Understanding the *origin* of a finding matters because several of them are different faces of the same underlying YT Music behavior.
+`--include-playable` is off by default: it removes a real like you made (an official MV, a fan upload) so that YT Music shows only the audio track. Keep individual findings out with `skip`.
 
-- **`unavailable_video`** — a YouTube video you liked later went private / deleted / rejected / unavailable. The like persists but points at a dead vid. (`region_blocked` is deliberately **excluded**: restrictions lift between days, so unliking would permanently lose the like.)
-- **`possibly_missing_from_ytmusic`** — you liked a music video on the YouTube side (app/site) that was never liked from YT Music, so it has no YT Music Liked Song counterpart.
-- **`possible_pointer_drift`** and **`ytmusic_only`** are *two faces of the YT Music license-relink mechanism*:
-  - Song **A** is liked (video_id A, liked on both YouTube and YT Music). Its license expires → A becomes region-blocked / unplayable.
-  - YT Music auto-creates a replacement track **B** (new video_id) for the same song and **moves your YT Music like to B automatically**. YouTube keeps the old like on **A** (this is not propagated back).
-  - If B still matches A → detected as **`possible_pointer_drift`** (re-point the YouTube like A → B). `sync` auto-applies it when `videos.list` confirms the pair (same channel, duration, title); an unverified title-only fuzzy pair needs `--include-fuzzy-drift`.
-  - If B's title/artist diverged too far for the fuzzy matcher (the `fuzzy_threshold` cutoff) → the drift is *missed* and B surfaces as a brand-new **`ytmusic_only`** instead. So a chunk of `ytmusic_only` findings are really undetected pointer drifts.
-- **`metadata_drift`** — same video_id on both sides, but the title/artist text changed (re-upload, channel rename, YT Music metadata correction). Informational only.
-- **`duplicate_in_source`** — the same video_id is liked more than once within one source's list. Two origins:
-  - *Historical*: an early drift sync used the non-idempotent `rate_song(LIKE)`, which appends a new LM entry on every call.
-  - *Cross-prop induced*: `yt_like` on a `ytmusic_only` track likes B on YouTube; YT Music cross-propagates that like back into Liked Songs **alongside the entry it already had**, so B ends up liked twice in YT Music.
+#### If something goes wrong
 
-> **Known limitation: `yt_like` → `duplicate_in_source` → `ytm_dedupe` is self-reverting.** `ytm_dedupe`'s `rate_song("INDIFFERENT")` is rating-level, not occurrence-level: on a still-live cross-prop dup it round-trips to YouTube and also removes the `yt_like` like, landing back at `ytmusic_only` (verified live, 5/5 reverted). Net: quota spent, no durable change — and repeated `scan` → `compare-likes` → `sync` cycles would loop forever. **`sync` therefore refuses to dedupe a video that is liked on YouTube** (per the diagnosis's YouTube scan, or because a past `yt_like` / `yt_relike` liked it): it records a planner skip and leaves the dup for you to handle by hand. This covers historical-origin dups too: they came from `possibly_missing_from_ytmusic` findings — videos liked on YouTube — so `INDIFFERENT` strips their YouTube like as well. Auto-dedupe now only runs for dups whose video isn't liked on YouTube. The guard can't see a YouTube like you made by hand after the last YouTube scan — re-scan both sources before a dedupe sync.
->
-> **So relink-origin `ytmusic_only` has no safe automatic fix — handle it by hand:** on YouTube, like the replacement **B** and unlike the dead original **A** (the `possible_pointer_drift` remediation, done manually). Auto-pairing B↔A by title alone was prototyped and parked — title-only matching is a false-positive magnet and a wrong pair feeds the destructive drift sync.
+- **Restored** — LM didn't change as expected, so A was re-liked and the finding marked `skipped`. Nothing to do.
+- **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike: the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
+- **Aborted or quota stop** — remaining actions stay `open`. Re-scan both sources, run `compare-likes`, then `sync` again.
 
 #### State model
 
-- Each HTTP call (or skip decision) writes one `SyncAttempt` row with `kind`, `status` (`applied`/`failed`/`skipped`), and a `reason`. The originating `DiagnosisItem.reason` (the diagnosis-time evidence) is **never overwritten** — sync detail lives on `SyncAttempt.reason` instead.
-- `DiagnosisItem.status` only flips to `'applied'` when every API call for the action succeeded — *except* for `ytm_dedupe`, which is non-idempotent and flips to `'applied'` after any attempt (success OR failure) to prevent auto-retry over-removal. For drift that means BOTH halves. For other failures, the status stays at `'open'` so the next `sync` re-evaluates.
-- **Re-scan both sources + compare-likes immediately before a dedupe sync.** The dedupe guard reads YouTube likes from the YouTube scan, and a stale `duplicate_in_source` finding can remove the only remaining LM entry if the dup was already fixed manually or by propagation between diagnose and sync. Eventual consistency also runs the other way: avoid re-scanning for a few minutes *after* a dedupe sync, since a stale snapshot can recreate the same finding and the next sync over-removes.
-- Re-running `sync` is idempotent: `'applied'`/`'skipped'` items are terminal and not re-attempted; everything else stays `'open'` and is re-evaluated next run. Both action failures **and planner-level skips** (no video_id, below confidence threshold, unsupported duplicate shape) stay `'open'` — that's why lowering `--drift-min-confidence` picks up previously-borderline drifts on the next run.
-- **Terminal statuses.** `'applied'` = every API call succeeded (or `ytm_dedupe` attempt regardless of outcome). `'skipped'` = a terminal non-failure status, set in exactly two ways: code-set by `execute()` on a cross-prop verify-miss (`ytm_like` / `yt_like` where the expected platform didn't observe the like within 5s), or an explicit operator manual override (e.g. a private/deleted YouTube ghost that `videos.rate` rejects with 403/404). A **planner-level skip is NOT terminal** — it only writes a `SyncAttempt` audit row; the `DiagnosisItem` stays `'open'` and is re-planned next run.
-- **`'skipped'` survives re-diagnosis.** Each `compare-likes` writes fresh findings, so it copies `'skipped'` onto the matching new finding (same issue type and tracks) from the most recent earlier diagnosis that had it. `likesurgeon skip <id>…` suppresses findings for good (ids from `issues`, latest diagnosis; all-or-nothing), `likesurgeon unskip <id>…` re-opens them — including code-set verify-miss skips.
-- Continue-on-error: a failure (transport error, revoked token, YT Music auth or server error) records the per-item `failed` row and moves on. The run exits non-zero if any action failed.
-- **Quota exhaustion stops the YouTube work.** Every later YouTube call would fail too, so `sync` leaves the remaining YouTube actions `'open'` (YT-Music-only `ytm_dedupe`s still run). If the quota ran out between a `ytm_like`'s unlike and relike, that video is now liked nowhere — `sync` prints its id, and the next `sync` names it again and re-likes it first. Re-run `sync` after the quota resets **before** re-scanning (a re-scan drops the unliked video from the diff; `sync` then lists it for a manual re-like), or re-like it by hand.
-
-#### Quota
-
-`videos.rate` is **50 units per call**. A drift fix is two calls plus a `videos.getRating` verify (= 101 units). A `ytm_like` cross-prop fix is also two `videos.rate` calls (= 100 units; the `is_in_liked_songs` verify read is free). A `yt_like` reverse cross-prop fix is one `videos.rate` call plus one `videos.getRating` verify (= ~51 units). The default daily YouTube quota is 10,000 units. The plan summary prints the estimate before the prompt (and a warning when it exceeds 10,000); if it exceeds your remaining quota, slice across days with `--limit`.
+- `skipped` is terminal until you run `likesurgeon unskip <id>`: a finding becomes `skipped` when B's like didn't land, a precheck failed, A was restored, or you ran `skip`.
+- `skipped` carries over to later diagnoses: each `compare-likes` copies it onto the matching new finding.
 
 #### Safety
 
-- `sync` needs the YouTube **write** scope. If it aborts asking for it, run `likesurgeon auth youtube` again and accept "Manage your YouTube account" on the consent screen.
-- Plans with YT Music actions (`ytm_dedupe`, or `ytm_like`'s verify) need `browser.json`; `sync` aborts up front if it's missing rather than mark dedupes `'applied'` after a no-op.
-- Re-scan (`scan youtube-likes` + `compare-likes`) before a big sync. The diagnosis is a point-in-time snapshot — region restrictions flip, and unliking a stale ghost that's since become available is an avoidable false positive.
+Sync refuses (exit 1) when:
+- any of its own writes happened after the older of the two scans the diagnosis is built from — a write between scans misaligns them, and one after both makes the diagnosis stale. Re-scan both sources, then `compare-likes`.
+- YouTube write scope is missing — run `likesurgeon auth youtube` again and accept "Manage your YouTube account".
+- the YT Music auth probe fails (needs `browser.json`; re-run `auth ytmusic --from-browser`).
+
+Sync stops early when:
+- YT Music liked songs can't be read (no baseline to check against), or
+- YouTube's daily quota runs out.
+
+The run exits non-zero if any action failed or it stopped on an unreadable LM.
 
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
+- **Order alignment has limits.** YT Music exposes no backing id, so pairing relies on order. Gaps where the LM and LL counts differ stay report-only, and the YouTube API may stop at 5000 likes (unverified) — if your library is that large, compare the counts in `doctor` with what you see on YouTube.
 - **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status,contentDetails` for ghost detection — `contentDetails` adds the `regionRestriction` field for region-blocked detection, but `videos.list` is 1 unit/call regardless of `part=` selection); the default daily quota is 10000. Re-scanning a few times a day is fine.
-- **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — nothing is mutated on the user's behalf.
+- **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — only `sync` writes, and only write-eligible findings.
 
 ## Local layout
 
