@@ -344,14 +344,18 @@ def compare_likes(inp: CompareInput) -> CompareResult:
     # Stage 3: RapidFuzz fuzzy on "title | artists". Best-of-remaining per
     # yt row, ties go to the highest score. Each ytm row reserved on use.
     threshold = inp.fuzzy_threshold
+    # Targets are built once — rebuilding them per pair (a JSON decode each)
+    # dominated the O(unmatched × ytmusic) loop.
+    ytm_targets = [_fuzz_target(ytm) for ytm in inp.ytmusic]
     for yt_idx, yt in youtube_music:
         if yt_idx in used_yt_idx:
             continue
+        yt_target = _fuzz_target(yt)
         best: tuple[float, int] | None = None
-        for ytm_idx, ytm in enumerate(inp.ytmusic):
+        for ytm_idx, ytm_target in enumerate(ytm_targets):
             if ytm_idx in used_ytm_idx:
                 continue
-            score = fuzz.token_set_ratio(_fuzz_target(yt), _fuzz_target(ytm))
+            score = fuzz.token_set_ratio(yt_target, ytm_target)
             if score >= threshold and (best is None or score > best[0]):
                 best = (float(score), ytm_idx)
         if best is not None:

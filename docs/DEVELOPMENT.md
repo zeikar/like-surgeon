@@ -168,7 +168,7 @@ LIKE_SURGEON_HOME="$SCRATCH" uv run likesurgeon scan youtube-likes --region KR
 rm -rf "$SCRATCH"
 ```
 
-**Tracebacks for unexpected failures.** The CLI catches known exceptions (`InvalidRegionError`, `ClientSecretsMissingError`, `AuthorizationRequiredError`, `CookieExtractionError`) and converts them to `_fail(..., code=2)`. Anything else (network errors, ytmusicapi parse failures, sqlalchemy IntegrityError) is intentionally allowed to propagate as a traceback so you have stack frames to debug from.
+**Tracebacks for unexpected failures.** The CLI catches known exceptions (`InvalidRegionError`, `ClientSecretsMissingError`, `AuthorizationRequiredError`, `CookieExtractionError`, plus `AuthFileMissingError` / `UnexpectedResponseError` from YT Music and `HttpError` from the YouTube liked-videos fetch) and converts them to `_fail(...)`. The YT Music client wraps every ytmusicapi failure (parse, server, transport) into those two types, keeping the original as `__cause__`. Anything else (e.g. sqlalchemy IntegrityError) is intentionally allowed to propagate as a traceback so you have stack frames to debug from.
 
 **JSON output for piping.** `issues --format json` is structured for `jq` / `python3 -c '...'`:
 

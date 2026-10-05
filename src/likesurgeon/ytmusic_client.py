@@ -7,16 +7,14 @@ ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import sys
-import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from ytmusicapi import YTMusic
+
+from .fileio import write_private_text
 
 
 class AuthFileMissingError(FileNotFoundError):
@@ -24,11 +22,15 @@ class AuthFileMissingError(FileNotFoundError):
 
 
 class UnexpectedResponseError(RuntimeError):
-    """Raised when ytmusicapi returns a payload we can't safely interpret.
+    """Raised when a ytmusicapi read fails or returns a payload we can't
+    safely interpret (server error, transport error, reshaped response).
 
     Surfacing this as an error (rather than silently returning ``[]``) keeps
     a 0-track snapshot from masquerading as a successful scan — that would
-    make the next diff report every prior song as removed.
+    make the next diff report every prior song as removed. It is also the
+    single read-side failure type the ``sync`` dispatcher catches, so every
+    ytmusicapi read failure must arrive wrapped as this (or as
+    ``AuthFileMissingError``) to keep the continue-on-error contract.
     """
 
 
@@ -72,6 +74,8 @@ SUPPORTED_BROWSERS = (
     "lynx",
 )
 
+
+_VERIFY_FIRST_FETCH = 100
 
 _YTM_ORIGIN = "https://music.youtube.com"
 _YTM_HOST = "music.youtube.com"
@@ -199,12 +203,20 @@ class YTMusicClient:
         self._browser_path = browser_path
 
     def _build(self) -> YTMusic:
-        if self._browser_path is not None and self._browser_path.exists():
+        if self._browser_path is None or not self._browser_path.exists():
+            raise AuthFileMissingError(
+                "No YouTube Music auth file found. "
+                "Run `likesurgeon auth ytmusic` and follow the printed instructions."
+            )
+        try:
             return YTMusic(str(self._browser_path))
-        raise AuthFileMissingError(
-            "No YouTube Music auth file found. "
-            "Run `likesurgeon auth ytmusic` and follow the printed instructions."
-        )
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            # A corrupt/partial browser.json is "no usable auth file" too;
+            # the recovery (re-run auth) is the same as the missing case.
+            raise AuthFileMissingError(
+                f"YouTube Music auth file {self._browser_path} is unusable "
+                f"({type(exc).__name__}: {exc}). Re-run `likesurgeon auth ytmusic`."
+            ) from exc
 
     def unlike_song(self, video_id: str) -> None:
         """Remove ONE LM-playlist entry for ``video_id`` via ``rate_song(..., "INDIFFERENT")``.
@@ -213,9 +225,12 @@ class YTMusicClient:
         appends to LM), and ``setVideoId`` isn't returned by ``get_liked_songs`` so
         ``remove_playlist_items`` can't target a specific occurrence. Propagation is
         eventually consistent on the order of minutes — see callers' cooldown notes.
+
+        ``_build()`` sits inside the try so an auth failure is recorded as a
+        per-item write failure instead of aborting the whole ``sync`` loop.
         """
-        client = self._build()
         try:
+            client = self._build()
             client.rate_song(video_id, "INDIFFERENT")
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YTMusicWriteError(video_id, str(exc)) from exc
@@ -249,6 +264,13 @@ class YTMusicClient:
                 "`likesurgeon auth ytmusic` to refresh; if that doesn't fix "
                 "it, file an issue and include the original error."
             ) from exc
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            # Server errors (``YTMusicServerError``, e.g. 401 on stale cookies),
+            # transport errors, malformed JSON bodies, ...
+            raise UnexpectedResponseError(
+                f"ytmusicapi request failed ({type(exc).__name__}: {exc}). "
+                "If this persists, refresh auth with `likesurgeon auth ytmusic`."
+            ) from exc
         if not isinstance(result, dict):
             raise UnexpectedResponseError(
                 f"ytmusicapi.get_liked_songs returned a {type(result).__name__}, "
@@ -280,38 +302,24 @@ class YTMusicClient:
         historically returned ``None`` for unavailable tracks) are skipped
         rather than raising — a malformed entry shouldn't make a present
         ``video_id`` look absent.
+
+        A fresh like lands at the top of LM, so a short first fetch settles
+        the common case; the full ``limit`` fetch only runs on a miss, which
+        keeps a non-top placement from being reported as absent.
         """
-        tracks = self.fetch_liked_songs(limit=limit)
-        return any(isinstance(t, dict) and t.get("videoId") == video_id for t in tracks)
+        tiers = (_VERIFY_FIRST_FETCH, limit) if limit > _VERIFY_FIRST_FETCH else (limit,)
+        for lim in tiers:
+            tracks = self.fetch_liked_songs(limit=lim)
+            if any(isinstance(t, dict) and t.get("videoId") == video_id for t in tracks):
+                return True
+        return False
 
 
 def write_browser_json_from_browser(browser: str, target: Path) -> None:
     """Read youtube.com cookies from ``browser``, build a ytmusicapi-compatible
-    ``browser.json``, and write it to ``target`` atomically (mode ``0o600`` on
-    POSIX from creation; falls back to ``Path.write_text`` on Windows where
-    POSIX mode bits don't apply).
-
-    On POSIX we write to a sibling temp file in ``target.parent`` and then
-    ``os.replace`` it into place. ``tempfile.mkstemp`` creates the temp file
-    with mode ``0o600`` from inception, and rename(2) preserves that mode
-    onto ``target`` — so the fresh secret never lives on disk at a more
-    permissive mode, even when ``target`` already existed at e.g. ``0o644``
-    from an older version of this code. Same-directory rename is required
-    for atomicity (cross-filesystem rename isn't atomic).
+    ``browser.json``, and write it to ``target`` via ``write_private_text``
+    (atomic, ``0o600`` from creation on POSIX).
     """
     cookies = extract_youtube_cookies(browser)
     headers = _cookies_to_browser_json(cookies)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(headers, indent=2)
-    if sys.platform == "win32":
-        target.write_text(payload, encoding="utf-8")
-        return
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".browser.", suffix=".json.tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-        os.replace(tmp_name, target)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    write_private_text(target, json.dumps(headers, indent=2))

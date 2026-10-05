@@ -50,3 +50,24 @@ def test_export_preserves_point_in_time_metadata(session: Session):
 def test_export_unknown_snapshot_raises(session: Session):
     with pytest.raises(ValueError):
         export_snapshot_json(session, 999)
+
+
+def test_export_youtube_snapshot_keeps_dict_thumbnails(session: Session):
+    """The Data API returns ``snippet.thumbnails`` as a size-keyed dict, not
+    ytmusicapi's list — export must accept it rather than fail validation."""
+    thumbs = {"default": {"url": "https://i.ytimg.com/vi/v1/default.jpg", "width": 120}}
+    item = {
+        "snippet": {
+            "title": "Artist - Song (Official MV)",
+            "videoOwnerChannelTitle": "Artist",
+            "thumbnails": thumbs,
+            "resourceId": {"videoId": "v1"},
+        },
+        "contentDetails": {"videoId": "v1"},
+    }
+    snap = create_snapshot(session, "youtube_liked_videos", [item])
+    session.commit()
+
+    payload = json.loads(export_snapshot_json(session, snap.id))
+    assert payload["tracks"][0]["video_id"] == "v1"
+    assert payload["tracks"][0]["thumbnails"] == thumbs

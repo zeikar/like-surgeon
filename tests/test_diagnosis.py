@@ -348,3 +348,114 @@ def test_build_unavailable_video_items_skips_region_blocked():
     assert all(it.status == "open" for it in result)
     assert "deleted" in result[0].reason
     assert "private" in result[1].reason
+
+
+def test_carry_over_skipped_keeps_terminal_skip_across_diagnoses(session: Session) -> None:
+    """compare-likes writes fresh 'open' items each run; a 'skipped' finding
+    (verify-miss or manual suppression) must stay skipped in the next one."""
+    from likesurgeon.diagnosis import carry_over_skipped
+    from likesurgeon.models import Diagnosis, DiagnosisItem, Track
+
+    tracks = []
+    for vid in ("a", "b"):
+        t = Track(
+            source="ytmusic_liked_songs",
+            video_id=vid,
+            title=vid,
+            artists="[]",
+            canonical_key=vid,
+            dedupe_key=vid,
+        )
+        session.add(t)
+        tracks.append(t)
+    session.flush()
+
+    def _diag(statuses: dict[int, str]) -> Diagnosis:
+        d = Diagnosis()
+        session.add(d)
+        session.flush()
+        for t in tracks:
+            session.add(
+                DiagnosisItem(
+                    diagnosis_id=d.id,
+                    issue_type=ISSUE_YTMUSIC_ONLY,
+                    confidence=0.5,
+                    reason="r",
+                    source_track_id=t.id,
+                    status=statuses.get(t.id, "open"),
+                )
+            )
+        session.flush()
+        return d
+
+    first = _diag({tracks[0].id: "skipped", tracks[1].id: "applied"})
+    second = _diag({})
+
+    assert carry_over_skipped(session, second) == 1
+    by_track = {it.source_track_id: it.status for it in diagnosis_items(session, second.id)}
+    # Only 'skipped' carries; an 'applied' finding that reappears is retried.
+    assert by_track == {tracks[0].id: "skipped", tracks[1].id: "open"}
+    assert first.id != second.id
+
+
+def test_carry_over_skipped_noop_without_previous_diagnosis(session: Session) -> None:
+    from likesurgeon.diagnosis import carry_over_skipped
+    from likesurgeon.models import Diagnosis
+
+    d = Diagnosis()
+    session.add(d)
+    session.flush()
+    assert carry_over_skipped(session, d) == 0
+
+
+def test_carry_over_skipped_bridges_gaps_and_respects_unskip(session: Session) -> None:
+    """Status comes from the most recent earlier diagnosis that HAS the
+    finding: a diagnosis missing it doesn't drop the skip, and an operator
+    flipping it back to 'open' on the latest one un-skips it."""
+    from likesurgeon.diagnosis import carry_over_skipped
+    from likesurgeon.models import Diagnosis, DiagnosisItem, Track
+
+    a = Track(
+        source="ytmusic_liked_songs",
+        video_id="a",
+        title="a",
+        artists="[]",
+        canonical_key="a",
+        dedupe_key="a",
+    )
+    b = Track(
+        source="ytmusic_liked_songs",
+        video_id="b",
+        title="b",
+        artists="[]",
+        canonical_key="b",
+        dedupe_key="b",
+    )
+    session.add_all([a, b])
+    session.flush()
+
+    def _diag(statuses: dict[int, str]) -> Diagnosis:
+        d = Diagnosis()
+        session.add(d)
+        session.flush()
+        for track_id, status in statuses.items():
+            session.add(
+                DiagnosisItem(
+                    diagnosis_id=d.id,
+                    issue_type=ISSUE_YTMUSIC_ONLY,
+                    confidence=0.5,
+                    reason="r",
+                    source_track_id=track_id,
+                    status=status,
+                )
+            )
+        session.flush()
+        return d
+
+    _diag({a.id: "skipped", b.id: "skipped"})
+    _diag({b.id: "open"})  # a absent (gap); b un-skipped by the operator
+    latest = _diag({a.id: "open", b.id: "open"})
+
+    assert carry_over_skipped(session, latest) == 1
+    by_track = {it.source_track_id: it.status for it in diagnosis_items(session, latest.id)}
+    assert by_track == {a.id: "skipped", b.id: "open"}

@@ -45,10 +45,11 @@ from .diagnosis import (
     ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
     ISSUE_UNAVAILABLE_VIDEO,
     ISSUE_YTMUSIC_ONLY,
+    is_stage4_drift_reason,
 )
 from .models import DiagnosisItem, SyncAttempt, Track
 from .snapshot import YTMUSIC_LIKED_SONGS
-from .youtube_client import YouTubeClient, YouTubeWriteError
+from .youtube_client import YouTubeClient, YouTubeQuotaExceededError, YouTubeWriteError
 from .ytmusic_client import (
     AuthFileMissingError,
     UnexpectedResponseError,
@@ -129,6 +130,14 @@ class ExecResult:
     applied: int
     failed: int
     skipped: int
+    # YouTube's daily quota ran out mid-run; the ``unattempted`` YouTube
+    # actions after that point were left 'open' without any API call.
+    quota_exhausted: bool = False
+    unattempted: int = 0
+    # ``ytm_like`` videos whose YouTube unlike landed but whose re-like
+    # didn't — liked nowhere now. Re-running sync on the same diagnosis
+    # re-likes them; re-scanning first would make them vanish from the diff.
+    left_unliked: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -170,6 +179,8 @@ def plan(
     video_ids: dict[int, str],
     *,
     drift_min_confidence: float,
+    include_fuzzy_drift: bool = False,
+    youtube_liked_video_ids: frozenset[str] | None = frozenset(),
 ) -> tuple[list[PlannedAction], list[SkipRecord]]:
     """Map findings to actions / skips. Pure — no I/O, no client calls.
 
@@ -185,8 +196,17 @@ def plan(
     to retry a code-set skip.
     Findings of type ``metadata_drift`` are silently
     dropped (informational, not actionable in 0.5).
+    ``possible_pointer_drift`` auto-applies only Stage-4 pairs unless
+    ``include_fuzzy_drift`` — Stage-3 fuzzy pairs are title-only and score
+    version variants ("Song" vs "Song (Remix)") at 1.0, so a wrong pair
+    would unlike the user's original. Either way ``drift_min_confidence``
+    still gates.
     ``duplicate_in_source`` maps to ``ytm_dedupe`` only when the parsed
-    reason validates as ytmusic-source + N=2 + matching position count.
+    reason validates as ytmusic-source + N=2 + matching position count,
+    and the video is not in ``youtube_liked_video_ids``: on a video liked
+    on YouTube, ``rate_song("INDIFFERENT")`` round-trips and removes that
+    YouTube like too (the ``yt_like`` → dup → dedupe self-revert loop).
+    ``None`` means YouTube likes are unknown, so no dedupe is planned.
     All other shapes produce a ``SkipRecord`` — we never default to a
     destructive YT Music write.
     """
@@ -238,6 +258,18 @@ def plan(
             )
 
         elif item.issue_type == ISSUE_POINTER_DRIFT:
+            if not include_fuzzy_drift and not is_stage4_drift_reason(item.reason):
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="yt_relike",
+                        reason=(
+                            "title-only fuzzy match; not auto-applied "
+                            "(pass --include-fuzzy-drift to opt in)"
+                        ),
+                    )
+                )
+                continue
             if item.confidence < drift_min_confidence:
                 skips.append(
                     SkipRecord(
@@ -333,6 +365,27 @@ def plan(
                     )
                 )
                 continue
+            if youtube_liked_video_ids is None:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason="diagnosis has no YouTube scan to rule out a YouTube like",
+                    )
+                )
+                continue
+            if primary in youtube_liked_video_ids:
+                skips.append(
+                    SkipRecord(
+                        item_id=item.id,
+                        kind="ytm_dedupe",
+                        reason=(
+                            "video is liked on YouTube; INDIFFERENT would remove that "
+                            "like too (self-revert) — dedupe by hand"
+                        ),
+                    )
+                )
+                continue
             actions.append(
                 PlannedAction(
                     item_id=item.id,
@@ -358,6 +411,8 @@ _PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedu
 
 # Quota cost per action kind (YouTube `videos.rate` = 50 units; ytm is free).
 # Drift's worst case = 100 (like 50 + unlike 50 if the like succeeds).
+_DAILY_QUOTA = 10000
+
 _QUOTA_COST: dict[ActionKind, int] = {
     "yt_unlike": 50,
     # rate-none + rate-like (verify reads are free; client retries are transparent)
@@ -389,7 +444,12 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
             count = by_skip.get(kind, 0)
             if count:
                 lines.append(f"    {kind}: {count}")
-    lines.append(f"Estimated YouTube quota: {quota} units (daily default 10000)")
+    lines.append(f"Estimated YouTube quota: {quota} units (daily default {_DAILY_QUOTA})")
+    if quota > _DAILY_QUOTA:
+        lines.append(
+            "  WARNING: exceeds the default daily quota — the run stops when it runs "
+            "out; slice it with --limit"
+        )
     return "\n".join(lines)
 
 
@@ -420,10 +480,17 @@ def execute(
     a failed unlike risks over-removal because client failure can't
     distinguish "server processed, client errored" from "server didn't
     process". Genuine failures self-correct via the next compare-likes.
+
+    YouTube daily-quota exhaustion stops all further YouTube work: the
+    action that hit it counts as failed (its attempt rows are committed)
+    and the remaining YouTube actions stay 'open' untouched — continuing
+    would only fail them one by one. ``ytm_dedupe`` uses no YouTube quota,
+    so those still run.
     """
     applied = 0
     failed = 0
     skipped = 0
+    left_unliked: list[str] = []
 
     for skip in skips:
         session.add(
@@ -437,7 +504,12 @@ def execute(
         skipped += 1
         session.commit()
 
+    quota_exhausted = False
+    unattempted = 0
     for action in actions:
+        if quota_exhausted and action.kind != "ytm_dedupe":
+            unattempted += 1
+            continue
         item = session.get(DiagnosisItem, action.item_id)
         # ``item`` is non-None in normal flow — the planner only emits
         # actions for items it just iterated; defensive None-skip just
@@ -445,7 +517,13 @@ def execute(
         if item is None:
             continue
 
-        outcome = _dispatch(action, ytm=ytm, yt=yt, session=session)
+        try:
+            outcome = _dispatch(action, ytm=ytm, yt=yt, session=session, left_unliked=left_unliked)
+        except YouTubeQuotaExceededError:
+            failed += 1
+            quota_exhausted = True
+            session.commit()
+            continue
         if outcome == "applied":
             applied += 1
             item.status = "applied"
@@ -463,7 +541,14 @@ def execute(
             item.status = "applied"
         session.commit()
 
-    return ExecResult(applied=applied, failed=failed, skipped=skipped)
+    return ExecResult(
+        applied=applied,
+        failed=failed,
+        skipped=skipped,
+        quota_exhausted=quota_exhausted,
+        unattempted=unattempted,
+        left_unliked=tuple(left_unliked),
+    )
 
 
 def _dispatch(
@@ -472,6 +557,7 @@ def _dispatch(
     ytm: YTMusicClient,
     yt: YouTubeClient,
     session: Session,
+    left_unliked: list[str],
 ) -> _DispatchOutcome:
     """Run ``action``'s HTTP call(s), record SyncAttempt rows, return outcome.
 
@@ -485,6 +571,9 @@ def _dispatch(
     Note: for ``ytm_dedupe``, the outcome is used only for ``ExecResult``
     counting. Terminality (``status='applied'`` regardless of success) is
     handled by ``execute()``, not here.
+
+    ``YouTubeQuotaExceededError`` propagates (after its failed attempt row
+    is recorded) so ``execute()`` can stop the run.
     """
     if action.kind == "yt_unlike":
         ok = _try_yt_rate(
@@ -504,6 +593,7 @@ def _dispatch(
             ytm=ytm,
             yt=yt,
             video_id=action.primary_video_id,
+            left_unliked=left_unliked,
         )
 
     if action.kind == "yt_like":
@@ -556,6 +646,12 @@ def _dispatch(
     return "failed"
 
 
+def _reraise_if_quota(exc: YouTubeWriteError) -> None:
+    """Quota exhaustion ends the run (see ``execute``); other write errors are per-item."""
+    if isinstance(exc, YouTubeQuotaExceededError):
+        raise exc
+
+
 def _try_yt_rate(
     session: Session,
     item_id: int,
@@ -576,6 +672,7 @@ def _try_yt_rate(
                 reason=str(exc),
             )
         )
+        _reraise_if_quota(exc)
         return False
     session.add(
         SyncAttempt(
@@ -595,6 +692,7 @@ def _try_ytm_like(
     ytm: YTMusicClient,
     yt: YouTubeClient,
     video_id: str,
+    left_unliked: list[str],
 ) -> _DispatchOutcome:
     """Cross-prop like: YouTube unlike → relike → wait → verify on YT Music.
 
@@ -612,9 +710,9 @@ def _try_ytm_like(
         (e.g. song is YouTube-only). Terminal: retrying just repeats the
         same outcome.
       * ``"failed"`` — any HTTP/auth failure. ``DiagnosisItem.status``
-        stays ``"open"`` so the next run retries. Note: if the unlike
-        succeeded but the relike failed, the video is left unliked on
-        YouTube; manual relike may be needed (rare).
+        stays ``"open"`` so the next run retries. If the unlike succeeded
+        but the relike failed, the video is left unliked on YouTube and is
+        appended to ``left_unliked`` so the CLI can name it.
     """
     # Step 1: YouTube unlike
     try:
@@ -628,6 +726,7 @@ def _try_ytm_like(
                 reason=str(exc),
             )
         )
+        _reraise_if_quota(exc)
         return "failed"
     session.add(
         SyncAttempt(
@@ -650,7 +749,8 @@ def _try_ytm_like(
                 reason=str(exc),
             )
         )
-        # vid left unliked on YouTube; rare, manual relike if needed
+        left_unliked.append(video_id)
+        _reraise_if_quota(exc)
         return "failed"
     session.add(
         SyncAttempt(
@@ -733,6 +833,7 @@ def _try_yt_like(
                 reason=str(exc),
             )
         )
+        _reraise_if_quota(exc)
         return "failed"
     session.add(
         SyncAttempt(
@@ -756,6 +857,7 @@ def _try_yt_like(
                 reason=str(exc),
             )
         )
+        _reraise_if_quota(exc)
         return "failed"
     if present:
         session.add(

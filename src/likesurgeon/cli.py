@@ -1,4 +1,8 @@
-"""Typer CLI for likesurgeon. Read-only except for local DB writes."""
+"""Typer CLI for likesurgeon.
+
+Every command only reads the providers and writes the local DB, except
+``sync``, which writes likes to YouTube / YT Music.
+"""
 
 from __future__ import annotations
 
@@ -49,8 +53,9 @@ err_console = Console(stderr=True)
 
 
 def _safe_config_load() -> Config:
-    """Wrap ``Config.load`` so a ``config.json`` typo on the ``region``
-    key fails fast with a friendly exit-2 instead of a traceback.
+    """Wrap ``Config.load`` so a ``config.json`` typo on the ``region`` or
+    ``fuzzy_threshold`` key fails fast with a friendly exit-2 instead of a
+    traceback.
 
     Used by every CLI entrypoint that reads config — ``_bootstrap`` for
     DB-backed commands plus the ``auth`` setup commands that don't need
@@ -223,7 +228,9 @@ def auth_youtube() -> None:
 
 @scan_app.command("ytmusic")
 def scan_ytmusic(
-    limit: Annotated[int, typer.Option(help="Maximum number of liked songs to fetch.")] = 5000,
+    limit: Annotated[
+        int, typer.Option(min=1, help="Maximum number of liked songs to fetch.")
+    ] = 5000,
 ) -> None:
     """Fetch YouTube Music liked songs and store a snapshot."""
     cfg, factory = _bootstrap()
@@ -242,7 +249,9 @@ def scan_ytmusic(
 
 @scan_app.command("youtube-likes")
 def scan_youtube_likes(
-    limit: Annotated[int, typer.Option(help="Maximum number of liked videos to fetch.")] = 5000,
+    limit: Annotated[
+        int, typer.Option(min=1, help="Maximum number of liked videos to fetch.")
+    ] = 5000,
     region: Annotated[
         str | None,
         typer.Option(
@@ -263,6 +272,8 @@ def scan_youtube_likes(
     Region-aware detection runs when ``region`` is provided either via
     ``--region`` or ``config.json``.
     """
+    from googleapiclient.errors import HttpError
+
     from .youtube_client import (
         AuthorizationRequiredError,
         ClientSecretsMissingError,
@@ -287,6 +298,8 @@ def scan_youtube_likes(
         items = client.fetch_liked_videos(limit=limit)
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
+    except HttpError as e:
+        _fail(f"YouTube API error while fetching liked videos: {e}", code=1)
 
     video_ids: list[str] = []
     for it in items:
@@ -493,6 +506,7 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
       3. Persist a Diagnosis with the existing buckets via `create_diagnosis`.
       4. Append ghost findings (latest YouTube snapshot's is_available=False rows).
       5. Append drift findings per source (latest, prev) via `detect_drift`.
+      6. Carry the previous diagnosis's 'skipped' statuses forward.
       All findings live on a single Diagnosis row.
     """
     from .diagnosis import (
@@ -500,6 +514,7 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
         build_duplicate_in_source_items,
         build_metadata_drift_items,
         build_unavailable_video_items,
+        carry_over_skipped,
         create_diagnosis,
     )
     from .drift import detect_drift
@@ -694,6 +709,12 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
             session.add(it)
 
     session.flush()
+    # Stage E — keep the previous diagnosis's terminal 'skipped' findings
+    # skipped, so a verify-miss or manual suppression survives this re-run.
+    carried = carry_over_skipped(session, diagnosis)
+    if carried:
+        console.print(f"Kept {carried} finding(s) 'skipped' from the previous diagnosis")
+    session.flush()
     return _PipelineResult(
         diagnosis_id=diagnosis.id,
         compare_result=cmp_result,
@@ -767,11 +788,13 @@ def issues(
     """List issues from the latest diagnosis."""
     import json as jsonlib
 
-    from .diagnosis import diagnosis_items, latest_diagnosis
+    from .diagnosis import ISSUE_TYPES, diagnosis_items, latest_diagnosis
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
+    if type is not None and type not in ISSUE_TYPES:
+        _fail(f"Unknown issue type: {type!r}. One of: {', '.join(ISSUE_TYPES)}.", code=2)
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:
@@ -868,13 +891,29 @@ def sync(
         float,
         typer.Option(
             "--drift-min-confidence",
+            min=0.0,
+            max=1.0,
             help="Auto-apply pointer-drift fixes only when confidence ≥ this value.",
         ),
     ] = 0.95,
+    include_fuzzy_drift: Annotated[
+        bool,
+        typer.Option(
+            "--include-fuzzy-drift/--no-include-fuzzy-drift",
+            help=(
+                "Also auto-apply title-only fuzzy pointer drifts. Off by default: a "
+                "version variant like 'Song (Remix)' scores 1.0 against 'Song', so "
+                "--drift-min-confidence does NOT filter those out, and a wrong pair "
+                "unlikes your original. (Stage-4 drifts are always 0.95, so a "
+                "threshold above 0.95 skips them and keeps only fuzzy ones.)"
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int | None,
         typer.Option(
             "--limit",
+            min=0,
             help=(
                 "Process at most N actions this run; the rest stay 'open' "
                 "for the next sync. Useful for ramped first runs."
@@ -883,8 +922,15 @@ def sync(
     ] = None,
 ) -> None:
     """Apply the latest diagnosis's actionable findings to YouTube / YT Music."""
+    from datetime import UTC, datetime
+
     from .diagnosis import diagnosis_items, latest_diagnosis
     from .sync import execute, plan, resolve_video_ids, summarize
+    from .sync_preflight import (
+        diagnosis_staleness,
+        stranded_unliked_video_ids,
+        youtube_liked_video_ids,
+    )
 
     cfg, factory = _bootstrap()
     with session_scope(factory) as session:
@@ -897,7 +943,18 @@ def sync(
             raise typer.Exit(1)
         items = diagnosis_items(session, diag.id)
         video_ids = resolve_video_ids(session, items)
-        actions, skips = plan(items, video_ids, drift_min_confidence=drift_min_confidence)
+        actions, skips = plan(
+            items,
+            video_ids,
+            drift_min_confidence=drift_min_confidence,
+            include_fuzzy_drift=include_fuzzy_drift,
+            youtube_liked_video_ids=youtube_liked_video_ids(session, diag),
+        )
+        # Videos an earlier run unliked but couldn't re-like are liked nowhere;
+        # their ytm_like goes first so --limit / a quota stop can't starve it.
+        stranded = stranded_unliked_video_ids(session)
+        planned_relikes = {a.primary_video_id for a in actions if a.kind == "ytm_like"}
+        actions.sort(key=lambda a: not (a.kind == "ytm_like" and a.primary_video_id in stranded))
         if limit is not None and limit < len(actions):
             console.print(
                 f"[yellow]--limit {limit}: applying first {limit} of "
@@ -905,6 +962,21 @@ def sync(
             )
             actions = actions[:limit]
         console.print(summarize(actions, skips))
+        for warning in diagnosis_staleness(session, diag, now=datetime.now(UTC)):
+            console.print(f"[yellow]⚠ Stale diagnosis:[/yellow] {warning}")
+        if pending := sorted(stranded & planned_relikes):
+            console.print(
+                f"[bold red]{len(pending)} video(s) an earlier sync unliked on YouTube but "
+                "couldn't re-like are liked nowhere right now:[/bold red] "
+                f"{', '.join(pending)}. This sync re-likes them first — run it before "
+                "re-scanning (a re-scan would drop them from the diff)."
+            )
+        if lost := sorted(stranded - planned_relikes):
+            console.print(
+                f"[bold red]{len(lost)} video(s) an earlier sync left unliked are not in "
+                "this diagnosis[/bold red] (re-scanned since?): "
+                f"{', '.join(lost)}. Re-like them on YouTube by hand."
+            )
 
         if dry_run:
             return
@@ -936,6 +1008,16 @@ def sync(
             raise typer.Exit(1)
 
         ytm = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
+        if any(a.kind in {"ytm_dedupe", "ytm_like"} for a in actions):
+            # A real read, not just a file check: with missing or expired
+            # cookies every ytm_like would toggle the YouTube like and then
+            # fail its verify, and every ytm_dedupe would "fail" into the
+            # terminal 'applied' status having done nothing.
+            try:
+                ytm.fetch_liked_songs(limit=1)
+            except (AuthFileMissingError, UnexpectedResponseError) as e:
+                console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {e}")
+                raise typer.Exit(1) from e
         result = execute(session, actions, skips, ytm=ytm, yt=yt)
 
     console.print(
@@ -944,6 +1026,20 @@ def sync(
         f"failed=[red]{result.failed}[/red] "
         f"skipped=[yellow]{result.skipped}[/yellow]"
     )
+    if result.quota_exhausted:
+        console.print(
+            f"[red]YouTube daily quota exhausted — stopped early; {result.unattempted} "
+            "action(s) left open.[/red] Re-run sync after the quota resets "
+            "(midnight Pacific)."
+        )
+    if result.left_unliked:
+        console.print(
+            "[bold red]These videos were unliked on YouTube but the re-like failed, so "
+            "they are liked nowhere right now:[/bold red] "
+            + ", ".join(result.left_unliked)
+            + "\nRe-run [cyan]likesurgeon sync[/cyan] on this same diagnosis (do NOT "
+            "re-scan first — they'd drop out of the diff) or re-like them by hand."
+        )
     if result.failed:
         raise typer.Exit(1)
 

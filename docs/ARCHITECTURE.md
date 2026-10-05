@@ -1,6 +1,6 @@
 # Architecture
 
-likesurgeon is a local-first, read-only scanner that diagnoses inconsistencies between your YouTube Music likes and your YouTube liked videos. No server, no destructive actions, no third-party data flow.
+likesurgeon is a local-first tool that diagnoses inconsistencies between your YouTube Music likes and your YouTube liked videos, and — only via the explicit `sync` command — repairs them by writing likes back to YouTube / YT Music. No server, no third-party data flow; every command except `sync` is read-only toward the providers.
 
 ## System overview
 
@@ -37,12 +37,13 @@ Two providers feed into one local SQLite database. Every snapshot is point-in-ti
 2. **Scan** — `scan ytmusic` / `scan youtube-likes` fetch the user's likes, translate provider dicts via per-source translators in [src/likesurgeon/snapshot.py](../src/likesurgeon/snapshot.py), upsert `Track` rows (deduplicated by `(source, dedupe_key)`), and write a fresh `Snapshot` plus N `SnapshotItem` rows. Each snapshot is independent — old ones are never mutated.
 3. **Compare** — `compare-likes` loads the latest snapshot from each source, runs the three-stage matcher (`video_id` → `canonical_key` → RapidFuzz fuzzy), classifies findings into buckets, and persists the run as a `Diagnosis` plus per-finding `DiagnosisItem` rows.
 4. **Inspect** — `issues`, `doctor`, `diff`, and `export` all read from local DB only. No outbound network.
+5. **Sync** — `sync` plans actions from the latest diagnosis (pure `sync.plan`, fed by read-only `sync_preflight` checks), then writes to YouTube / YT Music, recording one `SyncAttempt` per call.
 
 ## Modules
 
 | Module | Responsibility | Notes |
 |---|---|---|
-| [`cli.py`](../src/likesurgeon/cli.py) | Typer entrypoints, command wiring, output formatting | Read-only except for local DB writes |
+| [`cli.py`](../src/likesurgeon/cli.py) | Typer entrypoints, command wiring, output formatting | Only `sync` writes to the providers |
 | [`config.py`](../src/likesurgeon/config.py) | App-dir paths, env overrides, region validation, `config.json` loader | `Config` is a frozen dataclass; `_validate_region` enforces `^[A-Z]{2}$` |
 | [`db.py`](../src/likesurgeon/db.py) | SQLAlchemy engine, session factory, schema init | `init_db` creates tables on first run; `_migrate_in_place` adds new nullable columns idempotently on every engine build |
 | [`models.py`](../src/likesurgeon/models.py) | ORM tables: `Track`, `Snapshot`, `SnapshotItem`, `Diagnosis`, `DiagnosisItem` | See "Database schema" below |
@@ -53,7 +54,10 @@ Two providers feed into one local SQLite database. Every snapshot is point-in-ti
 | [`normalize.py`](../src/likesurgeon/normalize.py) | Canonical-key generation (lowercase, strip decorations) | Pure-functional |
 | [`compare.py`](../src/likesurgeon/compare.py) | Three-stage cross-source matcher → `CompareResult` | Pure-functional, multiset semantics |
 | [`drift.py`](../src/likesurgeon/drift.py) | Snapshot-pair metadata-drift detector | Same-source, two snapshots |
-| [`diagnosis.py`](../src/likesurgeon/diagnosis.py) | `CompareResult` → `Diagnosis` + `DiagnosisItem` row writer | |
+| [`diagnosis.py`](../src/likesurgeon/diagnosis.py) | `CompareResult` → `Diagnosis` + `DiagnosisItem` row writer | Carries `'skipped'` forward from the previous diagnosis |
+| [`sync.py`](../src/likesurgeon/sync.py) | `sync` planner (pure) + dispatcher (write calls, `SyncAttempt` audit) | Continue-on-error; stops on YouTube quota exhaustion |
+| [`sync_preflight.py`](../src/likesurgeon/sync_preflight.py) | Read-only DB checks before `sync`: YouTube-liked video set (dedupe guard), stale-scan warnings, videos a past run left unliked | |
+| [`fileio.py`](../src/likesurgeon/fileio.py) | Atomic `0o600` credential-file writes (`browser.json`, `youtube-token.json`) | |
 | [`diff.py`](../src/likesurgeon/diff.py) | Two-snapshot membership diff (added / removed / shared) | Identity = `track_id` |
 | [`export.py`](../src/likesurgeon/export.py) | Snapshot → JSON (other formats are future plug-ins) | |
 | [`doctor.py`](../src/likesurgeon/doctor.py) | Health summary across snapshots + latest diagnosis | Read-only |
@@ -92,6 +96,10 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 
 **Stage 4 — drift detection via YouTube enrichment.** When YouTube auth is configured, `compare-likes` runs an extra pass after stages 1-3. It builds a deduped union of unmatched candidates on both sides (ytmusic_only + youtube unmatched, including ghosts) keyed by their original `enumerate(items)` index, calls `videos.list snippet,contentDetails` in 50-vid batches, and promotes pairs matching `(snippet.channelId, contentDetails.duration ±2s, normalize_for_match(snippet.title))` into `pointer_drift_candidates`. Triple-signal match is required for the 0.95 confidence tier; ambiguous candidates within the duration window are rejected. Distinct channel sources to remember: `videos.list snippet.channelId` is the *uploader*; `playlistItems.list snippet.channelId` is the playlist *owner*; the uploader from playlistItems is `snippet.videoOwnerChannelId`. Stage 4 uses `videos.list` exclusively for authoritative metadata.
 
+**Why fuzzy pointer drift isn't auto-synced.** Stage 3 scores with RapidFuzz `token_set_ratio`, which returns 100 whenever one side's tokens are a subset of the other's — so `"Song"` vs `"Song (Remix)"` or `"(Japanese ver.)"` is a 1.0-confidence "match". That's useful for surfacing candidates but unsafe to act on: a drift fix unlikes the YouTube original. `sync.plan` therefore auto-applies only Stage-4 pairs (identified by the shared `STAGE4_REASON_PREFIX` on `DiagnosisItem.reason`) and requires `--include-fuzzy-drift` for the rest.
+
+**Why `ytm_dedupe` skips videos liked on YouTube.** `rate_song("INDIFFERENT")` is rating-level: on a video that is also liked on YouTube it removes that YouTube like as well. For a dup induced by `yt_like` (YT Music cross-props the new YouTube like next to its existing entry) that reverts the fix, and repeated scan → compare → sync cycles would loop. The planner gets the YouTube-liked set (diagnosis's YouTube snapshot ∪ videos a past `yt_like` / `yt_relike` liked) from `sync_preflight` and records a skip instead — for every dup when the diagnosis has no YouTube scan to check against.
+
 **Why two YouTube clients.** YouTube Music has no official public API; `ytmusicapi` is community-maintained and uses browser-cookie auth. YouTube Data API v3 is official, OAuth-based, quota-bounded. The two clients have different failure modes (cookie staleness vs. token refresh vs. quota), so they live in separate modules with provider-specific exception types.
 
 ## Roadmap context
@@ -109,4 +117,5 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 - **0.7.1**: `unavailable_video` finding builder skips `region_blocked` — restrictions can lift between scans (real example: 94 region-blocked ghosts un-blocked themselves overnight in testing), so auto-unliking risks permanent like loss when the vid becomes available again. Only `deleted` / `private` / `rejected` / `unavailable` reasons surface as ghosts now.
 - **0.8**: YouTube ingestion switches `artists` source from `channelTitle` to `videoOwnerChannelTitle` (with `channelTitle` fallback). ` - Topic` suffix stripped from `artists` for matching/display but kept for the music-candidate classifier. Requires a one-time `scan youtube-likes` to repopulate `artists`; the first post-upgrade `compare-likes` will show a `metadata_drift` spike (migration noise) that resolves after a second scan+compare.
 - **0.9**: `fuzzy_threshold` config key (`~/.like-surgeon/config.json`, default `85`, range `[0, 100]`) exposes the RapidFuzz cross-source match cutoff. Motivated by `f9DzbpmWbMo`, which scored 81.7 against its likely YT Music match — just below the 85 default. Lowering raises `possible_pointer_drift` false-positive risk; drift sync is fail-safe (like-then-unlike) but can still mis-match on lowered thresholds.
+- **0.10**: `ytmusic_only` sync — `yt_like` (one `videos.rate("like")` + `videos.getRating` verify; verify-miss → terminal `'skipped'`). Known self-revert with `ytm_dedupe` on the dup it spawns.
 - **1.0**: local web UI / Electron app

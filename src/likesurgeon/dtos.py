@@ -30,7 +30,9 @@ class TrackDTO(BaseModel):
     artists: list[str]
     album: str | None
     duration_seconds: int | None
-    thumbnails: list[dict[str, Any]] | None
+    # Provider-native shape: ytmusicapi returns a list of sizes, the YouTube
+    # Data API a ``{"default": {...}, "high": {...}}`` dict keyed by size name.
+    thumbnails: list[dict[str, Any]] | dict[str, Any] | None
     canonical_key: str
     first_seen_at: datetime
     last_seen_at: datetime

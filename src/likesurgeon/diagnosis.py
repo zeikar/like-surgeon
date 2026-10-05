@@ -17,6 +17,25 @@ ISSUE_YTMUSIC_ONLY = "ytmusic_only"
 ISSUE_UNAVAILABLE_VIDEO = "unavailable_video"
 ISSUE_METADATA_DRIFT = "metadata_drift"
 ISSUE_DUPLICATE_IN_SOURCE = "duplicate_in_source"
+ISSUE_TYPES = (
+    ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
+    ISSUE_POINTER_DRIFT,
+    ISSUE_YTMUSIC_ONLY,
+    ISSUE_UNAVAILABLE_VIDEO,
+    ISSUE_METADATA_DRIFT,
+    ISSUE_DUPLICATE_IN_SOURCE,
+)
+
+# Every Stage-4 pointer-drift reason starts with this. ``sync.plan`` keys
+# auto-apply eligibility on it: Stage-4 pairs (channel + duration + title all
+# agree) are auto-applied by default, while Stage-3 fuzzy pairs are title-only
+# — ``token_set_ratio`` scores a version variant ("Song" vs "Song (Remix)")
+# 100 — so they need an explicit opt-in.
+STAGE4_REASON_PREFIX = "enriched"
+
+
+def is_stage4_drift_reason(reason: str) -> bool:
+    return reason.startswith(STAGE4_REASON_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -89,10 +108,10 @@ def _match_reason(match: Match) -> str:
     if match.kind is MatchKind.STAGE4_ENRICHMENT:
         ev = match.evidence
         if ev is None:
-            return "enriched drift match"
+            return f"{STAGE4_REASON_PREFIX} drift match"
         return (
-            f"enriched: channel={ev.channel_id[:8]}… + duration={ev.duration_seconds}s"
-            f" + normalized title match"
+            f"{STAGE4_REASON_PREFIX}: channel={ev.channel_id[:8]}… "
+            f"+ duration={ev.duration_seconds}s + normalized title match"
         )
     return (
         f"fuzzy match (score {match.confidence * 100:.0f}/100): "
@@ -256,6 +275,46 @@ def build_duplicate_in_source_items(
 def latest_diagnosis(session: Session) -> Diagnosis | None:
     stmt = select(Diagnosis).order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc()).limit(1)
     return session.scalar(stmt)
+
+
+def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
+    """Re-apply earlier diagnoses' terminal ``'skipped'`` statuses to the
+    matching findings of ``diagnosis``. Returns how many were carried.
+
+    Every ``compare-likes`` run writes fresh ``'open'`` items and ``sync``
+    only reads the latest diagnosis, so without this a ``'skipped'`` — set
+    by ``sync`` on a cross-prop verify-miss, or by the operator via SQL —
+    would silently re-open on the next run and re-fire the same writes.
+    A finding matches on ``(issue_type, source_track_id, related_track_id)``,
+    and its status is taken from the most recent earlier diagnosis that
+    contains it — so a gap (e.g. a ``scan --limit`` run that missed it)
+    doesn't drop the skip, while flipping the item to ``'open'`` on the
+    latest diagnosis still un-skips it for good.
+    """
+    rows = session.execute(
+        select(
+            DiagnosisItem.issue_type,
+            DiagnosisItem.source_track_id,
+            DiagnosisItem.related_track_id,
+            DiagnosisItem.status,
+        )
+        .join(Diagnosis, DiagnosisItem.diagnosis_id == Diagnosis.id)
+        .where(Diagnosis.id != diagnosis.id)
+        .order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc())
+    )
+    last_status: dict[tuple[str, int | None, int | None], str] = {}
+    for issue_type, source_id, related_id, status in rows:
+        last_status.setdefault((issue_type, source_id, related_id), status)
+    carried = 0
+    for it in session.scalars(
+        select(DiagnosisItem).where(
+            DiagnosisItem.diagnosis_id == diagnosis.id, DiagnosisItem.status == "open"
+        )
+    ):
+        if last_status.get((it.issue_type, it.source_track_id, it.related_track_id)) == "skipped":
+            it.status = "skipped"
+            carried += 1
+    return carried
 
 
 def diagnosis_items(session: Session, diagnosis_id: int) -> list[DiagnosisItem]:

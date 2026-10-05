@@ -47,15 +47,7 @@ def _validate_fuzzy_threshold(value: object) -> int:
     Checks bool before int because ``isinstance(True, int)`` is True in Python.
     Raises ``InvalidFuzzyThresholdError`` with ``repr(value)`` on any failure.
     """
-    if isinstance(value, bool):
-        raise InvalidFuzzyThresholdError(
-            f"fuzzy_threshold must be an int in [0, 100], got {value!r}"
-        )
-    if not isinstance(value, int):
-        raise InvalidFuzzyThresholdError(
-            f"fuzzy_threshold must be an int in [0, 100], got {value!r}"
-        )
-    if not (0 <= value <= 100):
+    if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 100):
         raise InvalidFuzzyThresholdError(
             f"fuzzy_threshold must be an int in [0, 100], got {value!r}"
         )

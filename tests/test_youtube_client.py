@@ -1420,3 +1420,116 @@ def test_fetch_video_statuses_passes_region_through(monkeypatch) -> None:
     out = client.fetch_video_statuses(["v_kr_blocked", "v_kr_allowed"], user_region="KR")
     assert out["v_kr_blocked"] == VideoStatus(is_available=False, reason="region_blocked")
     assert out["v_kr_allowed"] == VideoStatus(is_available=True, reason=None)
+
+
+# ---------------------------------------------------------------------------
+# Daily quota vs. short-window rate limit on the write/verify paths
+# ---------------------------------------------------------------------------
+
+_QUOTA_BODY = (
+    b'{"error":{"code":403,"errors":[{"reason":"quotaExceeded","domain":"youtube.quota"}]}}'
+)
+_RATE_LIMIT_BODY = (
+    b'{"error":{"code":403,"errors":[{"reason":"rateLimitExceeded","domain":"youtube.quota"}]}}'
+)
+
+
+class _ScriptedVideos:
+    """``rate`` / ``getRating`` whose ``execute()`` pops the next scripted
+    outcome (an exception to raise, or a dict to return)."""
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self._outcomes = list(outcomes)
+        self.attempts = 0
+
+    def _req(self) -> Any:
+        self.attempts += 1
+        outcome = self._outcomes.pop(0)
+
+        class _Req:
+            def execute(self_inner) -> Any:  # noqa: N805
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        return _Req()
+
+    def rate(self, **kwargs: Any) -> Any:
+        return self._req()
+
+    def getRating(self, **kwargs: Any) -> Any:  # noqa: N802 (mirrors google API)
+        return self._req()
+
+
+def _client_with(monkeypatch, videos: _ScriptedVideos) -> YouTubeClient:
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    class _Svc:
+        def videos(self) -> _ScriptedVideos:
+            return videos
+
+    monkeypatch.setattr(client, "_service", lambda: _Svc())
+    monkeypatch.setattr("likesurgeon.youtube_client.time.sleep", lambda _s: None)
+    return client
+
+
+def test_rate_video_quota_exceeded_raises_dedicated_error_without_retry(monkeypatch) -> None:
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import YouTubeQuotaExceededError
+
+    videos = _ScriptedVideos([HttpError(_FakeResp(403), _QUOTA_BODY)])
+    client = _client_with(monkeypatch, videos)
+
+    with pytest.raises(YouTubeQuotaExceededError) as exc_info:
+        client.rate_video("vidQ", "like")
+    # Still a YouTubeWriteError, so per-item recording keeps working.
+    assert isinstance(exc_info.value, YouTubeWriteError)
+    assert videos.attempts == 1
+
+
+def test_rate_video_retries_403_rate_limit(monkeypatch) -> None:
+    """``rateLimitExceeded`` is short-window throttling, not the daily quota."""
+    from googleapiclient.errors import HttpError
+
+    videos = _ScriptedVideos([HttpError(_FakeResp(403), _RATE_LIMIT_BODY), {}])
+    client = _client_with(monkeypatch, videos)
+
+    client.rate_video("vidR", "like")  # must not raise
+    assert videos.attempts == 2
+
+
+def test_is_in_liked_videos_quota_exceeded_raises_dedicated_error(monkeypatch) -> None:
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import YouTubeQuotaExceededError
+
+    videos = _ScriptedVideos([HttpError(_FakeResp(403), _QUOTA_BODY)])
+    client = _client_with(monkeypatch, videos)
+
+    with pytest.raises(YouTubeQuotaExceededError):
+        client.is_in_liked_videos("vidQ")
+
+
+def test_fetch_video_statuses_retries_rate_limit_instead_of_bailing(monkeypatch) -> None:
+    """A transient ``rateLimitExceeded`` must not be mistaken for the daily
+    quota (which bails every remaining batch)."""
+    from googleapiclient.errors import HttpError
+
+    from likesurgeon.youtube_client import VideoStatus
+
+    client = YouTubeClient(client_secrets_path=None, token_path=None)
+    attempts = {"n": 0}
+
+    def fake(*, ids: list[str]) -> dict:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise HttpError(_FakeResp(403), _RATE_LIMIT_BODY)
+        return {"items": [{"id": vid, "status": {"uploadStatus": "processed"}} for vid in ids]}
+
+    monkeypatch.setattr(client, "_videos_list", fake)
+    monkeypatch.setattr(client, "_RETRY_SLEEPS", (0, 0))
+
+    out = client.fetch_video_statuses(["a"])
+    assert out["a"] == VideoStatus(is_available=True, reason=None)
+    assert attempts["n"] == 2

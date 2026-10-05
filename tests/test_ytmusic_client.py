@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from ytmusicapi.exceptions import YTMusicServerError
 
 from likesurgeon.ytmusic_client import (
     AuthFileMissingError,
@@ -153,12 +154,86 @@ def test_unlike_song_wraps_arbitrary_failure_as_ytmusic_write_error() -> None:
     assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
-def test_unlike_song_does_not_wrap_build_failure() -> None:
-    """``_build()`` is called outside the try block, so auth failures propagate
-    as ``AuthFileMissingError`` rather than being wrapped as ``YTMusicWriteError``."""
+def test_unlike_song_wraps_build_failure_as_write_error() -> None:
+    """A missing auth file must surface as a per-item ``YTMusicWriteError`` —
+    the ``sync`` dispatcher only catches that, so an unwrapped
+    ``AuthFileMissingError`` would abort every remaining action."""
     client = YTMusicClient(browser_path=Path("/nonexistent"))
-    with pytest.raises(AuthFileMissingError):
+    with pytest.raises(YTMusicWriteError) as exc_info:
         client.unlike_song("vid")
+    assert isinstance(exc_info.value.__cause__, AuthFileMissingError)
+
+
+def test_build_with_corrupt_auth_file_raises_auth_file_missing(tmp_path: Path) -> None:
+    """A truncated/garbled browser.json is "no usable auth file" — same
+    exception (and recovery) as the missing case, not a raw JSONDecodeError."""
+    bad = tmp_path / "browser.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(AuthFileMissingError, match="unusable"):
+        YTMusicClient(browser_path=bad).fetch_liked_songs()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionError("network down"),
+        YTMusicServerError("Server returned HTTP 401: Unauthorized."),
+    ],
+)
+def test_fetch_liked_songs_wraps_request_failures_as_unexpected_response(exc) -> None:
+    """Transport errors and ytmusicapi server errors (e.g. 401 on stale
+    cookies) must arrive as ``UnexpectedResponseError`` so ``sync``'s verify
+    step records a failed attempt instead of escaping the dispatcher loop."""
+
+    class _RaisingFake:
+        def get_liked_songs(self, limit: int) -> Any:
+            raise exc
+
+    class _Client(YTMusicClient):
+        def __init__(self) -> None:
+            super().__init__(browser_path=None)
+
+        def _build(self) -> Any:
+            return _RaisingFake()
+
+    with pytest.raises(UnexpectedResponseError, match="request failed") as exc_info:
+        _Client().fetch_liked_songs()
+    assert exc_info.value.__cause__ is exc
+
+
+class _PagedClient(YTMusicClient):
+    """Serves the first ``limit`` entries of ``tracks`` and records each limit."""
+
+    def __init__(self, tracks: list[dict[str, Any]]) -> None:
+        super().__init__(browser_path=None)
+        self._tracks = tracks
+        self.limits: list[int] = []
+
+    def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
+        self.limits.append(limit)
+        return self._tracks[:limit]
+
+
+def test_is_in_liked_songs_hit_in_first_fetch_skips_full_scan() -> None:
+    client = _PagedClient([{"videoId": "new"}] + [{"videoId": f"o{i}"} for i in range(500)])
+    assert client.is_in_liked_songs("new") is True
+    assert client.limits == [100]
+
+
+def test_is_in_liked_songs_miss_in_first_fetch_falls_back_to_full_limit() -> None:
+    """A song placed below the first page must still be found — a false miss
+    would be recorded as a terminal 'skipped'."""
+    tracks = [{"videoId": f"o{i}"} for i in range(500)] + [{"videoId": "deep"}]
+    client = _PagedClient(tracks)
+    assert client.is_in_liked_songs("deep") is True
+    assert client.limits == [100, 10000]
+    assert client.is_in_liked_songs("absent") is False
+
+
+def test_is_in_liked_songs_small_limit_fetches_once() -> None:
+    client = _PagedClient([{"videoId": "x"}])
+    assert client.is_in_liked_songs("absent", limit=50) is False
+    assert client.limits == [50]
 
 
 def test_missing_auth_raises():

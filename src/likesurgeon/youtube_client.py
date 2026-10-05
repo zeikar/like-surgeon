@@ -16,9 +16,7 @@ silently refresh that token.
 
 from __future__ import annotations
 
-import os
 import re
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +29,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from .compare import CanonicalMetadata
+from .fileio import write_private_text
 
 LIKED_VIDEOS_FALLBACK_PLAYLIST_ID = "LL"
 
@@ -68,6 +67,13 @@ class YouTubeWriteError(RuntimeError):
         self.video_id = video_id
         self.rating = rating
         self.message = message
+
+
+class YouTubeQuotaExceededError(YouTubeWriteError):
+    """The daily Data API quota is spent. Every further call this run would
+    fail the same way, so ``sync`` stops instead of walking the rest of the
+    plan (which, for ``ytm_like``'s unlike→relike pair, could strand a video
+    unliked)."""
 
 
 @dataclass(frozen=True)
@@ -119,8 +125,13 @@ def _token_has_write_scope(token_path: Path | None) -> bool:
     return WRITE_SCOPE in scopes
 
 
-def _is_quota_exceeded(exc: Any) -> bool:
-    """Detect Google API quota exhaustion from the JSON error body.
+_QUOTA_REASONS = frozenset({"quotaExceeded", "dailyLimitExceeded"})
+# Short-window throttling — transient, unlike the daily quota, so retried.
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+
+
+def _error_reasons_403(exc: Any) -> set[str]:
+    """Extract ``error.errors[].reason`` values from a 403's JSON body.
 
     The HTTP-level `e.resp.reason` is just "Forbidden" for any 403, so we
     parse `e.content` (bytes) instead — the body's `error.errors[].reason`
@@ -130,32 +141,41 @@ def _is_quota_exceeded(exc: Any) -> bool:
     Defensive at every shape boundary: non-403 responses, missing bodies,
     non-UTF-8 bytes, malformed JSON, or any payload whose shape doesn't
     precisely match `{"error": {"errors": [{"reason": ...}, ...]}}` all
-    return False rather than raising. We'd rather mis-classify an
-    edge-case 403 as a non-quota failure (and let it fall through the
+    return an empty set rather than raising. We'd rather mis-classify an
+    edge-case 403 as a generic failure (and let it fall through the
     retry/`failed` path) than abort the entire scan because Google
     returned a body we didn't predict.
     """
     import json
 
     if getattr(getattr(exc, "resp", None), "status", None) != 403:
-        return False
+        return set()
     content = getattr(exc, "content", None)
     if not content:
-        return False
+        return set()
     try:
         payload = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
     except (ValueError, UnicodeDecodeError, TypeError):
-        return False
+        return set()
     if not isinstance(payload, dict):
-        return False
+        return set()
     err = payload.get("error")
     if not isinstance(err, dict):
-        return False
+        return set()
     errors = err.get("errors")
     if not isinstance(errors, list):
-        return False
-    quota_reasons = {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"}
-    return any(isinstance(e, dict) and e.get("reason") in quota_reasons for e in errors)
+        return set()
+    return {e["reason"] for e in errors if isinstance(e, dict) and isinstance(e.get("reason"), str)}
+
+
+def _is_quota_exceeded(exc: Any) -> bool:
+    """Daily quota exhaustion — retrying won't help until the quota resets."""
+    return bool(_error_reasons_403(exc) & _QUOTA_REASONS)
+
+
+def _is_rate_limited(exc: Any) -> bool:
+    """403 short-window throttling — retryable like a 429."""
+    return bool(_error_reasons_403(exc) & _RATE_LIMIT_REASONS)
 
 
 def _classify_status(
@@ -323,12 +343,9 @@ class YouTubeClient:
     def _save_token(self, creds: Credentials) -> None:
         if self._token_path is None:
             return
-        self._token_path.parent.mkdir(parents=True, exist_ok=True)
-        self._token_path.write_text(creds.to_json(), encoding="utf-8")
-        # Refresh tokens are credentials — narrow file mode on POSIX so they
-        # aren't accidentally readable by other users sharing this machine.
-        if sys.platform != "win32":
-            os.chmod(self._token_path, 0o600)
+        # Refresh tokens are credentials — written at 0o600 from creation so
+        # they're never readable by other users sharing this machine.
+        write_private_text(self._token_path, creds.to_json())
 
     def _service(self) -> Any:
         """Return an authorized Data API resource. Raises if not authorized.
@@ -413,12 +430,14 @@ class YouTubeClient:
         """Apply a rating to a video via ``videos.rate``.
 
         Retries up to ``_RATE_VIDEO_MAX_ATTEMPTS`` times on transient HTTP
-        errors (429, 500, 502, 503, 504) with sleeps from
-        ``_RATE_VIDEO_BACKOFFS``. Non-transient ``HttpError`` and non-HTTP
-        exceptions wrap once as ``YouTubeWriteError`` (no retry) so the
-        dispatcher's continue-on-error loop records a per-item failed attempt
-        instead of aborting the whole sync. ``_service()`` is inside the try
-        because token refresh can fail at this point.
+        errors (429, 500, 502, 503, 504, 403 rate-limit) with sleeps from
+        ``_RATE_VIDEO_BACKOFFS``. Daily-quota exhaustion raises
+        ``YouTubeQuotaExceededError`` (no retry) so ``sync`` can stop the run.
+        Other ``HttpError`` and non-HTTP exceptions wrap once as
+        ``YouTubeWriteError`` (no retry) so the dispatcher's continue-on-error
+        loop records a per-item failed attempt instead of aborting the whole
+        sync. ``_service()`` is inside the try because token refresh can fail
+        at this point.
         """
         from googleapiclient.errors import HttpError
 
@@ -432,8 +451,11 @@ class YouTubeClient:
                 service.videos().rate(id=video_id, rating=rating).execute()
                 return
             except HttpError as exc:
+                if _is_quota_exceeded(exc):
+                    raise YouTubeQuotaExceededError(video_id, rating, str(exc)) from exc
                 status = getattr(getattr(exc, "resp", None), "status", None)
-                if status in {429, 500, 502, 503, 504} and attempt < _RATE_VIDEO_MAX_ATTEMPTS:
+                transient = status in {429, 500, 502, 503, 504} or _is_rate_limited(exc)
+                if transient and attempt < _RATE_VIDEO_MAX_ATTEMPTS:
                     time.sleep(_RATE_VIDEO_BACKOFFS[attempt - 1])
                     continue
                 raise YouTubeWriteError(video_id, rating, str(exc)) from exc
@@ -465,6 +487,8 @@ class YouTubeClient:
         try:
             resp = service.videos().getRating(id=video_id).execute()
         except HttpError as exc:
+            if _is_quota_exceeded(exc):
+                raise YouTubeQuotaExceededError(video_id, "verify", str(exc)) from exc
             raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
@@ -498,7 +522,7 @@ class YouTubeClient:
         sentinel to the right policy.
 
         Quota and 404 short-circuit (no retry — same condition would
-        repeat). 5xx and arbitrary non-HttpError exceptions (timeouts,
+        repeat). 5xx, 403 rate-limit, and arbitrary non-HttpError exceptions (timeouts,
         socket resets, urllib3 connection errors) are retried; the retry
         budget is bounded by ``_RETRY_SLEEPS``, so a true programming bug
         that raises a non-HTTP exception will eventually fall through to
@@ -520,7 +544,7 @@ class YouTubeClient:
                     return "quota"
                 if status == 404:
                     return "404"
-                if status is not None and 500 <= status < 600:
+                if (status is not None and 500 <= status < 600) or _is_rate_limited(e):
                     continue
                 # Non-retryable HTTP error (e.g. 401 auth, 400 bad request).
                 break

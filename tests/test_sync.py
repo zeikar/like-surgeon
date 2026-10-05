@@ -158,6 +158,11 @@ def _make_item(
     return it
 
 
+# A real Stage-4 reason — only these auto-apply as ``yt_relike`` by default.
+_STAGE4_REASON = "enriched: channel=UCabcdef… + duration=200s + normalized title match"
+_FUZZY_REASON = "fuzzy match (score 100/100): YT 'Spring Day' ↔ YT Music 'Spring Day (Remix)'"
+
+
 # ---------------------------------------------------------------------------
 # resolve_video_ids
 # ---------------------------------------------------------------------------
@@ -308,6 +313,7 @@ def test_plan_drift_above_threshold_maps_to_yt_relike(session: Session) -> None:
         confidence=0.97,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     session.commit()
 
@@ -341,6 +347,7 @@ def test_plan_drift_threshold_boundary(session: Session) -> None:
         confidence=0.95,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     # Just below — skipped.
     src2 = _make_track(session, "src2", suffix="s2")
@@ -352,6 +359,7 @@ def test_plan_drift_threshold_boundary(session: Session) -> None:
         confidence=0.94999,
         source_track=src2,
         related_track=rel2,
+        reason=_STAGE4_REASON,
     )
     session.commit()
 
@@ -436,6 +444,7 @@ def test_plan_missing_video_id_emits_skip_with_action_kind(session: Session) -> 
         confidence=0.99,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     session.commit()
 
@@ -912,7 +921,8 @@ def test_execute_ytm_like_yt_relike_fails(session: Session) -> None:
     ]
     res = execute(session, actions, [], ytm=ytm, yt=yt)
 
-    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    # The unlike landed but the relike didn't — the result names the video.
+    assert res == ExecResult(applied=0, failed=1, skipped=0, left_unliked=("song",))
     session.refresh(item)
     assert item.status == "open"
     rows = _attempts_for(session, item.id)
@@ -1098,6 +1108,7 @@ def test_execute_yt_relike_both_succeed(session: Session) -> None:
         confidence=0.99,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     session.commit()
     original_reason = item.reason
@@ -1173,6 +1184,7 @@ def test_execute_yt_relike_unlike_fails_after_like_success(session: Session) -> 
         confidence=0.99,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     session.commit()
     original_reason = item.reason
@@ -1226,6 +1238,7 @@ def test_execute_yt_relike_like_failure_skips_unlike(session: Session) -> None:
         confidence=0.99,
         source_track=src,
         related_track=rel,
+        reason=_STAGE4_REASON,
     )
     session.commit()
     original_reason = item.reason
@@ -1537,3 +1550,326 @@ def test_parse_dup_reason_roundtrip_with_builder() -> None:
     reason = diagnosis_items[0].reason
     result = _parse_duplicate_in_source_reason(reason)
     assert result == _DuplicateReason(count=2, source="ytmusic_liked_songs", positions=(0, 1))
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: fuzzy-drift gate, dedupe self-revert guard, quota stop,
+# YT Music failures staying per-item.
+# ---------------------------------------------------------------------------
+
+
+def _drift_item(
+    session: Session, *, reason: str, confidence: float = 1.0, tag: str = ""
+) -> DiagnosisItem:
+    diag = _make_diagnosis(session)
+    src = _make_track(session, f"orig{tag}", suffix=f"s{tag}")
+    rel = _make_track(session, f"variant{tag}", suffix=f"r{tag}")
+    return _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_POINTER_DRIFT,
+        confidence=confidence,
+        source_track=src,
+        related_track=rel,
+        reason=reason,
+    )
+
+
+def test_plan_fuzzy_drift_is_not_auto_applied_by_default(session: Session) -> None:
+    """A fuzzy pair scores 1.0 for a version variant (subset tokens) — it must
+    not clear the default gate and unlike the user's original."""
+    item = _drift_item(session, reason=_FUZZY_REASON, confidence=1.0)
+    session.commit()
+
+    actions, skips = plan(
+        [item],
+        {item.source_track_id: "orig", item.related_track_id: "variant"},
+        drift_min_confidence=0.95,
+    )
+
+    assert actions == []
+    assert len(skips) == 1
+    assert skips[0].kind == "yt_relike"
+    assert "--include-fuzzy-drift" in skips[0].reason
+
+
+def test_plan_fuzzy_drift_opt_in_is_still_confidence_gated(session: Session) -> None:
+    hi = _drift_item(session, reason=_FUZZY_REASON, confidence=1.0)
+    lo = _drift_item(session, reason=_FUZZY_REASON, confidence=0.9, tag="2")
+    session.commit()
+    vids = {
+        hi.source_track_id: "orig",
+        hi.related_track_id: "variant",
+        lo.source_track_id: "orig2",
+        lo.related_track_id: "variant2",
+    }
+
+    actions, skips = plan([hi, lo], vids, drift_min_confidence=0.95, include_fuzzy_drift=True)
+
+    assert [a.item_id for a in actions] == [hi.id]
+    assert [s.item_id for s in skips] == [lo.id]
+    assert "confidence" in skips[0].reason
+
+
+def test_plan_dedupe_skipped_when_video_is_liked_on_youtube(session: Session) -> None:
+    """INDIFFERENT on a video liked on YouTube also removes that YouTube like
+    (the yt_like → dup → dedupe self-revert loop) — the planner refuses."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "B", suffix="b")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 7)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [item],
+        {t.id: "B"},
+        drift_min_confidence=0.95,
+        youtube_liked_video_ids=frozenset({"B"}),
+    )
+    assert actions == []
+    assert skips[0].kind == "ytm_dedupe"
+    assert "liked on YouTube" in skips[0].reason
+
+    # Not liked on YouTube → the historical-dup path still dedupes.
+    actions, skips = plan([item], {t.id: "B"}, drift_min_confidence=0.95)
+    assert [a.kind for a in actions] == ["ytm_dedupe"]
+
+
+class _QuotaYouTube(FakeYouTube):
+    """Raises ``YouTubeQuotaExceededError`` on the given (video_id, rating) pairs."""
+
+    def __init__(self, quota_on: set[tuple[str, str]], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._quota_on = quota_on
+
+    def rate_video(self, video_id: str, rating: str) -> None:
+        from likesurgeon.youtube_client import YouTubeQuotaExceededError
+
+        self.calls.append((video_id, rating))
+        if (video_id, rating) in self._quota_on:
+            raise YouTubeQuotaExceededError(video_id, rating, "quotaExceeded")
+
+
+def test_execute_quota_exhausted_stops_run_and_keeps_rest_open(session: Session) -> None:
+    diag = _make_diagnosis(session)
+    tracks = [_make_track(session, f"v{i}", suffix=str(i)) for i in range(3)]
+    items = [
+        _make_item(session, diag, issue_type=ISSUE_UNAVAILABLE_VIDEO, source_track=t)
+        for t in tracks
+    ]
+    session.commit()
+
+    yt = _QuotaYouTube(quota_on={("v1", "none")})
+    actions = [
+        PlannedAction(
+            item_id=it.id, kind="yt_unlike", primary_video_id=f"v{i}", secondary_video_id=None
+        )
+        for i, it in enumerate(items)
+    ]
+    res = execute(session, actions, [], ytm=FakeYTMusic(), yt=yt)
+
+    assert res == ExecResult(applied=1, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
+    # v2 was never called.
+    assert yt.calls == [("v0", "none"), ("v1", "none")]
+    for it in items:
+        session.refresh(it)
+    assert [it.status for it in items] == ["applied", "open", "open"]
+    # The quota-hit attempt is still on record.
+    assert [(r.kind, r.status) for r in _attempts_for(session, items[1].id)] == [
+        ("yt_unlike", "failed")
+    ]
+
+
+def test_execute_ytm_like_relike_quota_names_the_stranded_video(session: Session) -> None:
+    """Quota running out between ytm_like's unlike and relike leaves the video
+    liked nowhere — the result must name it so the user can recover."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="m")
+    item = _make_item(session, diag, issue_type=ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC, source_track=t)
+    session.commit()
+
+    yt = _QuotaYouTube(quota_on={("song", "like")})
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=FakeYTMusic(), yt=yt)
+
+    assert res.quota_exhausted is True
+    assert res.left_unliked == ("song",)
+    assert [(r.kind, r.status) for r in _attempts_for(session, item.id)] == [
+        ("ytm_like_yt_unlike", "applied"),
+        ("ytm_like_yt_relike", "failed"),
+    ]
+
+
+def test_execute_ytm_dedupe_without_auth_file_does_not_abort_run(session: Session) -> None:
+    """Real client, no browser.json: the dedupe records a failed attempt and
+    the loop moves on to the next action instead of raising."""
+    from pathlib import Path
+
+    from likesurgeon.ytmusic_client import YTMusicClient
+
+    diag = _make_diagnosis(session)
+    t1 = _make_track(session, "dup", suffix="d")
+    t2 = _make_track(session, "ghost", suffix="g")
+    dup = _make_item(session, diag, issue_type=ISSUE_DUPLICATE_IN_SOURCE, source_track=t1)
+    ghost = _make_item(session, diag, issue_type=ISSUE_UNAVAILABLE_VIDEO, source_track=t2)
+    session.commit()
+
+    yt = FakeYouTube()
+    actions = [
+        PlannedAction(
+            item_id=dup.id, kind="ytm_dedupe", primary_video_id="dup", secondary_video_id=None
+        ),
+        PlannedAction(
+            item_id=ghost.id, kind="yt_unlike", primary_video_id="ghost", secondary_video_id=None
+        ),
+    ]
+    res = execute(session, actions, [], ytm=YTMusicClient(browser_path=Path("/nonexistent")), yt=yt)
+
+    assert res == ExecResult(applied=1, failed=1, skipped=0)
+    assert yt.calls == [("ghost", "none")]
+    assert [(r.kind, r.status) for r in _attempts_for(session, dup.id)] == [
+        ("ytm_dedupe", "failed")
+    ]
+
+
+def test_execute_ytm_like_verify_transport_error_keeps_write_audit_rows(
+    session: Session,
+) -> None:
+    """A transport error during the YT Music verify (after both YouTube writes
+    landed) must be a per-item failure — previously it escaped execute() and
+    the rollback erased the audit rows of writes that really happened."""
+    from likesurgeon.ytmusic_client import YTMusicClient
+
+    class _DownYTM:
+        def get_liked_songs(self, limit: int):
+            raise ConnectionError("network down")
+
+    class _Client(YTMusicClient):
+        def _build(self):
+            return _DownYTM()
+
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "song", suffix="m")
+    item = _make_item(session, diag, issue_type=ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC, source_track=t)
+    session.commit()
+
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="ytm_like", primary_video_id="song", secondary_video_id=None
+        )
+    ]
+    res = execute(session, actions, [], ytm=_Client(browser_path=None), yt=FakeYouTube())
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    assert [(r.kind, r.status) for r in _attempts_for(session, item.id)] == [
+        ("ytm_like_yt_unlike", "applied"),
+        ("ytm_like_yt_relike", "applied"),
+        ("ytm_like_verify", "failed"),
+    ]
+
+
+def test_summarize_warns_when_plan_exceeds_daily_quota() -> None:
+    actions = [
+        PlannedAction(item_id=i, kind="ytm_like", primary_video_id=f"v{i}", secondary_video_id=None)
+        for i in range(101)
+    ]
+    assert "exceeds the default daily quota" in summarize(actions, [])
+    assert "exceeds" not in summarize(actions[:100], [])
+
+
+def test_version_variant_fuzzy_pair_is_not_planned_end_to_end(session: Session) -> None:
+    """Regression for the review repro: a YouTube topic upload "Spring Day"
+    vs a YT Music "Spring Day (Remix)" fuzzy-matches at 1.0 (token subset).
+    The default sync plan must not unlike the original."""
+    from likesurgeon.cli import _compare_and_persist
+    from likesurgeon.diagnosis import diagnosis_items
+    from likesurgeon.snapshot import create_snapshot
+
+    create_snapshot(
+        session,
+        "youtube_liked_videos",
+        [
+            {
+                "snippet": {
+                    "title": "Spring Day",
+                    "videoOwnerChannelTitle": "BTS - Topic",
+                    "description": "Provided to YouTube by BIGHIT",
+                    "resourceId": {"videoId": "ORIG"},
+                },
+                "contentDetails": {"videoId": "ORIG"},
+                "_likesurgeon_video_status": {"is_available": True, "reason": None},
+            }
+        ],
+    )
+    create_snapshot(
+        session,
+        "ytmusic_liked_songs",
+        [{"videoId": "REMIX", "title": "Spring Day (Remix)", "artists": [{"name": "BTS"}]}],
+    )
+    items = diagnosis_items(session, _compare_and_persist(session).diagnosis_id)
+    [drift] = [it for it in items if it.issue_type == ISSUE_POINTER_DRIFT]
+    assert drift.confidence == 1.0  # the matcher itself is unchanged
+
+    actions, skips = plan(items, resolve_video_ids(session, items), drift_min_confidence=0.95)
+    assert actions == []
+    assert [s.kind for s in skips] == ["yt_relike"]
+
+
+def test_plan_skips_dedupe_when_youtube_likes_are_unknown(session: Session) -> None:
+    """No YouTube scan behind the diagnosis → the guard can't rule out a
+    YouTube like, so no dedupe (fail-safe)."""
+    diag = _make_diagnosis(session)
+    t = _make_track(session, "B", suffix="b")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_DUPLICATE_IN_SOURCE,
+        source_track=t,
+        reason="appears 2 times in ytmusic_liked_songs snapshot (positions: 0, 7)",
+    )
+    session.commit()
+
+    actions, skips = plan(
+        [item], {t.id: "B"}, drift_min_confidence=0.95, youtube_liked_video_ids=None
+    )
+    assert actions == []
+    assert "no YouTube scan" in skips[0].reason
+
+
+def test_execute_after_quota_stop_still_runs_ytmusic_only_dedupes(session: Session) -> None:
+    diag = _make_diagnosis(session)
+    t_ghost1 = _make_track(session, "g1", suffix="g1")
+    t_ghost2 = _make_track(session, "g2", suffix="g2")
+    t_dup = _make_track(session, "dup", suffix="d")
+    g1 = _make_item(session, diag, issue_type=ISSUE_UNAVAILABLE_VIDEO, source_track=t_ghost1)
+    g2 = _make_item(session, diag, issue_type=ISSUE_UNAVAILABLE_VIDEO, source_track=t_ghost2)
+    dup = _make_item(session, diag, issue_type=ISSUE_DUPLICATE_IN_SOURCE, source_track=t_dup)
+    session.commit()
+
+    yt = _QuotaYouTube(quota_on={("g1", "none")})
+    ytm = FakeYTMusic()
+    actions = [
+        PlannedAction(
+            item_id=g1.id, kind="yt_unlike", primary_video_id="g1", secondary_video_id=None
+        ),
+        PlannedAction(
+            item_id=g2.id, kind="yt_unlike", primary_video_id="g2", secondary_video_id=None
+        ),
+        PlannedAction(
+            item_id=dup.id, kind="ytm_dedupe", primary_video_id="dup", secondary_video_id=None
+        ),
+    ]
+    res = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    assert res == ExecResult(applied=1, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
+    assert yt.calls == [("g1", "none")]
+    assert ytm.unlike_calls == ["dup"]
