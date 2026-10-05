@@ -252,6 +252,28 @@ def test_rendered_pair_whose_b_is_liked_on_youtube_is_shadow_duplicate(session: 
     assert [i.issue_type for i in items] == [ISSUE_SHADOW_DUPLICATE]
 
 
+def test_shadow_duplicate_is_eligible_without_the_same_recording_check(session: Session):
+    """A shadow is a different upload by nature (MV, fan or making-of video), so
+    the check is informational only; unlike_shadow proves the pair at run time."""
+    ll, lm = ["A", "x", "B"], ["B", "x", "B"]
+    _, _, _, _, res = _aligned(session, ll, lm, ll_state={"A": (True, None, True)})
+    differ = {"A": _meta("A", duration=396), "B": _meta("B", duration=315)}
+    [failed] = build_alignment_items(1, res, metadata=differ)
+    assert failed.issue_type == ISSUE_SHADOW_DUPLICATE
+    assert failed.confidence == 1.0
+    assert "(not required for a shadow)" in failed.reason
+    assert "report-only" not in failed.reason
+
+    [no_meta] = build_alignment_items(1, res, metadata={})
+    assert no_meta.confidence == 1.0
+    assert "same-recording check: not run (not required for a shadow)" in no_meta.reason
+
+    _, _, _, _, res2 = _aligned(session, ll, lm, ll_state={"A": (None, None, True)})
+    [unknown] = build_alignment_items(1, res2, metadata=differ)
+    assert unknown.confidence == 0.5
+    assert "report-only: availability unknown" in unknown.reason
+
+
 def test_pair_is_report_only_without_metadata_or_sanity_or_known_availability(session: Session):
     _, _, _, _, res = _aligned(session, ["a1", "A", "a3"], ["a1", "B", "a3"])
     [no_meta] = build_alignment_items(1, res, metadata={"A": _meta("A")})

@@ -111,10 +111,16 @@ def _alignment_pair_reason(
     sanity: bool,
     a_meta: CanonicalMetadata | None,
     b_meta: CanonicalMetadata | None,
+    *,
+    check_gates: bool,
 ) -> str:
     a, lm = b.ll_item, b.lm_item
     check = _same_recording_text(sanity, a_meta, b_meta)
-    if a_meta is None or b_meta is None:
+    missing = a_meta is None or b_meta is None
+    if not check_gates:
+        verdict = "report-only: availability unknown" if a.is_available is None else None
+        check = f"{'not run' if missing else check} (not required for a shadow)"
+    elif missing:
         verdict = f"report-only: {check}"
         check = "not run"
     elif not sanity:
@@ -144,10 +150,11 @@ def build_alignment_items(
     unavailable) or ``rendered_as_other``.
 
     A finding is **write-eligible** iff its ``issue_type`` is one of those
-    three AND ``confidence == 1.0``: the pair passed ``pair_passes_sanity`` on
-    the ``videos.list`` metadata and A's availability is known; otherwise 0.5
-    (report-only). ``is_write_eligible`` encodes this. ``unbacked_lm_entry``,
-    ``dead_unrendered`` and ``unrendered_music`` are facts, so 1.0, but they
+    three AND ``confidence == 1.0``: A's availability is known and — except for
+    ``shadow_duplicate`` — the pair passed ``pair_passes_sanity`` on the
+    ``videos.list`` metadata; otherwise 0.5 (report-only). ``is_write_eligible``
+    encodes this. ``unbacked_lm_entry``, ``dead_unrendered`` and
+    ``unrendered_music`` are facts, so 1.0, but they
     are report-only types and never actionable regardless of confidence.
     """
     ll_ids = {it.video_id for it in result.ll if it.video_id}
@@ -186,7 +193,6 @@ def build_alignment_items(
             a_meta = metadata.get(a.video_id)
             b_meta = metadata.get(lm.video_id)
             sanity = pair_passes_sanity(a_meta, b_meta)
-            eligible = sanity and a.is_available is not None
             # B already liked on YouTube wins over relinked: the fix is then
             # removing A, not re-pointing it.
             if lm.video_id in ll_ids:
@@ -195,10 +201,16 @@ def build_alignment_items(
                 issue = ISSUE_RELINKED
             else:
                 issue = ISSUE_RENDERED_AS_OTHER
+            # A shadow is by nature a different upload (MV, fan or making-of
+            # video), so the same-recording check rarely passes; unlike_shadow
+            # proves the pair itself instead (B shown twice before, exactly one
+            # B fewer after, else A is re-liked).
+            check_gates = issue != ISSUE_SHADOW_DUPLICATE
+            eligible = (sanity or not check_gates) and a.is_available is not None
             add(
                 issue,
                 1.0 if eligible else 0.5,
-                _alignment_pair_reason(b, sanity, a_meta, b_meta),
+                _alignment_pair_reason(b, sanity, a_meta, b_meta, check_gates=check_gates),
                 a.track_id,
                 lm.track_id,
             )

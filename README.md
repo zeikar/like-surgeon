@@ -148,7 +148,7 @@ uv run likesurgeon issues --min-confidence 1.0 --format json
 | `unbacked_lm_entry` | YT Music entry with no determinable YouTube like behind it | report only |
 | `metadata_drift` | Title/artists changed between two scans of one source | report only |
 
-A pair (A shown as B) is **write-eligible** only at confidence 1.0: it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles) and A's availability is known. Everything else is report-only. LL videos in gaps whose LM and LL counts differ get no finding.
+A pair (A shown as B) is **write-eligible** only at confidence 1.0: A's availability is known and — except for `shadow_duplicate` — it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles). A shadow is usually a different upload (MV, fan or making-of video), so instead `sync` proves it while acting: B must show twice before, and exactly one B must disappear after, or A is re-liked. Everything else is report-only. LL videos in gaps whose LM and LL counts differ get no finding.
 
 ### 6. Sync (write actions)
 
