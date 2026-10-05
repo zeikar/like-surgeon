@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy.orm import Session
 
 from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt, Track
@@ -240,7 +241,9 @@ def test_sync_attempts_since_counts_writes_strictly_after(session: Session) -> N
     assert sync_attempts_since(session, t + timedelta(minutes=2)) == 0
 
 
-def _write_at(session: Session, when: datetime, status: str = "applied") -> None:
+def _write_at(
+    session: Session, when: datetime, status: str = "applied", kind: str = "repoint_like"
+) -> None:
     diag = Diagnosis()
     session.add(diag)
     session.flush()
@@ -250,7 +253,7 @@ def _write_at(session: Session, when: datetime, status: str = "applied") -> None
     session.add(
         SyncAttempt(
             diagnosis_item_id=item.id,
-            kind="repoint_like",
+            kind=kind,
             status=status,
             reason="",
             created_at=when,
@@ -277,7 +280,42 @@ def test_sync_attempts_since_older_scan_counts_from_the_older_of_the_two_scans(
     _write_at(session, t + timedelta(hours=1))  # between the scans
     _write_at(session, t + timedelta(hours=3))  # after both
     _write_at(session, t + timedelta(hours=3), status="skipped")  # no write
+    # A failed read-only check isn't a write; a failed write may have landed.
+    _write_at(session, t + timedelta(hours=3), status="failed", kind="repoint_precheck_a")
+    _write_at(session, t + timedelta(hours=3), status="failed", kind="repoint_verify")
+    _write_at(session, t + timedelta(hours=3), status="failed", kind="lm_check")
     assert sync_attempts_since_older_scan(session, diag) == 2
+    _write_at(session, t + timedelta(hours=3), status="failed", kind="repoint_rollback")
+    assert sync_attempts_since_older_scan(session, diag) == 3
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "yt_unlike",
+        "yt_relike_like",
+        "yt_relike_unlike",
+        "ytm_like_yt_unlike",
+        "ytm_like_yt_relike",
+        "yt_like_yt_rate",
+        "ytm_dedupe",
+    ],
+)
+def test_a_legacy_write_between_the_scans_is_counted(session: Session, kind: str) -> None:
+    """Rows written before the alignment redesign stay in upgraded databases."""
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    ll = create_snapshot(session, "youtube_liked_videos", [])
+    lm = create_snapshot(session, "ytmusic_liked_songs", [])
+    lm.created_at = t
+    ll.created_at = t + timedelta(hours=2)
+    diag = Diagnosis(youtube_snapshot_id=ll.id, ytmusic_snapshot_id=lm.id)
+    session.add(diag)
+    session.flush()
+
+    _write_at(session, t + timedelta(hours=1), kind=kind)
+    _write_at(session, t + timedelta(hours=1), kind="yt_like_verify", status="failed")  # a read
+
+    assert sync_attempts_since_older_scan(session, diag) == 1
 
 
 def test_sync_attempts_since_older_scan_without_scans_uses_the_diagnosis_time(

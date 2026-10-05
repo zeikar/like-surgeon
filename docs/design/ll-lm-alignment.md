@@ -65,14 +65,15 @@ For an LL video A rendered as B (availability from scan time):
 
 ### 4.1 Actions
 
-**re-point (A → B)** — 102 units
+**re-point (A → B)** — 104 units
+0. `getRating(A)` must be `like` (else skip, no writes); `getRating(B)` must be `none` (B already liked → stale, skip, no writes).
 1. `videos.rate(B, like)`; wait 5 s; `getRating(B)` must be `like`, else stop (A untouched).
 2. `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
 
-**unlike shadow (A behind B)** — 52 units
-1. `getRating(B)` must be `like` and LM must currently show B at least twice; `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
+**unlike shadow (A behind B)** — 53 units
+1. `getRating(B)` must be `like`, `getRating(A)` must be `like` and LM must currently show B at least twice; `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
 
-**Post-action LM check (both actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1. If LM doesn't match (re-read once after 15 s), **re-like A** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting).
+**Post-action LM check (both actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1. If LM doesn't match (re-read once after 15 s), **re-like A** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting). A re-point that leaves A liked after B's like may have landed (restore, quota-rejected unlike, B's like erroring) also unlikes B (`rate(B, none)` + `getRating`, failure reported as `left_liked`). Any action needing a restore, successful or not, stops the run: the mismatch means an order-derived pair was wrong, so later pairs may be too — re-scan and re-run `compare-likes`.
 
 **Never** call `rate_song(INDIFFERENT)` or `rate_song(LIKE)` on YT Music.
 

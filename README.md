@@ -167,16 +167,17 @@ uv run likesurgeon skip 812 813                    # keep sync off findings #812
 
 | Action | For | Steps | Quota (`videos.rate` 50 units, `getRating` 1) |
 |---|---|---|---|
-| repoint | `relinked`; `rendered_as_other` with `--include-playable` | like B, confirm via `getRating`, unlike A, confirm, full-LM check | 102 units |
-| unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, unlike A, confirm, full-LM check | 52 units |
+| repoint | `relinked`; `rendered_as_other` with `--include-playable` | confirm A still liked, confirm B isn't liked yet, like B, confirm via `getRating`, unlike A, confirm, full-LM check | 104 units |
+| unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, confirm A still liked, unlike A, confirm, full-LM check | 53 units |
 
-**LM check and restore.** After each unlike `sync` reads the whole LM again: repoint expects it unchanged, unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed. Unliking a wrongly paired A would otherwise silently drop an unrelated song. A restore re-like (~51 units) only happens after a failed check and isn't in the plan's estimate. The default daily YouTube quota is 10,000 units; the plan prints the estimate (warning above 10,000), and `--limit` slices a run.
+**LM check and restore.** After each unlike `sync` reads the whole LM again: repoint expects it unchanged, unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed. Unliking a wrongly paired A would otherwise silently drop an unrelated song. A restore re-like (~51 units) happens only when the unlike didn't take or the check failed. For a repoint, the undo of the B like it added (~51 units) happens whenever A stays liked after B's like may have landed: after a restore, when the quota rejects A's unlike, or when B's like errors but landed. Neither is in the plan's estimate. Any action that needs a restore, successful or not, and any B undo that can't be confirmed also stops the run, since other pairs from the same diagnosis may be wrong too. The default daily YouTube quota is 10,000 units; the plan prints the estimate (warning above 10,000), and `--limit` slices a run.
 
 `--include-playable` is off by default: it removes a real like you made (an official MV, a fan upload) so that YT Music shows only the audio track. Keep individual findings out with `skip`.
 
 #### If something goes wrong
 
-- **Restored** — LM didn't change as expected, so A was re-liked and the finding marked `skipped`. Nothing to do.
+- **Restored** — A was re-liked and the finding marked `skipped`, because A's unlike didn't take or the LM check didn't match. The run stops; re-scan both sources and run `compare-likes` before syncing again. Separately, for a repoint `sync` tries to unlike the B it liked, whenever A stays liked (also when A's unlike was rejected by the quota, or B's like errored but landed). If that undo fails or can't be confirmed, `sync` names the video and stops the run: B may still be liked, so unlike it on YouTube by hand if you don't want it (no song is lost).
+- **Stale finding** — A is no longer liked on YouTube (you unliked it after the scan), or B is already liked, so the finding is `skipped` without any write.
 - **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike: the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
 - **Aborted or quota stop** — remaining actions stay `open`. Re-scan both sources, run `compare-likes`, then `sync` again.
 
@@ -193,10 +194,11 @@ Sync refuses (exit 1) when:
 - the YT Music auth probe fails (needs `browser.json`; re-run `auth ytmusic --from-browser`).
 
 Sync stops early when:
-- YT Music liked songs can't be read (no baseline to check against), or
+- YT Music liked songs can't be read (no baseline to check against),
+- an action had to be restored, or a repoint's B like couldn't be confirmed undone (the diagnosis' pairs can't be trusted), or
 - YouTube's daily quota runs out.
 
-The run exits non-zero if any action failed or it stopped on an unreadable LM.
+The run exits non-zero if any action failed or it stopped early on an unreadable LM, after a restore, or after an unconfirmed B undo.
 
 ## Caveats
 

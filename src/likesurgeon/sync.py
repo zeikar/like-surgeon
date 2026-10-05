@@ -175,10 +175,10 @@ _ACTION_KINDS: tuple[ActionKind, ...] = ("repoint", "unlike_shadow")
 _DAILY_QUOTA = 10000
 
 _QUOTA_COST: dict[ActionKind, int] = {
-    # like B + getRating B + unlike A + getRating A
-    "repoint": 102,
-    # getRating B + unlike A + getRating A
-    "unlike_shadow": 52,
+    # getRating A + getRating B + like B + getRating B + unlike A + getRating A
+    "repoint": 104,
+    # getRating B + getRating A + unlike A + getRating A
+    "unlike_shadow": 53,
 }
 
 

@@ -541,6 +541,8 @@ def _out(result: Any) -> str:
 
 
 _REPOINT_ROWS = [
+    "repoint_precheck_a",
+    "repoint_precheck_b",
     "repoint_like",
     "repoint_verify",
     "repoint_unlike",
@@ -594,7 +596,7 @@ def test_sync_dry_run_prints_plan_and_writes_nothing(
     assert "\n  repoint: 1" in result.output
     assert "\n  unlike_shadow: 1" in result.output
     assert "skipped: 1" in result.output
-    assert "154 units" in result.output
+    assert "157 units" in result.output
     assert _sync_rows(fake_home)[1] == []
     assert _FakeYouTubeWrite.instances == []
     assert _FakeYTMusicWrite.instances == []
@@ -892,7 +894,7 @@ def test_sync_quota_exhaustion_stops_and_says_to_rescan(
     )
     acct = patch_sync_clients
     acct.liked, acct.renders = ["A1", "A2"], {"A1": "B1", "A2": "B2"}
-    acct.quota_after = 0
+    acct.quota_after = 2  # the two prechecks pass, the first write is rejected
 
     result = CliRunner().invoke(app, ["sync", "--yes"])
 
@@ -917,12 +919,35 @@ def test_sync_reports_an_action_undone_by_its_lm_check(
 
     result = CliRunner().invoke(app, ["sync", "--yes"])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output  # a restore stops the run
     out = _out(result)
     assert "applied=0 failed=0 skipped=1 restored=1" in out
     assert "1 action(s) were undone" in out
-    assert "A" in acct.liked
+    assert "re-scan both sources" in out
+    assert "A" in acct.liked and "B" not in acct.liked
     assert _sync_rows(fake_home)[0] == {item_id: "skipped"}
+
+
+def test_sync_restored_message_does_not_claim_b_removed_when_rollback_failed(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A", "D"], {"A": "C", "D": "B"}
+    acct.rate_errors = {("B", "none")}  # undoing B's like fails
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "restored=1" in out
+    assert "was removed" not in out
+    assert "undoing a B like this run added failed" in out
+    assert "unlike them on YouTube by hand if you don't want them" in out and "B" in out
 
 
 def test_sync_names_videos_left_unliked(

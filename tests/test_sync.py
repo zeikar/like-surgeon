@@ -184,12 +184,13 @@ def test_summarize_counts_and_quota() -> None:
     assert "\n  unlike_shadow: 1" in s
     assert "skipped: 1" in s
     assert "\n    unlike_shadow: 1" in s
-    # 2 × (like + getRating + unlike + getRating = 102) + (getRating + unlike + getRating = 52).
-    assert "256 units" in s
+    # 2 × (2 prechecks + like + getRating + unlike + getRating = 104)
+    # + (2 prechecks + unlike + getRating = 53).
+    assert "261 units" in s
 
 
 def test_summarize_warns_when_plan_exceeds_daily_quota() -> None:
-    actions = [PlannedAction(i, "repoint", f"a{i}", f"b{i}") for i in range(99)]
+    actions = [PlannedAction(i, "repoint", f"a{i}", f"b{i}") for i in range(97)]
 
     assert "exceeds the default daily quota" in summarize(actions, [])
-    assert "exceeds" not in summarize(actions[:98], [])  # 98 × 102 = 9996
+    assert "exceeds" not in summarize(actions[:96], [])  # 96 × 104 = 9984

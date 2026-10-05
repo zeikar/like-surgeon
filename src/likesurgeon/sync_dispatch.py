@@ -11,6 +11,16 @@ re-like of A. An A that still reads liked after its unlike is re-liked before
 the check, so an unlike landing late can't win unnoticed. An A whose re-like
 can't be confirmed is reported in ``ExecResult.left_unliked``.
 
+Each action first reads A's rating (A must still be liked — the user may have
+unliked it since the scan) and, for a repoint, B's (B must not be liked yet);
+a stale finding is skipped without writes. A repoint that leaves A liked after
+B's like may have landed (A restored, A's unlike rejected by the quota, B's
+like erroring or unconfirmed) undoes B's like, so nothing is left behind; a B
+left liked is reported in ``ExecResult.left_liked``. Any action that needs a
+restore, successful or not, or whose B undo fails stops the run: a mismatch
+means an order-derived pair was wrong, and later pairs of the same diagnosis
+may be too.
+
 Invariants:
   * ``DiagnosisItem.reason`` is never modified — that field is the
     diagnosis-time evidence. Sync-side detail lives on ``SyncAttempt.reason``.
@@ -57,6 +67,18 @@ _LM_DIFF_SHOWN = 6
 # nothing was sent. ``stranded_unliked_video_ids`` keys on it.
 QUOTA_REJECTED = "not sent, YouTube quota exhausted"
 
+# ``ExecResult.aborted`` when B's like couldn't be undone after a repoint.
+ROLLBACK_STOP = (
+    "a repoint's B like couldn't be undone, so the account differs from the diagnosis — "
+    "unlike B by hand, then re-scan both sources and re-run compare-likes"
+)
+
+# ``ExecResult.aborted`` after an action needed a restore (whether or not it worked).
+RESTORED_STOP = (
+    "an action needed A re-liked, so the diagnosis' pairs can't be trusted — "
+    "re-scan both sources and re-run compare-likes"
+)
+
 
 @dataclass(frozen=True)
 class ExecResult:
@@ -74,8 +96,14 @@ class ExecResult:
     # Videos unliked on YouTube whose restoring re-like failed or couldn't be
     # confirmed — possibly liked nowhere now; the user re-likes them by hand.
     left_unliked: tuple[str, ...] = ()
-    # Why the run stopped early because YT Music liked songs couldn't be read.
+    # Why the run stopped early: YT Music liked songs couldn't be read, or an
+    # action was restored (the diagnosis' pairs can't be trusted any more).
     aborted: str | None = None
+    # Videos a repoint of this run liked on YouTube (B) that stayed liked or
+    # may have: the undo failed or couldn't be confirmed (A restored, A's unlike
+    # rejected, or B's like erroring). An unintended like, not a lost song;
+    # the user unlikes them by hand.
+    left_liked: tuple[str, ...] = ()
 
 
 def execute(
@@ -121,6 +149,7 @@ def execute(
         if item is None:
             continue
         before = run.take_lm_baseline()
+        restored_before = (run.restored, len(run.left_unliked))
         if before is None:
             unattempted = len(actions) - i
             break
@@ -129,6 +158,8 @@ def execute(
         else:
             outcome = run.unlike_shadow(action, before)
         outcomes[outcome] += 1
+        if (run.restored, len(run.left_unliked)) != restored_before and run.aborted is None:
+            run.aborted = RESTORED_STOP
         if outcome in ("applied", "skipped"):
             item.status = outcome
         session.commit()
@@ -142,6 +173,7 @@ def execute(
         unattempted=unattempted,
         left_unliked=tuple(run.left_unliked),
         aborted=run.aborted,
+        left_liked=tuple(run.left_liked),
     )
 
 
@@ -179,6 +211,9 @@ class _SyncRun:
         self.aborted: str | None = None
         self.restored = 0
         self.left_unliked: list[str] = []
+        self.left_liked: list[str] = []
+        # Set by ``_unlike_and_check``: the daily quota rejected A's unlike.
+        self.unlike_rejected = False
 
     def take_lm_baseline(self) -> _LM | None:
         """The LM the next action is checked against, or None if the run stops.
@@ -197,14 +232,43 @@ class _SyncRun:
 
     def repoint(self, action: PlannedAction, before: _LM) -> _DispatchOutcome:
         item_id, a, b = action.item_id, action.a_video_id, action.b_video_id
-        if self._rate(item_id, "repoint_like", b, "like") != "ok":
-            return "failed"
-        # A 2xx doesn't mean B's like landed; unliking A without it would drop
-        # the song from both platforms.
+        a_liked = self._has_rating(
+            item_id, "repoint_precheck_a", a, "like", miss="skipped", wait=False
+        )
+        if not a_liked:
+            return _unconfirmed(a_liked)
+        # B already liked: the finding is stale (and a rollback couldn't tell
+        # this run's like from the user's). Unread: don't write.
+        b_liked = self._has_rating(
+            item_id,
+            "repoint_precheck_b",
+            b,
+            "none",
+            miss="skipped",
+            wait=False,
+            miss_note="B is already liked — the finding is stale; re-scan both sources and "
+            "re-run compare-likes",
+        )
+        if not b_liked:
+            return _unconfirmed(b_liked)
+        rated = self._rate(item_id, "repoint_like", b, "like")
+        if rated == "quota":
+            return "failed"  # nothing was sent
+        # A 2xx doesn't mean B's like landed (and an error may have): unliking
+        # A without it would drop the song from both platforms.
         liked = self._has_rating(item_id, "repoint_verify", b, "like", miss="skipped")
+        if rated != "ok":
+            # A is untouched; whatever landed of B's like is undone.
+            if liked is not False:
+                self._undo_b_like(item_id, b)
+            return "failed"
         if not liked:
+            if liked is None:
+                self._undo_b_like(item_id, b)  # unread: B may be liked
             return _unconfirmed(liked)
-        return self._unlike_and_check(
+        self.unlike_rejected = False
+        restored_before = self.restored
+        outcome = self._unlike_and_check(
             item_id,
             a,
             unlike_kind="repoint_unlike",
@@ -214,6 +278,9 @@ class _SyncRun:
             # B's own like adds an entry while A still renders as B.
             still_liked=before + Counter([b]),
         )
+        if self.restored > restored_before or self.unlike_rejected:
+            self._undo_b_like(item_id, b)
+        return outcome
 
     def unlike_shadow(self, action: PlannedAction, before: _LM) -> _DispatchOutcome:
         item_id, a, b = action.item_id, action.a_video_id, action.b_video_id
@@ -232,6 +299,11 @@ class _SyncRun:
         )
         if not liked:
             return _unconfirmed(liked)
+        a_liked = self._has_rating(
+            item_id, "unlike_shadow_precheck_a", a, "like", miss="skipped", wait=False
+        )
+        if not a_liked:
+            return _unconfirmed(a_liked)
         expected = before.copy()
         expected[b] -= 1
         return self._unlike_and_check(
@@ -261,6 +333,7 @@ class _SyncRun:
         try:
             rated = self._rate(item_id, unlike_kind, a, "none")
             if rated == "quota":
+                self.unlike_rejected = True
                 return "failed"  # rejected outright: nothing was sent
             return self._settle(
                 item_id,
@@ -379,6 +452,19 @@ class _SyncRun:
         self.left_unliked.append(a)
         return "failed"
 
+    def _undo_b_like(self, item_id: int, b: str) -> None:
+        """Unlike the B this run liked, after A's restore (``repoint_rollback`` /
+        ``repoint_rollback_verify``). A failure doesn't change the action's
+        outcome — A is already back — but B is reported in ``left_liked``."""
+        if (
+            self._rate(item_id, "repoint_rollback", b, "none") != "ok"
+            or self._has_rating(item_id, "repoint_rollback_verify", b, "none", miss="failed")
+            is not True
+        ):
+            self.left_liked.append(b)
+            if self.aborted is None:
+                self.aborted = ROLLBACK_STOP
+
     def _rate(
         self, item_id: int, kind: str, video_id: str, rating: Literal["like", "none"]
     ) -> _RateResult:
@@ -412,6 +498,7 @@ class _SyncRun:
         *,
         miss: Literal["skipped", "failed"],
         wait: bool = True,
+        miss_note: str | None = None,
     ) -> bool | None:
         """Whether ``videos.getRating`` shows ``rating`` on ``video_id`` (None if
         the read failed). A 2xx from ``videos.rate`` doesn't guarantee the
@@ -428,7 +515,7 @@ class _SyncRun:
             self._record(item_id, kind, "applied", f"rating is {rating}")
             return True
         after = f" after +{_VERIFY_WAIT_SECONDS}s" if wait else ""
-        self._record(item_id, kind, miss, f"rating is not {rating}{after}")
+        self._record(item_id, kind, miss, miss_note or f"rating is not {rating}{after}")
         return False
 
     def _record(self, item_id: int, kind: str, status: str, reason: str) -> None:

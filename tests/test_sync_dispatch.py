@@ -15,7 +15,13 @@ from likesurgeon.db import make_session_factory
 from likesurgeon.diagnosis import ISSUE_SHADOW_DUPLICATE
 from likesurgeon.models import DiagnosisItem, SyncAttempt
 from likesurgeon.sync import PlannedAction, SkipRecord
-from likesurgeon.sync_dispatch import QUOTA_REJECTED, ExecResult, execute
+from likesurgeon.sync_dispatch import (
+    QUOTA_REJECTED,
+    RESTORED_STOP,
+    ROLLBACK_STOP,
+    ExecResult,
+    execute,
+)
 from likesurgeon.sync_preflight import stranded_unliked_video_ids
 from likesurgeon.ytmusic_client import UnexpectedResponseError
 
@@ -45,7 +51,10 @@ def _steps(session: Session, item_id: int) -> list[tuple[str, str]]:
     return [(r.kind, r.status) for r in _attempts(session, item_id)]
 
 
+_PRECHECKS = [("repoint_precheck_a", "applied"), ("repoint_precheck_b", "applied")]
+_ROLLBACK = [("repoint_rollback", "applied"), ("repoint_rollback_verify", "applied")]
 _REPOINT_UNLIKED = [
+    *_PRECHECKS,
     ("repoint_like", "applied"),
     ("repoint_verify", "applied"),
     ("repoint_unlike", "applied"),
@@ -97,7 +106,11 @@ def test_repoint_stops_before_unliking_a_when_bs_like_does_not_land(session: Ses
     assert "A" in acct.liked
     session.refresh(item)
     assert item.status == "skipped"
-    assert _steps(session, item.id) == [("repoint_like", "applied"), ("repoint_verify", "skipped")]
+    assert _steps(session, item.id) == [
+        *_PRECHECKS,
+        ("repoint_like", "applied"),
+        ("repoint_verify", "skipped"),
+    ]
 
 
 def test_repoint_restores_a_when_its_unlike_drops_another_song(
@@ -112,15 +125,16 @@ def test_repoint_restores_a_when_its_unlike_drops_another_song(
 
     res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1)
-    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like")]
-    assert "A" in acct.liked and "C" in acct.lm
+    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1, aborted=RESTORED_STOP)
+    # B's like is undone too: it was this run's, and the pair was wrong.
+    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like"), ("B", "none")]
+    assert "A" in acct.liked and "B" not in acct.liked and "C" in acct.lm
     session.refresh(item)
     assert item.status == "skipped"
     rows = _attempts(session, item.id)
-    assert [(r.kind, r.status) for r in rows] == [*_REPOINT_UNLIKED, *_RESTORED]
-    assert rows[4].reason.startswith("expected no change, got -C +B")
-    assert sleeps == [5, 5, 15, 5]
+    assert [(r.kind, r.status) for r in rows] == [*_REPOINT_UNLIKED, *_RESTORED, *_ROLLBACK]
+    assert rows[6].reason.startswith("expected no change, got -C +B")
+    assert sleeps == [5, 5, 15, 5, 5]
     assert acct.lm_reads == 3  # baseline, check, re-read
 
 
@@ -140,11 +154,136 @@ def test_repoint_restore_failure_leaves_a_in_left_unliked(
 
     res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=1, skipped=0, left_unliked=("A",))
+    assert res == ExecResult(
+        applied=0, failed=1, skipped=0, left_unliked=("A",), aborted=RESTORED_STOP
+    )
     assert "A" not in acct.liked
     session.refresh(item)
     assert item.status == "open"
     assert _steps(session, item.id) == [*_REPOINT_UNLIKED, ("lm_check", "failed"), *tail]
+
+
+def test_a_repoint_whose_b_is_already_liked_is_stale_and_skipped(session: Session) -> None:
+    item = pair(session, make_diagnosis(session))
+    session.commit()
+    acct = FakeAccount(["A", "B"], renders={"A": "B", "B": "E"})
+
+    res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        ("repoint_precheck_a", "applied"),
+        ("repoint_precheck_b", "skipped"),
+    ]
+    assert "stale" in rows[-1].reason and "compare-likes" in rows[-1].reason
+
+
+def test_a_failed_restore_also_stops_the_run(session: Session) -> None:
+    first, second, actions = _two_repoints(session)
+    acct = FakeAccount(["A1", "D", "A2"], renders={"A1": "C", "D": "B1", "A2": "B2"})
+    acct.rate_errors = {("A1", "like")}
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res.left_unliked == ("A1",) and res.unattempted == 1
+    assert res.aborted == RESTORED_STOP
+    assert _attempts(session, second.id) == []
+
+
+def test_a_like_that_errors_without_landing_leaves_nothing_to_undo(session: Session) -> None:
+    item = pair(session, make_diagnosis(session))
+    session.commit()
+    acct = FakeAccount(["A"], renders={"A": "B"})
+    acct.rate_errors = {("B", "like")}
+
+    res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    assert acct.rate_calls == [("B", "like")]
+    assert _steps(session, item.id) == [
+        *_PRECHECKS,
+        ("repoint_like", "failed"),
+        ("repoint_verify", "skipped"),
+    ]
+
+
+@pytest.mark.parametrize("breaks", ["rate_error", "unlike_does_not_land"])
+def test_a_failed_rollback_of_b_is_reported_without_blocking_a_restore(
+    session: Session, breaks: str
+) -> None:
+    item = pair(session, make_diagnosis(session))
+    session.commit()
+    acct = FakeAccount(["A", "D"], renders={"A": "C", "D": "B"})
+    if breaks == "rate_error":
+        acct.rate_errors = {("B", "none")}
+        tail = [("repoint_rollback", "failed")]
+    else:
+        acct.unlike_lands_late = {"B": 99}  # never lands within the run
+        tail = [("repoint_rollback", "applied"), ("repoint_rollback_verify", "failed")]
+
+    res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res.restored == 1 and res.left_liked == ("B",) and res.left_unliked == ()
+    assert "A" in acct.liked and "B" in acct.liked
+    session.refresh(item)
+    assert item.status == "skipped"
+    assert _steps(session, item.id)[-len(tail) :] == tail
+
+
+def test_an_unconfirmed_b_rollback_stops_the_run(session: Session) -> None:
+    first, second, actions = _two_repoints(session)
+    acct = FakeAccount(["A1", "D", "A2"], renders={"A1": "C", "D": "B1", "A2": "B2"})
+    acct.rate_errors = {("B1", "none")}  # not a quota failure
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res.left_liked == ("B1",) and res.restored == 1
+    assert res.aborted == ROLLBACK_STOP and res.unattempted == 1
+    assert not res.quota_exhausted
+    assert _attempts(session, second.id) == []
+
+
+def test_a_failed_restore_keeps_b_liked(session: Session) -> None:
+    """With A unliked and not re-liked, B's like is the song's only one."""
+    item = pair(session, make_diagnosis(session))
+    session.commit()
+    acct = FakeAccount(["A", "D"], renders={"A": "C", "D": "B"})
+    acct.rate_errors = {("A", "like")}
+
+    res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res.left_unliked == ("A",) and res.left_liked == ()
+    assert ("B", "none") not in acct.rate_calls
+
+
+@pytest.mark.parametrize("kind", ["repoint", "unlike_shadow"])
+def test_a_stale_finding_whose_a_is_no_longer_liked_is_skipped_without_writes(
+    session: Session, kind: str
+) -> None:
+    """The user unliked A after the scan: re-liking it in a restore would undo that."""
+    if kind == "repoint":
+        item = pair(session, make_diagnosis(session))
+        acct = FakeAccount(["x"], renders={"A": "B"})
+        action, check = repoint(item), "repoint_precheck_a"
+    else:
+        item = pair(session, make_diagnosis(session), ISSUE_SHADOW_DUPLICATE)
+        acct = FakeAccount(["x", "B", "B"], renders={})  # B shown twice, A not liked
+        action, check = unlike_shadow(item), "unlike_shadow_precheck_a"
+    session.commit()
+
+    res = execute(session, [action], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    rows = _attempts(session, item.id)
+    assert (rows[-1].kind, rows[-1].status) == (check, "skipped")
+    assert "rating is not like" in rows[-1].reason
 
 
 _STILL_LIKED = [
@@ -167,21 +306,27 @@ def test_repoint_unlike_that_does_not_take_relikes_a_and_checks_lm(session: Sess
 
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=2, failed=0, skipped=1, restored=1)
-    assert {"A1", "B1"} <= set(acct.liked)
+    # The restore stops the run: action 2 is never attempted.
+    assert res == ExecResult(
+        applied=1, failed=0, skipped=1, restored=1, unattempted=1, aborted=RESTORED_STOP
+    )
+    assert "A1" in acct.liked and "B1" not in acct.liked  # B1's like was undone
     rows = _attempts(session, items[1].id)
     assert [(r.kind, r.status) for r in rows] == [
+        *_PRECHECKS,
         ("repoint_like", "applied"),
         ("repoint_verify", "applied"),
         ("repoint_unlike", "failed"),
         ("repoint_unlike_verify", "failed"),
         *_STILL_LIKED,
+        *_ROLLBACK,
     ]
-    assert rows[-1].reason == "as expected: +B1"
+    assert rows[-3].reason == "as expected: +B1"
     for it in items:
         session.refresh(it)
-    assert [it.status for it in items] == ["applied", "skipped", "applied"]
-    assert acct.lm_reads == 4  # baseline + one check per action
+    assert [it.status for it in items] == ["applied", "skipped", "open"]
+    assert _attempts(session, items[2].id) == []
+    assert acct.lm_reads == 3  # baseline + one check per attempted action
 
 
 @pytest.mark.parametrize("kind", ["repoint", "unlike_shadow"])
@@ -191,26 +336,32 @@ def test_an_unlike_landing_after_its_verify_read_cannot_win(session: Session, ki
     if kind == "repoint":
         item = pair(session, make_diagnosis(session))
         acct = FakeAccount(["x", "A", "y"], renders={"A": "B"})
-        action, head = repoint(item), [*_REPOINT_UNLIKED[:3]]
-        rate_calls = [("B", "like"), ("A", "none"), ("A", "like")]
+        action, head = repoint(item), [*_REPOINT_UNLIKED[:5]]
+        rate_calls = [("B", "like"), ("A", "none"), ("A", "like"), ("B", "none")]
+        tail = _ROLLBACK
     else:
         item = pair(session, make_diagnosis(session), ISSUE_SHADOW_DUPLICATE)
         acct = FakeAccount(["x", "A", "B", "y"], renders={"A": "B"})
         action = unlike_shadow(item)
-        head = [("unlike_shadow_precheck", "applied"), ("unlike_shadow_unlike", "applied")]
+        head = [
+            ("unlike_shadow_precheck", "applied"),
+            ("unlike_shadow_precheck_a", "applied"),
+            ("unlike_shadow_unlike", "applied"),
+        ]
         rate_calls = [("A", "none"), ("A", "like")]
+        tail = []
     session.commit()
     acct.unlike_lands_late = {"A": 1}
 
     res = execute(session, [action], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1)
+    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1, aborted=RESTORED_STOP)
     assert acct.rate_calls == rate_calls
     assert "A" in acct.liked
     session.refresh(item)
     assert item.status == "skipped"
     verify = "repoint_unlike_verify" if kind == "repoint" else "unlike_shadow_verify"
-    assert _steps(session, item.id) == [*head, (verify, "failed"), *_STILL_LIKED]
+    assert _steps(session, item.id) == [*head, (verify, "failed"), *_STILL_LIKED, *tail]
 
 
 def test_an_unlike_landing_after_the_first_relike_is_relike_again(session: Session) -> None:
@@ -223,15 +374,16 @@ def test_an_unlike_landing_after_the_first_relike_is_relike_again(session: Sessi
 
     res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1)
+    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1, aborted=RESTORED_STOP)
     assert "A" in acct.liked
     assert _steps(session, item.id) == [
-        *_REPOINT_UNLIKED[:3],
+        *_REPOINT_UNLIKED[:5],
         ("repoint_unlike_verify", "failed"),
         *_STILL_LIKED[:2],
         ("lm_check", "failed"),
         ("restore_like", "applied"),
         ("restore_verify", "applied"),
+        *_ROLLBACK,
     ]
 
 
@@ -244,10 +396,12 @@ def test_a_late_unlike_whose_relike_fails_still_gets_the_lm_check(session: Sessi
 
     res = execute(session, [repoint(item)], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=1, skipped=0, left_unliked=("A",))
+    assert res == ExecResult(
+        applied=0, failed=1, skipped=0, left_unliked=("A",), aborted=RESTORED_STOP
+    )
     assert "A" not in acct.liked
     assert _steps(session, item.id) == [
-        *_REPOINT_UNLIKED[:3],
+        *_REPOINT_UNLIKED[:5],
         ("repoint_unlike_verify", "failed"),
         ("restore_like", "failed"),
         ("lm_check", "failed"),  # A's late unlike took its entry
@@ -255,9 +409,9 @@ def test_a_late_unlike_whose_relike_fails_still_gets_the_lm_check(session: Sessi
     ]
 
 
-def test_after_a_restore_the_next_action_rereads_lm(session: Session) -> None:
-    """Action 1's restore leaves B1's extra like in LM; checking action 2
-    against action 0's post-check read would wrongly undo it."""
+def test_a_restore_stops_the_run_and_later_actions_stay_untouched(session: Session) -> None:
+    """Action 1's LM mismatch proves a pair of this diagnosis was wrong; the
+    pairs after it may be too, so nothing more is written."""
     diag = make_diagnosis(session)
     items = [pair(session, diag, a=f"A{i}", b=f"B{i}") for i in range(3)]
     session.commit()
@@ -269,11 +423,14 @@ def test_after_a_restore_the_next_action_rereads_lm(session: Session) -> None:
 
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=2, failed=0, skipped=1, restored=1)
+    assert res == ExecResult(
+        applied=1, failed=0, skipped=1, restored=1, unattempted=1, aborted=RESTORED_STOP
+    )
     for it in items:
         session.refresh(it)
-    assert [it.status for it in items] == ["applied", "skipped", "applied"]
-    assert acct.lm_reads == 6  # baseline, check 0, check 1 + re-read, fresh baseline, check 2
+    assert [it.status for it in items] == ["applied", "skipped", "open"]
+    assert _attempts(session, items[2].id) == []
+    assert ("B2", "like") not in acct.rate_calls and "A2" in acct.liked
 
 
 def test_a_matching_check_is_the_next_actions_baseline(session: Session) -> None:
@@ -311,6 +468,7 @@ def test_unlike_shadow_removes_one_b_from_lm(session: Session) -> None:
     rows = _attempts(session, item.id)
     assert [(r.kind, r.status) for r in rows] == [
         ("unlike_shadow_precheck", "applied"),
+        ("unlike_shadow_precheck_a", "applied"),
         ("unlike_shadow_unlike", "applied"),
         ("unlike_shadow_verify", "applied"),
         ("lm_check", "applied"),
@@ -326,7 +484,7 @@ def test_unlike_shadow_restores_a_when_the_pair_was_wrong(session: Session) -> N
 
     res = execute(session, [unlike_shadow(item)], [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1)
+    assert res == ExecResult(applied=0, failed=0, skipped=1, restored=1, aborted=RESTORED_STOP)
     assert acct.rate_calls == [("A", "none"), ("A", "like")]
     assert sorted(acct.lm) == ["B", "B", "C", "x"]
     session.refresh(item)
@@ -367,7 +525,11 @@ def test_a_failed_rating_read_of_b_is_a_failure_and_a_stays_liked(
     if kind == "repoint":
         item = pair(session, make_diagnosis(session))
         acct = FakeAccount(["A"], renders={"A": "B"})
-        action, head, verify = repoint(item), [("repoint_like", "applied")], "repoint_verify"
+        action, head, verify = (
+            repoint(item),
+            [("repoint_precheck_a", "applied")],
+            "repoint_precheck_b",
+        )
     else:
         item = pair(session, make_diagnosis(session), ISSUE_SHADOW_DUPLICATE)
         acct = FakeAccount(["A", "B"], renders={"A": "B"})
@@ -425,9 +587,14 @@ def test_lm_read_failure_after_an_unlike_restores_a_and_stops(session: Session) 
     assert (res.applied, res.failed, res.skipped, res.restored) == (0, 0, 1, 1)
     assert res.unattempted == 1
     assert res.aborted is not None and "network down" in res.aborted
-    assert acct.rate_calls == [("B1", "like"), ("A1", "none"), ("A1", "like")]
-    assert "A1" in acct.liked
-    assert _steps(session, first.id)[-3:] == _RESTORED
+    assert acct.rate_calls == [("B1", "like"), ("A1", "none"), ("A1", "like"), ("B1", "none")]
+    assert "A1" in acct.liked and "B1" not in acct.liked
+    assert _steps(session, first.id)[-5:] == [
+        ("lm_check", "failed"),
+        ("restore_like", "applied"),
+        ("restore_verify", "applied"),
+        *_ROLLBACK,
+    ]
     assert _attempts(session, second.id) == []
 
 
@@ -447,33 +614,43 @@ def _two_repoints(session: Session) -> tuple[DiagnosisItem, DiagnosisItem, list[
 def test_quota_on_the_first_write_stops_the_run(session: Session) -> None:
     first, second, actions = _two_repoints(session)
     acct = FakeAccount(["A1", "A2"], renders={"A1": "B1", "A2": "B2"})
-    acct.quota_after = 0
+    acct.quota_after = 2  # the two prechecks pass
 
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
     assert res == ExecResult(applied=0, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
     assert acct.rate_calls == [("B1", "like")]
-    assert _steps(session, first.id) == [("repoint_like", "failed")]
+    assert _steps(session, first.id) == [*_PRECHECKS, ("repoint_like", "failed")]
     assert _attempts(session, second.id) == []
 
 
 def test_quota_on_the_unlike_leaves_a_liked(session: Session) -> None:
-    """The quota error rejects the unlike outright: A is untouched."""
+    """The quota error rejects the unlike outright: A is untouched, so B's like
+    is undone — which the exhausted quota rejects too, leaving B reported."""
     first, _, actions = _two_repoints(session)
     acct = FakeAccount(["A1", "A2"], renders={"A1": "B1", "A2": "B2"})
-    acct.quota_after = 2  # like B1 + getRating B1
+    acct.quota_after = 4  # 2 prechecks + like B1 + getRating B1
 
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
-    assert res == ExecResult(applied=0, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
+    assert res == ExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        quota_exhausted=True,
+        unattempted=1,
+        left_liked=("B1",),
+        aborted=ROLLBACK_STOP,
+    )
     assert "A1" in acct.liked
     rows = _attempts(session, first.id)
     assert [(r.kind, r.status) for r in rows] == [
-        *_REPOINT_UNLIKED[:2],
+        *_REPOINT_UNLIKED[:4],
         ("repoint_unlike", "failed"),
+        ("repoint_rollback", "failed"),
     ]
     # Nothing was sent, so an unlike with nothing after it doesn't strand A here.
-    assert rows[-1].reason.startswith(QUOTA_REJECTED)
+    assert rows[4].reason.startswith(QUOTA_REJECTED)
     assert stranded_unliked_video_ids(session) == frozenset()
 
 
@@ -482,13 +659,13 @@ def test_quota_after_the_unlike_still_runs_the_lm_check(session: Session) -> Non
     no YouTube quota and passes, so A's unlike stands: nothing is stranded."""
     first, _, actions = _two_repoints(session)
     acct = FakeAccount(["A1", "A2"], renders={"A1": "B1", "A2": "B2"})
-    acct.quota_after = 3
+    acct.quota_after = 5
 
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
     assert res == ExecResult(applied=0, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
     assert _steps(session, first.id) == [
-        *_REPOINT_UNLIKED[:3],
+        *_REPOINT_UNLIKED[:5],
         ("repoint_unlike_verify", "failed"),
         ("lm_check", "applied"),
     ]
@@ -499,7 +676,7 @@ def test_quota_after_the_unlike_still_runs_the_lm_check(session: Session) -> Non
     [
         # getRating(A) hits the quota; so does the restore it then needs.
         (
-            3,
+            5,
             [
                 ("repoint_unlike_verify", "failed"),
                 ("lm_check", "failed"),
@@ -508,7 +685,7 @@ def test_quota_after_the_unlike_still_runs_the_lm_check(session: Session) -> Non
         ),
         # The re-like itself hits the quota.
         (
-            4,
+            6,
             [
                 ("repoint_unlike_verify", "applied"),
                 ("lm_check", "failed"),
@@ -517,7 +694,7 @@ def test_quota_after_the_unlike_still_runs_the_lm_check(session: Session) -> Non
         ),
         # The re-like lands, but can't be confirmed.
         (
-            5,
+            7,
             [
                 ("repoint_unlike_verify", "applied"),
                 ("lm_check", "failed"),
@@ -543,8 +720,9 @@ def test_quota_mid_action_never_leaves_a_unliked_unreported(
         quota_exhausted=True,
         unattempted=1,
         left_unliked=("A1",),
+        aborted=RESTORED_STOP,
     )
-    assert _steps(session, first.id) == [*_REPOINT_UNLIKED[:3], *tail]
+    assert _steps(session, first.id) == [*_REPOINT_UNLIKED[:5], *tail]
     assert _attempts(session, second.id) == []
     assert stranded_unliked_video_ids(session) == {"A1"}  # and on later runs too
 
@@ -671,8 +849,8 @@ def test_each_write_row_is_on_disk_before_the_next_wait(
     execute(session, [repoint(item)], [], ytm=acct, yt=acct)
 
     # Wait 1 confirms B's like; wait 2 confirms A's unlike.
-    assert committed_at_waits[0] == [("repoint_like", "applied")]
-    assert committed_at_waits[1] == _REPOINT_UNLIKED[:3]
+    assert committed_at_waits[0] == [*_PRECHECKS, ("repoint_like", "applied")]
+    assert committed_at_waits[1] == _REPOINT_UNLIKED[:5]
 
 
 def test_an_unlike_that_errors_but_lands_is_still_checked(session: Session) -> None:
@@ -687,7 +865,7 @@ def test_an_unlike_that_errors_but_lands_is_still_checked(session: Session) -> N
     assert res == ExecResult(applied=0, failed=1, skipped=0)
     assert "A" not in acct.liked
     assert _steps(session, item.id) == [
-        *_REPOINT_UNLIKED[:2],
+        *_REPOINT_UNLIKED[:4],
         ("repoint_unlike", "failed"),
         ("repoint_unlike_verify", "applied"),
         ("lm_check", "applied"),
@@ -703,7 +881,14 @@ def test_a_like_that_errors_but_lands_makes_the_next_action_reread_lm(session: S
     res = execute(session, actions, [], ytm=acct, yt=acct)
 
     assert res == ExecResult(applied=1, failed=1, skipped=0)
-    assert _steps(session, first.id) == [("repoint_like", "failed")]
+    # The like landed despite the error: B1 is confirmed, then undone (A1 untouched).
+    assert _steps(session, first.id) == [
+        *_PRECHECKS,
+        ("repoint_like", "failed"),
+        ("repoint_verify", "applied"),
+        *_ROLLBACK,
+    ]
+    assert "A1" in acct.liked and "B1" not in acct.liked
     session.refresh(second)
     assert second.status == "applied"
     assert acct.lm_reads == 3  # baseline, fresh baseline after B1's stray like, check

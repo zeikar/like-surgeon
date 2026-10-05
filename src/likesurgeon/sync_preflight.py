@@ -37,6 +37,29 @@ _SETTLING_KINDS = (
 )
 
 
+# Rows of a ``videos.rate`` call or an interrupted action: each may have
+# changed a like, even when it failed. Prechecks, verifies and LM checks only read.
+_WRITE_KINDS = (
+    "repoint_like",
+    "repoint_unlike",
+    "unlike_shadow_unlike",
+    "restore_like",
+    "repoint_rollback",
+    "interrupted",
+    # Writes recorded by versions before the LL -> LM alignment; their rows stay
+    # in existing databases. (``ytm_like`` / ``yt_relike`` / ``yt_like`` alone were
+    # plan-time skips, which the 'skipped' status already excludes.)
+    "yt_unlike",
+    "yt_relike_like",
+    "yt_relike_unlike",
+    "ytm_like",
+    "ytm_like_yt_unlike",
+    "ytm_like_yt_relike",
+    "yt_like_yt_rate",
+    "ytm_dedupe",
+)
+
+
 def _may_be_unliked(kind: str, status: str, reason: str) -> bool:
     if kind in _UNLIKE_KINDS:
         # Nothing recorded after the unlike: the process died before its check.
@@ -137,17 +160,18 @@ def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> 
 
 
 def sync_attempts_since(session: Session, since: datetime) -> int:
-    """How many of our own ``sync`` API calls were recorded strictly after ``since``.
+    """How many of our own ``sync`` write attempts were recorded strictly after ``since``.
 
-    A diagnosis is only trustworthy when no such call happened after the
+    A diagnosis is only trustworthy when no such write happened after the
     older of its two scans (spec §5.1): one between the scans misaligns them,
-    one after both means the lists have changed since. 'skipped' rows are
-    plan-time skips or verify misses — no write — so they don't count; a
-    'failed' call may still have landed, so it does.
+    one after both means the lists have changed since. Only ``_WRITE_KINDS``
+    rows count — reads (prechecks, verifies, LM checks) and skips change
+    nothing — and a 'failed' write may still have landed, so it does.
     """
     return (
         session.scalar(
             select(func.count(SyncAttempt.id)).where(
+                SyncAttempt.kind.in_(_WRITE_KINDS),
                 SyncAttempt.status != "skipped",
                 # Bound as UTC wall-clock, which is how the column is stored.
                 SyncAttempt.created_at > _as_utc(since),

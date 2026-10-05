@@ -813,10 +813,17 @@ def sync(
         f"restored=[yellow]{result.restored}[/yellow]"
     )
     if result.restored:
+        b_note = (
+            "restored (undoing a B like this run added failed — see below)"
+            if result.left_liked
+            else "restored (and any B like this run added was removed)"
+        )
         console.print(
             f"[yellow]{result.restored} action(s) were undone:[/yellow] the unlike didn't "
-            "take or YT Music liked songs didn't change as expected, so the YouTube like was "
-            "restored and the finding marked 'skipped'. See [cyan]likesurgeon issues[/cyan]."
+            f"take or YT Music liked songs didn't change as expected, so the YouTube like was "
+            f"{b_note} and the finding marked "
+            "'skipped'. The run stopped there: re-scan both sources and re-run compare-likes "
+            "before syncing again. See [cyan]likesurgeon issues[/cyan]."
         )
     if result.quota_exhausted:
         console.print(
@@ -835,6 +842,13 @@ def sync(
             "they may be liked nowhere right now:[/bold red] "
             + ", ".join(result.left_unliked)
             + "\nRe-like them on YouTube by hand."
+        )
+    if result.left_liked:
+        console.print(
+            "[bold red]A re-point liked these videos on YouTube, and undoing that like failed "
+            "or couldn't be confirmed, so they may still be liked:[/bold red] "
+            + ", ".join(result.left_liked)
+            + "\nNo song is lost, but unlike them on YouTube by hand if you don't want them."
         )
     if result.failed or result.aborted:
         raise typer.Exit(1)

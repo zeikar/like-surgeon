@@ -191,10 +191,13 @@ class DiagnosisItem(Base):
 class SyncAttempt(Base):
     """One row per ``sync`` API call, LM check, or skip decision.
 
-    ``kind`` names the step: ``repoint_like``, ``repoint_verify``,
+    ``kind`` names the step: ``repoint_precheck_a``,
+    ``repoint_precheck_b``, ``repoint_like``, ``repoint_verify``,
     ``repoint_unlike``, ``repoint_unlike_verify``; ``unlike_shadow_precheck``,
-    ``unlike_shadow_unlike``, ``unlike_shadow_verify``; ``lm_check``;
-    ``restore_like``, ``restore_verify``; or the action kind (``repoint`` /
+    ``unlike_shadow_precheck_a``, ``unlike_shadow_unlike``,
+    ``unlike_shadow_verify``; ``lm_check``; ``restore_like``,
+    ``restore_verify``; ``repoint_rollback``,
+    ``repoint_rollback_verify``; or the action kind (``repoint`` /
     ``unlike_shadow``) for a plan-time skip, and ``interrupted`` when an action
     stopped after A's unlike call started. See ``sync_dispatch.py`` for the
     authoritative list. Rows written before the LL → LM alignment redesign may
