@@ -109,8 +109,9 @@ def _match_reason(match: Match) -> str:
         ev = match.evidence
         if ev is None:
             return f"{STAGE4_REASON_PREFIX} drift match"
+        via = "" if ev.fuzzy_score is None else f" (verified fuzzy {ev.fuzzy_score:.0f}/100)"
         return (
-            f"{STAGE4_REASON_PREFIX}: channel={ev.channel_id[:8]}… "
+            f"{STAGE4_REASON_PREFIX}{via}: channel={ev.channel_id[:8]}… "
             f"+ duration={ev.duration_seconds}s + normalized title match"
         )
     return (
@@ -283,7 +284,7 @@ def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
 
     Every ``compare-likes`` run writes fresh ``'open'`` items and ``sync``
     only reads the latest diagnosis, so without this a ``'skipped'`` — set
-    by ``sync`` on a cross-prop verify-miss, or by the operator via SQL —
+    by ``sync`` on a cross-prop verify-miss, or by ``likesurgeon skip`` —
     would silently re-open on the next run and re-fire the same writes.
     A finding matches on ``(issue_type, source_track_id, related_track_id)``,
     and its status is taken from the most recent earlier diagnosis that

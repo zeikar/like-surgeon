@@ -197,7 +197,7 @@ class SyncAttempt(Base):
     ``kind`` identifies the specific HTTP call (or skip decision). Known
     values: ``yt_unlike``, ``ytm_like_yt_unlike``, ``ytm_like_yt_relike``,
     ``ytm_like_verify``, ``yt_like_yt_rate``, ``yt_like_verify``,
-    ``yt_relike_like``, ``yt_relike_unlike``, ``ytm_dedupe``. Multi-step
+    ``yt_relike_like``, ``yt_relike_verify``, ``yt_relike_unlike``, ``ytm_dedupe``. Multi-step
     actions (``ytm_like``, ``yt_like``, ``yt_relike``) emit one row per
     step so the audit trail stays atomic per HTTP call. See ``sync.py``
     for the authoritative list. ``status`` is one of ``applied``,

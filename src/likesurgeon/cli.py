@@ -565,6 +565,7 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
         Stage4Candidate,
         apply_stage4_result,
         stage4_enrich_drift,
+        verify_fuzzy_drift,
     )
     from .youtube_client import AuthorizationRequiredError, ClientSecretsMissingError, YouTubeClient
 
@@ -608,8 +609,20 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
         )
     yt_candidates = sorted(yt_unique_by_index.values(), key=lambda c: c.original_index)
 
+    # Fuzzy pointer-drift pairs get the same metadata so they can be
+    # re-verified with Stage 4's rule (see verify_fuzzy_drift).
+    video_id_by_track = {it.track_id: it.video_id for it in (*yt_items, *ytm_items) if it.video_id}
+    fuzzy_vids = {
+        video_id_by_track[tid]
+        for m in cmp_result.pointer_drift_candidates
+        for tid in (m.youtube_track_id, m.ytmusic_track_id)
+        if tid in video_id_by_track
+    }
+
     # Combined unique vids for batch lookup.
-    vids = sorted({c.video_id for c in ytm_candidates} | {c.video_id for c in yt_candidates})
+    vids = sorted(
+        {c.video_id for c in ytm_candidates} | {c.video_id for c in yt_candidates} | fuzzy_vids
+    )
 
     # Construct YouTube client (only when cfg paths are available).
     yt_client = (
@@ -661,6 +674,13 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
     )
     cmp_result = apply_stage4_result(cmp_result, stage4)
     console.print(f"Stage 4 promoted {len(stage4.new_pairs)} drift candidate(s)")
+    cmp_result, verified = verify_fuzzy_drift(
+        cmp_result, video_id_by_track=video_id_by_track, metadata=metadata
+    )
+    if fuzzy_vids:
+        console.print(
+            f"Stage 4 verified {verified} fuzzy drift pair(s) by channel + duration + title"
+        )
 
     # Stage B — persist Diagnosis + the existing 0.2 finding buckets.
     diagnosis = create_diagnosis(
@@ -855,6 +875,7 @@ def issues(
     table.add_column("Conf", justify="right")
     table.add_column("Source VID")
     table.add_column("Related VID")
+    table.add_column("Status")
     table.add_column("Reason")
     for it in items:
         table.add_row(
@@ -863,12 +884,69 @@ def issues(
             f"{it.confidence:.2f}",
             _vid(it.source_track_id) or "",
             _vid(it.related_track_id) or "",
+            it.status,
             it.reason,
         )
     if not items:
         console.print("[dim]No issues match the filter.[/dim]")
         return
     console.print(table)
+
+
+def _set_findings_status(item_ids: list[int], *, to: str) -> None:
+    """Flip findings of the latest diagnosis between 'open' and 'skipped'.
+
+    All-or-nothing: every id is validated first, so a typo changes nothing.
+    'skipped' carries over to later diagnoses (``carry_over_skipped``), so
+    this is the durable way to keep ``sync`` off a finding.
+    """
+    from .diagnosis import latest_diagnosis
+    from .models import DiagnosisItem
+
+    source = "open" if to == "skipped" else "skipped"
+    _, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session)
+        if diag is None:
+            _fail("No diagnosis yet. Run `likesurgeon compare-likes` first.", code=1)
+        errors: list[str] = []
+        targets: list[DiagnosisItem] = []
+        for item_id in item_ids:
+            it = session.get(DiagnosisItem, item_id)
+            if it is None or it.diagnosis_id != diag.id:
+                errors.append(
+                    f"#{item_id} is not a finding of the latest diagnosis #{diag.id} "
+                    "(ids come from `likesurgeon issues`)"
+                )
+            elif it.status not in (source, to):
+                errors.append(f"#{item_id} is '{it.status}'; only '{source}' findings can change")
+            else:
+                targets.append(it)
+        if errors:
+            _fail("nothing changed:\n  " + "\n  ".join(errors), code=2)
+        for it in targets:
+            it.status = to
+    console.print(f"[green]✓[/green] {len(targets)} finding(s) now '{to}'.")
+
+
+@app.command()
+def skip(
+    item_ids: Annotated[
+        list[int], typer.Argument(help="Finding ids from `likesurgeon issues` (latest diagnosis).")
+    ],
+) -> None:
+    """Keep `sync` off these findings, across future diagnoses too."""
+    _set_findings_status(item_ids, to="skipped")
+
+
+@app.command()
+def unskip(
+    item_ids: Annotated[
+        list[int], typer.Argument(help="Finding ids from `likesurgeon issues` (latest diagnosis).")
+    ],
+) -> None:
+    """Re-open skipped findings so the next `sync` acts on them again."""
+    _set_findings_status(item_ids, to="open")
 
 
 @app.command()

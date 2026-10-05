@@ -906,3 +906,74 @@ def test_apply_stage4_result_removes_consumed_video_ids_from_unmatched_buckets()
     # Original unchanged.
     assert len(cr.ytmusic_only_likes) == 2
     assert len(cr.possibly_missing_from_ytmusic) == 2
+
+
+# ---------------------------------------------------------------------------
+# verify_fuzzy_drift — Stage 4's triple rule re-applied to fuzzy pairs
+# ---------------------------------------------------------------------------
+
+
+def _fuzzy(yt_tid: int, ytm_tid: int, score: float = 1.0) -> Match:
+    return Match(
+        ytmusic_track_id=ytm_tid,
+        youtube_track_id=yt_tid,
+        kind=MatchKind.FUZZY,
+        confidence=score,
+        ytmusic_title="夢の歌 - Yume no Uta",
+        youtube_title="夢の歌",
+    )
+
+
+def _meta(vid: str, title: str, channel: str = "UCx", dur: int = 250) -> CanonicalMetadata:
+    return CanonicalMetadata(video_id=vid, title=title, channel_id=channel, duration_seconds=dur)
+
+
+def test_verify_fuzzy_drift_promotes_pairs_passing_the_stage4_rule() -> None:
+    from likesurgeon.compare import verify_fuzzy_drift
+
+    exact = Match(1, 2, MatchKind.VIDEO_ID, 1.0, "t", "t")
+    ok, slow, other_channel, other_title = (
+        _fuzzy(10, 20),
+        _fuzzy(11, 21),
+        _fuzzy(12, 22),
+        _fuzzy(13, 23),
+    )
+    result = CompareResult(
+        ytmusic_count=4,
+        youtube_total_count=5,
+        youtube_music_count=5,
+        matched=[exact, ok, slow, other_channel, other_title],
+        pointer_drift_candidates=[ok, slow, other_channel, other_title],
+    )
+    vids = {t: f"v{t}" for t in (10, 20, 11, 21, 12, 22, 13, 23)}
+    metadata = {
+        # Same video title on both sides — only YT Music's display title had the suffix.
+        "v10": _meta("v10", "夢の歌"),
+        "v20": _meta("v20", "夢の歌", dur=252),
+        "v11": _meta("v11", "Song"),
+        "v21": _meta("v21", "Song", dur=253),  # 3s off
+        "v12": _meta("v12", "Song"),
+        "v22": _meta("v22", "Song", channel="UCother"),
+        "v13": _meta("v13", "Song"),
+        "v23": _meta("v23", "Song (Remix)"),
+    }
+
+    new, promoted = verify_fuzzy_drift(result, video_id_by_track=vids, metadata=metadata)
+
+    assert promoted == 1
+    [verified] = [m for m in new.pointer_drift_candidates if m.kind is MatchKind.STAGE4_ENRICHMENT]
+    assert (verified.youtube_track_id, verified.ytmusic_track_id) == (10, 20)
+    assert verified.confidence == 0.95
+    assert verified.evidence.fuzzy_score == 100
+    assert verified in new.matched and ok not in new.matched
+    assert [m.kind for m in new.pointer_drift_candidates[1:]] == [MatchKind.FUZZY] * 3
+    assert new.matched[0] is exact
+
+
+def test_verify_fuzzy_drift_without_metadata_is_a_noop() -> None:
+    from likesurgeon.compare import verify_fuzzy_drift
+
+    m = _fuzzy(10, 20)
+    result = CompareResult(1, 1, 1, matched=[m], pointer_drift_candidates=[m])
+    new, promoted = verify_fuzzy_drift(result, video_id_by_track={10: "a", 20: "b"}, metadata={})
+    assert (new, promoted) == (result, 0)

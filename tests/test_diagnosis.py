@@ -459,3 +459,24 @@ def test_carry_over_skipped_bridges_gaps_and_respects_unskip(session: Session) -
     assert carry_over_skipped(session, latest) == 1
     by_track = {it.source_track_id: it.status for it in diagnosis_items(session, latest.id)}
     assert by_track == {a.id: "skipped", b.id: "open"}
+
+
+def test_match_reason_for_verified_fuzzy_keeps_stage4_prefix() -> None:
+    """The sync gate keys on the reason prefix — a re-verified fuzzy pair must
+    read as Stage 4 while still saying where it came from."""
+    from likesurgeon.diagnosis import is_stage4_drift_reason
+
+    m = Match(
+        ytmusic_track_id=1,
+        youtube_track_id=2,
+        kind=MatchKind.STAGE4_ENRICHMENT,
+        confidence=0.95,
+        ytmusic_title="a",
+        youtube_title="b",
+        evidence=Stage4Evidence(
+            channel_id="UCabcdefgh", duration_seconds=250, normalized_title="a", fuzzy_score=100.0
+        ),
+    )
+    reason = _match_reason(m)
+    assert reason.startswith("enriched (verified fuzzy 100/100): channel=UCabcdef…")
+    assert is_stage4_drift_reason(reason)

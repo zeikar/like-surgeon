@@ -17,7 +17,7 @@ Invariants:
     ``"skipped"`` is a terminal non-failure outcome, code-set by
     ``_try_ytm_like`` / ``_try_yt_like`` on cross-prop verify-miss (or set
     manually by the operator). Items at ``"skipped"`` are not re-attempted
-    on the next run; flip ``DiagnosisItem.status`` to ``"open"`` via SQL to
+    on the next run; ``likesurgeon unskip <id>`` re-opens one to
     retry. Note: a *planner-level* skip (no video_id, below confidence
     threshold, unsupported duplicate shape) only writes a ``SyncAttempt``
     audit row — the ``DiagnosisItem`` stays ``"open"`` and is re-evaluated
@@ -192,7 +192,7 @@ def plan(
     (e.g. a private/deleted YouTube ghost that ``videos.rate`` can't unlike
     anyway) or code-set by ``execute`` on cross-prop verify-miss (``ytm_like``
     and ``yt_like`` actions). Both are treated the same here: skipped items
-    are not re-planned. Flip ``DiagnosisItem.status`` to ``'open'`` via SQL
+    are not re-planned. ``likesurgeon unskip <id>`` re-opens one
     to retry a code-set skip.
     Findings of type ``metadata_drift`` are silently
     dropped (informational, not actionable in 0.5).
@@ -410,7 +410,7 @@ def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None
 _PLAN_ACTION_KINDS = ("yt_unlike", "ytm_like", "yt_like", "yt_relike", "ytm_dedupe")
 
 # Quota cost per action kind (YouTube `videos.rate` = 50 units; ytm is free).
-# Drift's worst case = 100 (like 50 + unlike 50 if the like succeeds).
+# Drift's worst case = 101 (like 50 + getRating verify 1 + unlike 50).
 _DAILY_QUOTA = 10000
 
 _QUOTA_COST: dict[ActionKind, int] = {
@@ -419,7 +419,8 @@ _QUOTA_COST: dict[ActionKind, int] = {
     "ytm_like": 100,
     # videos.rate (50) + videos.getRating verify (1)
     "yt_like": 51,
-    "yt_relike": 100,
+    # like + getRating verify + unlike
+    "yt_relike": 101,
     "ytm_dedupe": 0,
 }
 
@@ -565,8 +566,8 @@ def _dispatch(
     dispatcher is allowed to flip ``DiagnosisItem.status`` to ``'applied'``.
     ``"skipped"`` is a terminal non-failure outcome — returned by
     ``_try_ytm_like`` when cross-prop didn't observe the song in YT Music,
-    and by ``_try_yt_like`` when the video was not observed in YouTube Liked
-    Videos, both after a 5s wait; ``"failed"`` is anything else.
+    and by ``_try_yt_like`` / ``yt_relike`` when the like was not observed
+    on YouTube, all after a 5s wait; ``"failed"`` is anything else.
 
     Note: for ``ytm_dedupe``, the outcome is used only for ``ExecResult``
     counting. Terminality (``status='applied'`` regardless of success) is
@@ -618,6 +619,19 @@ def _dispatch(
         )
         if not like_ok:
             return "failed"
+        # "Success" isn't enough: a relinked B's like can silently not land,
+        # and since YT Music's B entry rides on A's like, unliking A would
+        # then drop the song from both platforms. Unlike only once the like
+        # is confirmed; a verify-miss is terminal ('skipped'), A stays liked.
+        verified = _verify_yt_liked(
+            session,
+            action.item_id,
+            kind="yt_relike_verify",
+            yt=yt,
+            video_id=action.primary_video_id,
+        )
+        if verified != "applied":
+            return verified
         # Defensive — planner always provides secondary for yt_relike,
         # but the type signature permits None.
         if action.secondary_video_id is None:
@@ -845,6 +859,24 @@ def _try_yt_like(
     )
 
     # Step 2: cross-prop wait + verify
+    return _verify_yt_liked(session, item_id, kind="yt_like_verify", yt=yt, video_id=video_id)
+
+
+def _verify_yt_liked(
+    session: Session,
+    item_id: int,
+    *,
+    kind: str,
+    yt: YouTubeClient,
+    video_id: str,
+) -> _DispatchOutcome:
+    """Wait, then confirm via ``videos.getRating`` that a like on ``video_id``
+    actually landed — a 2xx from ``videos.rate`` doesn't guarantee it.
+
+    ``"applied"`` = rating is ``like``; ``"skipped"`` = it isn't (terminal:
+    retrying repeats the same no-op); ``"failed"`` = the read errored.
+    Records one ``SyncAttempt`` of ``kind``.
+    """
     time.sleep(_YT_LIKE_VERIFY_WAIT_SECONDS)
     try:
         present = yt.is_in_liked_videos(video_id)
@@ -852,7 +884,7 @@ def _try_yt_like(
         session.add(
             SyncAttempt(
                 diagnosis_item_id=item_id,
-                kind="yt_like_verify",
+                kind=kind,
                 status="failed",
                 reason=str(exc),
             )
@@ -863,7 +895,7 @@ def _try_yt_like(
         session.add(
             SyncAttempt(
                 diagnosis_item_id=item_id,
-                kind="yt_like_verify",
+                kind=kind,
                 status="applied",
                 reason="present in youtube liked videos",
             )
@@ -872,9 +904,9 @@ def _try_yt_like(
     session.add(
         SyncAttempt(
             diagnosis_item_id=item_id,
-            kind="yt_like_verify",
+            kind=kind,
             status="skipped",
-            reason="not observed in youtube liked videos after +5s",
+            reason=f"not observed in youtube liked videos after +{_YT_LIKE_VERIFY_WAIT_SECONDS}s",
         )
     )
     return "skipped"

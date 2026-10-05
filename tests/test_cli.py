@@ -1958,6 +1958,7 @@ def test_sync_fuzzy_drift_needs_include_flag(
     assert result.exit_code == 0, result.output
     assert _FakeYouTubeWrite.instances[0].rate_calls == []
 
+    _FakeYouTubeWrite.in_liked_videos = {"rel_0"}  # the like on B lands
     result = runner.invoke(app, ["sync", "--yes", "--include-fuzzy-drift"])
     assert result.exit_code == 0, result.output
     assert _FakeYouTubeWrite.instances[1].rate_calls == [("rel_0", "like"), ("src_0", "none")]
@@ -2118,3 +2119,123 @@ def test_sync_surfaces_and_prioritizes_videos_stranded_by_an_earlier_run(
     assert "liked nowhere right now: src_1" in out
     # --limit 1 picked the stranded re-like, not the 1.0-confidence ghost unlike.
     assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_1", "none"), ("src_1", "like")]
+
+
+def test_compare_likes_verifies_fuzzy_relink_so_sync_plans_it(
+    fake_home: Path,
+    patch_stage4_client: type[_FakeYouTubeStage4],
+) -> None:
+    """A YT Music relink whose display title gained a romanized suffix is a
+    fuzzy (title-only) pair; when videos.list shows the same channel,
+    duration and title it becomes Stage-4 grade and sync applies it."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.compare import CanonicalMetadata
+    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT
+    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [_ytm_raw("YTM_B", "夢の歌 - Yume no Uta", ["Example Unit"])],
+        )
+        create_snapshot(
+            s,
+            "youtube_liked_videos",
+            [
+                {
+                    "snippet": {
+                        "title": "夢の歌",
+                        "videoOwnerChannelTitle": "Example Unit - Topic",
+                        "description": "Provided to YouTube by Example Records",
+                        "resourceId": {"videoId": "YT_A"},
+                    },
+                    "contentDetails": {"videoId": "YT_A"},
+                    "_likesurgeon_video_status": {"is_available": True, "reason": None},
+                }
+            ],
+        )
+        s.commit()
+    finally:
+        s.close()
+    patch_stage4_client.canonical_metadata_return = {
+        vid: CanonicalMetadata(
+            video_id=vid, title="夢の歌", channel_id="UCexample", duration_seconds=250
+        )
+        for vid in ("YT_A", "YTM_B")
+    }
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["compare-likes"])
+    assert result.exit_code == 0, result.output
+    assert "verified 1 fuzzy drift pair" in result.output
+
+    s = _open_db(fake_home)
+    try:
+        [drift] = s.scalars(
+            select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
+        ).all()
+        assert drift.reason.startswith("enriched (verified fuzzy 100/100)")
+        assert drift.confidence == 0.95
+    finally:
+        s.close()
+
+    result = runner.invoke(app, ["sync", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "\n  yt_relike: 1" in result.output
+
+
+def test_skip_and_unskip_flip_latest_findings(fake_home: Path) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY
+    from likesurgeon.models import DiagnosisItem
+
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY])
+    ghost, ytm_only = ids[ISSUE_UNAVAILABLE_VIDEO], ids[ISSUE_YTMUSIC_ONLY]
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["skip", str(ghost), str(ytm_only)])
+    assert result.exit_code == 0, result.output
+    # Idempotent: skipping an already-skipped finding is fine.
+    assert runner.invoke(app, ["skip", str(ghost)]).exit_code == 0
+    result = runner.invoke(app, ["unskip", str(ytm_only)])
+    assert result.exit_code == 0, result.output
+
+    s = _open_db(fake_home)
+    try:
+        assert s.get(DiagnosisItem, ghost).status == "skipped"
+        assert s.get(DiagnosisItem, ytm_only).status == "open"
+    finally:
+        s.close()
+
+
+def test_skip_is_all_or_nothing_on_bad_ids(fake_home: Path) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY
+    from likesurgeon.models import DiagnosisItem
+
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY])
+    s = _open_db(fake_home)
+    try:
+        s.get(DiagnosisItem, ids[ISSUE_YTMUSIC_ONLY]).status = "applied"
+        s.commit()
+    finally:
+        s.close()
+
+    result = CliRunner().invoke(
+        app, ["skip", str(ids[ISSUE_UNAVAILABLE_VIDEO]), str(ids[ISSUE_YTMUSIC_ONLY]), "9999"]
+    )
+
+    assert result.exit_code == 2, result.output
+    out = " ".join(result.output.split())
+    assert "is 'applied'" in out
+    assert "#9999 is not a finding of the latest diagnosis" in out
+    s = _open_db(fake_home)
+    try:
+        assert s.get(DiagnosisItem, ids[ISSUE_UNAVAILABLE_VIDEO]).status == "open"
+    finally:
+        s.close()

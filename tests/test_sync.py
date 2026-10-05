@@ -720,8 +720,8 @@ def test_summarize_counts_and_quota() -> None:
     assert "ytm_like: 1" in s
     assert "yt_relike: 1" in s
     assert "skipped: 1" in s
-    # Quota: 2 unlikes (100) + 1 ytm_like (100) + 1 relike worst-case (100) = 300.
-    assert "300" in s
+    # Quota: 2 unlikes (100) + 1 ytm_like (100) + 1 relike (like + verify + unlike = 101) = 301.
+    assert "301" in s
 
 
 def test_summarize_includes_ytm_dedupe() -> None:
@@ -1113,7 +1113,7 @@ def test_execute_yt_relike_both_succeed(session: Session) -> None:
     session.commit()
     original_reason = item.reason
 
-    yt = FakeYouTube()
+    yt = FakeYouTube(in_likes={"rel"})
     ytm = FakeYTMusic()
     actions = [
         PlannedAction(
@@ -1134,6 +1134,7 @@ def test_execute_yt_relike_both_succeed(session: Session) -> None:
     rows = _attempts_for(session, item.id)
     assert [(r.kind, r.status) for r in rows] == [
         ("yt_relike_like", "applied"),
+        ("yt_relike_verify", "applied"),
         ("yt_relike_unlike", "applied"),
     ]
 
@@ -1189,7 +1190,7 @@ def test_execute_yt_relike_unlike_fails_after_like_success(session: Session) -> 
     session.commit()
     original_reason = item.reason
 
-    yt = FakeYouTube(raise_on={("src", "none")})
+    yt = FakeYouTube(raise_on={("src", "none")}, in_likes={"rel"})
     ytm = FakeYTMusic()
     actions = [
         PlannedAction(
@@ -1211,6 +1212,7 @@ def test_execute_yt_relike_unlike_fails_after_like_success(session: Session) -> 
     rows = _attempts_for(session, item.id)
     assert [(r.kind, r.status) for r in rows] == [
         ("yt_relike_like", "applied"),
+        ("yt_relike_verify", "applied"),
         ("yt_relike_unlike", "failed"),
     ]
 
@@ -1873,3 +1875,69 @@ def test_execute_after_quota_stop_still_runs_ytmusic_only_dedupes(session: Sessi
     assert res == ExecResult(applied=1, failed=1, skipped=0, quota_exhausted=True, unattempted=1)
     assert yt.calls == [("g1", "none")]
     assert ytm.unlike_calls == ["dup"]
+
+
+def test_execute_yt_relike_unconfirmed_like_never_unlikes_original(session: Session) -> None:
+    """videos.rate("like") on B returned OK but the rating didn't change
+    (seen live on relinked videos). Unliking A then would drop the song from
+    YouTube AND from YT Music (whose B entry rides on A's like) — so stop,
+    keep A, and mark the finding terminal."""
+    diag = _make_diagnosis(session)
+    src = _make_track(session, "src", suffix="s")
+    rel = _make_track(session, "rel", suffix="r")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_POINTER_DRIFT,
+        confidence=0.95,
+        source_track=src,
+        related_track=rel,
+        reason=_STAGE4_REASON,
+    )
+    session.commit()
+
+    yt = FakeYouTube()  # getRating never reports the like
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_relike", primary_video_id="rel", secondary_video_id="src"
+        )
+    ]
+    res = execute(session, actions, [], ytm=FakeYTMusic(), yt=yt)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert yt.calls == [("rel", "like")]  # no unlike of the original
+    session.refresh(item)
+    assert item.status == "skipped"
+    assert [(r.kind, r.status) for r in _attempts_for(session, item.id)] == [
+        ("yt_relike_like", "applied"),
+        ("yt_relike_verify", "skipped"),
+    ]
+
+
+def test_execute_yt_relike_verify_error_keeps_original_and_retries(session: Session) -> None:
+    diag = _make_diagnosis(session)
+    src = _make_track(session, "src", suffix="s")
+    rel = _make_track(session, "rel", suffix="r")
+    item = _make_item(
+        session,
+        diag,
+        issue_type=ISSUE_POINTER_DRIFT,
+        confidence=0.95,
+        source_track=src,
+        related_track=rel,
+        reason=_STAGE4_REASON,
+    )
+    session.commit()
+
+    yt = FakeYouTube(raise_is_in_liked_videos=YouTubeWriteError("rel", "verify", "boom"))
+    actions = [
+        PlannedAction(
+            item_id=item.id, kind="yt_relike", primary_video_id="rel", secondary_video_id="src"
+        )
+    ]
+    res = execute(session, actions, [], ytm=FakeYTMusic(), yt=yt)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    assert yt.calls == [("rel", "like")]
+    session.refresh(item)
+    assert item.status == "open"

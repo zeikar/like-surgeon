@@ -120,6 +120,10 @@ class MatchKind(StrEnum):
     STAGE4_ENRICHMENT = "stage4_enrichment"
 
 
+# Stage 4's duration tolerance between the two sides of a pair, in seconds.
+_STAGE4_DURATION_TOLERANCE = 2
+
+
 @dataclass(frozen=True)
 class Stage4Evidence:
     """Evidence captured by Stage 4 drift detection — used for diagnosis reason strings."""
@@ -127,6 +131,9 @@ class Stage4Evidence:
     channel_id: str  # videos.list snippet.channelId of the matched pair
     duration_seconds: int  # ytmusic-side duration; yt-side is within ±2s of this
     normalized_title: str  # normalize_for_match(canonical_title)
+    # Set when a Stage-3 fuzzy pair was re-verified by this rule (its RapidFuzz
+    # score, 0–100); None for pairs Stage 4 found among unmatched rows.
+    fuzzy_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -436,7 +443,7 @@ def stage4_enrich_drift(
         for yt_cand, yt_dur in yt_entries:
             if yt_cand.original_index in consumed_yt:
                 continue
-            if abs(yt_dur - meta.duration_seconds) > 2:
+            if abs(yt_dur - meta.duration_seconds) > _STAGE4_DURATION_TOLERANCE:
                 continue
             in_tolerance[yt_cand.original_index] = (yt_cand, yt_dur)
 
@@ -469,6 +476,69 @@ def stage4_enrich_drift(
         new_pairs=new_pairs,
         consumed_original_ytm_indices=frozenset(consumed_ytm),
         consumed_original_yt_indices=frozenset(consumed_yt),
+    )
+
+
+def verify_fuzzy_drift(
+    compare_result: CompareResult,
+    *,
+    video_id_by_track: dict[int, str],
+    metadata: dict[str, CanonicalMetadata],
+) -> tuple[CompareResult, int]:
+    """Re-check Stage-3 fuzzy pointer-drift pairs with Stage 4's triple rule.
+
+    A fuzzy pair is title-only (``token_set_ratio`` scores "Song" vs
+    "Song (Remix)" at 100), so on its own it isn't safe to auto-sync. A pair
+    whose two videos also share ``videos.list`` channel, duration (±2s) and
+    normalized canonical title is promoted to a ``STAGE4_ENRICHMENT`` match
+    (confidence 0.95, ``evidence.fuzzy_score`` kept); every other fuzzy pair
+    is left as-is. Returns the new result and how many pairs were promoted.
+
+    Typical hit: a YT Music relink whose display title gained a romanized
+    suffix ("夢の歌 - Yume no Uta") while its ``videos.list`` title
+    stayed identical to the original.
+    """
+    promoted: dict[Match, Match] = {}
+    for m in compare_result.pointer_drift_candidates:
+        if m.kind is not MatchKind.FUZZY:
+            continue
+        yt_meta = metadata.get(video_id_by_track.get(m.youtube_track_id, ""))
+        ytm_meta = metadata.get(video_id_by_track.get(m.ytmusic_track_id, ""))
+        if yt_meta is None or ytm_meta is None or not ytm_meta.channel_id:
+            continue
+        title = normalize_for_match(ytm_meta.title)
+        if (
+            not title
+            or yt_meta.channel_id != ytm_meta.channel_id
+            or abs(yt_meta.duration_seconds - ytm_meta.duration_seconds)
+            > _STAGE4_DURATION_TOLERANCE
+            or normalize_for_match(yt_meta.title) != title
+        ):
+            continue
+        promoted[m] = dataclasses.replace(
+            m,
+            kind=MatchKind.STAGE4_ENRICHMENT,
+            confidence=0.95,
+            evidence=Stage4Evidence(
+                channel_id=ytm_meta.channel_id,
+                duration_seconds=ytm_meta.duration_seconds,
+                normalized_title=title,
+                fuzzy_score=m.confidence * 100,
+            ),
+        )
+    if not promoted:
+        return compare_result, 0
+
+    def _swap(matches: list[Match]) -> list[Match]:
+        return [promoted.get(m, m) for m in matches]
+
+    return (
+        dataclasses.replace(
+            compare_result,
+            matched=_swap(compare_result.matched),
+            pointer_drift_candidates=_swap(compare_result.pointer_drift_candidates),
+        ),
+        len(promoted),
     )
 
 
