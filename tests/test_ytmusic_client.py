@@ -21,9 +21,9 @@ from likesurgeon.ytmusic_client import (
 class _FakeYTMusic:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
-        self.last_limit: int | None = None
+        self.last_limit: Any = "<unset>"
 
-    def get_liked_songs(self, limit: int) -> Any:
+    def get_liked_songs(self, limit: int | None) -> Any:
         self.last_limit = limit
         return self._payload
 
@@ -49,6 +49,15 @@ def test_fetch_liked_songs_returns_track_list():
     assert result[0]["videoId"] == "v1"
     assert client.fake is not None
     assert client.fake.last_limit == 42
+
+
+def test_fetch_liked_songs_fetches_everything_by_default():
+    """``None`` reaches ytmusicapi, whose playlist fetch then follows every
+    continuation — a truncated LM can't be aligned."""
+    client = _FakeClient({"tracks": []})
+    client.fetch_liked_songs()
+    assert client.fake is not None
+    assert client.fake.last_limit is None
 
 
 def test_fetch_liked_songs_returns_empty_list_for_well_formed_empty_response():
@@ -207,9 +216,9 @@ class _PagedClient(YTMusicClient):
     def __init__(self, tracks: list[dict[str, Any]]) -> None:
         super().__init__(browser_path=None)
         self._tracks = tracks
-        self.limits: list[int] = []
+        self.limits: list[int | None] = []
 
-    def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
+    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
         self.limits.append(limit)
         return self._tracks[:limit]
 

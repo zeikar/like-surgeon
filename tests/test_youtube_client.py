@@ -122,6 +122,18 @@ def test_fetch_liked_videos_uses_resolved_playlist_id():
     assert c._fake_channels.calls[0]["part"] == "contentDetails"
 
 
+def test_fetch_liked_videos_without_limit_follows_every_page():
+    """The default reads the whole playlist, past the old 5000 cap — a
+    truncated LL can't be aligned."""
+    pages = [{"items": [{}] * 50, "nextPageToken": f"p{n}"} for n in range(1, 102)]
+    pages.append({"items": [{}] * 10})
+    c = _FakeClient(pages)
+    result = c.fetch_liked_videos()
+    assert len(result) == 101 * 50 + 10
+    assert [call["pageToken"] for call in c._fake_pi.calls[:3]] == [None, "p1", "p2"]
+    assert {call["maxResults"] for call in c._fake_pi.calls} == {50}
+
+
 def test_fetch_liked_videos_respects_limit():
     pages = [{"items": [{"snippet": {"title": f"T{i}"}} for i in range(50)]}]
     c = _FakeClient(pages)

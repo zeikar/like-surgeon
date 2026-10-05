@@ -12,18 +12,40 @@ from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import __version__
-from .compare import CompareInput, CompareResult, compare_likes, dedupe_by_video_id
+from .align import align
+from .compare import CanonicalMetadata, dedupe_by_video_id
 from .config import Config, InvalidFuzzyThresholdError, InvalidRegionError, _validate_region
 from .db import init_db, make_engine, make_session_factory, session_scope
+from .diagnosis import (
+    ALIGNMENT_ISSUE_TYPES,
+    FindingCounts,
+    build_metadata_drift_items,
+    carry_over_skipped,
+    count_findings,
+    create_alignment_diagnosis,
+    diagnosis_items,
+    latest_diagnosis,
+)
 from .diff import diff_snapshots
 from .doctor import health_summary
+from .drift import detect_drift
 from .export import export_snapshot_json
-from .snapshot import create_snapshot, list_snapshots
+from .snapshot import (
+    YOUTUBE_LIKED_VIDEOS,
+    YTMUSIC_LIKED_SONGS,
+    create_snapshot,
+    get_snapshot_items,
+    latest_snapshot,
+    latest_snapshots_for_source,
+    list_snapshots,
+)
 from .sync import _TRACK_LOOKUP_BATCH_SIZE, _video_ids_for_tracks  # noqa: F401 — re-exported
+from .sync_preflight import sync_attempts_since
 from .ytmusic_client import (
     SUPPORTED_BROWSERS,
     AuthFileMissingError,
@@ -169,7 +191,7 @@ def auth_ytmusic(
         console.print(
             f"[green]✓[/green] browser.json written to [cyan]{target}[/cyan].\n"
             "[dim]Verify with: [/dim]"
-            "[cyan]uv run likesurgeon scan ytmusic --limit 1[/cyan]"
+            "[cyan]uv run likesurgeon scan ytmusic[/cyan]"
         )
         return
 
@@ -226,17 +248,15 @@ def auth_youtube() -> None:
     console.print(f"[green]✓[/green] Authorized. Token saved to [cyan]{token_path}[/cyan].")
 
 
+# Neither scan takes a --limit: compare-likes aligns the two lists by
+# position, which a truncated scan breaks (spec §5.2).
 @scan_app.command("ytmusic")
-def scan_ytmusic(
-    limit: Annotated[
-        int, typer.Option(min=1, help="Maximum number of liked songs to fetch.")
-    ] = 5000,
-) -> None:
-    """Fetch YouTube Music liked songs and store a snapshot."""
+def scan_ytmusic() -> None:
+    """Fetch every YouTube Music liked song and store a snapshot."""
     cfg, factory = _bootstrap()
     client = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
     try:
-        items = client.fetch_liked_songs(limit=limit)
+        items = client.fetch_liked_songs()
     except (AuthFileMissingError, UnexpectedResponseError) as e:
         _fail(str(e), code=2)
 
@@ -249,9 +269,6 @@ def scan_ytmusic(
 
 @scan_app.command("youtube-likes")
 def scan_youtube_likes(
-    limit: Annotated[
-        int, typer.Option(min=1, help="Maximum number of liked videos to fetch.")
-    ] = 5000,
     region: Annotated[
         str | None,
         typer.Option(
@@ -264,7 +281,7 @@ def scan_youtube_likes(
         ),
     ] = None,
 ) -> None:
-    """Fetch YouTube liked videos (LL playlist) and store a snapshot.
+    """Fetch every YouTube liked video (LL playlist) and store a snapshot.
 
     Also runs a per-video availability check (`videos.list?part=status,contentDetails`)
     and persists the result as `SnapshotItem.is_available` /
@@ -295,7 +312,7 @@ def scan_youtube_likes(
         token_path=cfg.youtube_token_path,
     )
     try:
-        items = client.fetch_liked_videos(limit=limit)
+        items = client.fetch_liked_videos()
     except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
         _fail(str(e), code=2)
     except HttpError as e:
@@ -314,8 +331,6 @@ def scan_youtube_likes(
 
     with session_scope(factory) as session:
         snap = create_snapshot(session, "youtube_liked_videos", items)
-        from .snapshot import get_snapshot_items
-
         scan_items = get_snapshot_items(session, snap.id)
         music_like = sum(1 for it in scan_items if it.is_music_candidate)
         unavailable = sum(1 for it in scan_items if it.is_available is False)
@@ -455,77 +470,79 @@ def doctor() -> None:
         d = report.latest_diagnosis
         console.print(
             f"[bold]Latest diagnosis #{d.diagnosis_id}:[/bold] "
-            f"{d.possibly_missing_from_ytmusic} possibly missing from YT Music · "
-            f"{d.pointer_drift} pointer drift · "
-            f"{d.ytmusic_only} YT Music only · "
-            f"{d.unavailable_videos} unavailable videos · "
-            f"{d.metadata_drift} metadata drift · "
-            f"{d.duplicate_in_source} duplicate likes"
+            + " · ".join(f"{n} {issue_type}" for issue_type, n in d.counts.items())
         )
 
-    if report.match_rate_percent is None:
-        console.print("[dim]Match-rate health score: N/A (no music candidates).[/dim]")
+    if report.lm_backed_percent is None:
+        console.print("[dim]LM backed: N/A (no diagnosed YT Music liked songs).[/dim]")
     else:
-        score = report.match_rate_percent
+        score = report.lm_backed_percent
         color = "green" if score >= 80 else "yellow" if score >= 50 else "red"
-        console.print(f"[bold]Match-rate health score:[/bold] [{color}]{score:.1f}%[/{color}]")
+        console.print(
+            f"[bold]LM backed:[/bold] [{color}]{score:.1f}%[/{color}] of YT Music liked songs "
+            "traced to the YouTube like behind them"
+        )
 
 
 @dataclass(frozen=True)
 class _PipelineResult:
-    """Compound return value for `_compare_and_persist` so the CLI wrapper
-    can render the existing summary table AND the two new finding-type
-    rows from a single call. Tests typically only need `.diagnosis_id`.
-
-    Raw counts (``raw_ytmusic_count`` / ``raw_youtube_total_count`` /
-    ``raw_youtube_music_count``) reflect snapshot row counts as scanned —
-    the "what's actually in your account" view, including within-source
-    duplicates. ``compare_result`` counts are post-canonicalization
-    (each ``video_id`` collapsed to one row), matching what the matcher
-    actually saw.
+    """What the ``compare-likes`` summary prints. Tests typically only need
+    ``.diagnosis_id``. ``lm_count`` / ``ll_count`` are raw snapshot rows, LM
+    duplicates included.
     """
 
     diagnosis_id: int
-    compare_result: CompareResult
-    unavailable_count: int
-    drift_count: int
-    duplicate_count: int
-    raw_ytmusic_count: int
-    raw_youtube_total_count: int
-    raw_youtube_music_count: int
+    lm_count: int
+    ll_count: int
+    anchor_count: int
+    findings: FindingCounts
+
+
+def _fetch_pair_metadata(cfg: Config | None, video_ids: list[str]) -> dict[str, CanonicalMetadata]:
+    """``videos.list`` metadata for the aligned pairs' same-recording check.
+
+    Without it every pair is merely report-only, so any failure (no auth,
+    HTTP, transport) is reported in one line instead of failing the run.
+    """
+    from .youtube_client import (
+        AuthorizationRequiredError,
+        ClientSecretsMissingError,
+        YouTubeClient,
+    )
+
+    if cfg is None:
+        reason = "no YouTube auth"
+    else:
+        try:
+            return YouTubeClient(
+                client_secrets_path=cfg.youtube_oauth_client_path,
+                token_path=cfg.youtube_token_path,
+            ).fetch_canonical_metadata(video_ids)
+        except (AuthorizationRequiredError, ClientSecretsMissingError):
+            reason = "no YouTube auth"
+        except Exception as exc:  # noqa: BLE001 — boundary catch, see docstring
+            reason = f"{type(exc).__name__}: {exc}"
+    console.print(
+        f"[yellow]⚠[/yellow] videos.list metadata unavailable ({escape(reason)}); "
+        "every aligned pair is report-only."
+    )
+    return {}
 
 
 def _compare_and_persist(session: Session, cfg: Config | None = None) -> _PipelineResult:
-    """Run the full 0.3 compare-likes pipeline against the current session
-    and return the persisted Diagnosis id plus the finding counts the CLI
-    summary needs.
+    """Align the latest LL and LM snapshots and persist the findings as one Diagnosis.
 
     Pipeline:
-      1. Cross-source matcher (existing 0.2 buckets) → CompareResult.
-      2. Stage 4 enrichment via YouTube canonical metadata (skipped when cfg is None).
-      3. Persist a Diagnosis with the existing buckets via `create_diagnosis`.
-      4. Append ghost findings (latest YouTube snapshot's is_available=False rows).
-      5. Append drift findings per source (latest, prev) via `detect_drift`.
-      6. Carry the previous diagnosis's 'skipped' statuses forward.
-      All findings live on a single Diagnosis row.
+      1. ``align`` the raw snapshot rows (spec §3). Not deduped: an LM video
+         shown twice is how a shadow like behind it shows up.
+      2. Warn when one of our own ``sync`` attempts ran after the older scan
+         (spec §5.1): the lists may then misalign or no longer be current.
+      3. Fetch ``videos.list`` metadata for both sides of every rendered pair;
+         without it (``cfg`` is None, or the fetch fails) pairs are report-only.
+      4. Persist the alignment findings, then metadata-drift findings per
+         source (latest vs previous scan).
+      5. Carry earlier diagnoses' 'skipped' statuses forward.
     """
-    from .diagnosis import (
-        DiagnosisInput,
-        build_duplicate_in_source_items,
-        build_metadata_drift_items,
-        build_unavailable_video_items,
-        carry_over_skipped,
-        create_diagnosis,
-    )
-    from .drift import detect_drift
-    from .snapshot import (
-        YOUTUBE_LIKED_VIDEOS,
-        YTMUSIC_LIKED_SONGS,
-        get_snapshot_items,
-        latest_snapshot,
-        latest_snapshots_for_source,
-    )
-
     yt_snap = latest_snapshot(session, source=YOUTUBE_LIKED_VIDEOS)
     ytm_snap = latest_snapshot(session, source=YTMUSIC_LIKED_SONGS)
     if yt_snap is None or ytm_snap is None:
@@ -540,181 +557,40 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
             code=2,
         )
 
-    yt_items_raw = get_snapshot_items(session, yt_snap.id)
-    ytm_items_raw = get_snapshot_items(session, ytm_snap.id)
+    ll = get_snapshot_items(session, yt_snap.id)
+    lm = get_snapshot_items(session, ytm_snap.id)
+    result = align(ll, lm)
 
-    # Stage A0 — within-source duplicate detection (pre-matching).
-    # We retain the raw rows so the duplicate-finding builder sees every
-    # occurrence; canonicalized streams feed the matcher and drift detector
-    # below so each ``video_id`` is counted at most once per source.
-    yt_items = dedupe_by_video_id(yt_items_raw)
-    ytm_items = dedupe_by_video_id(ytm_items_raw)
-
-    # Stage A — existing cross-source matcher (over canonicalized items).
-    cmp_result = compare_likes(
-        CompareInput(
-            ytmusic=ytm_items,
-            youtube=yt_items,
-            **({"fuzzy_threshold": cfg.fuzzy_threshold} if cfg is not None else {}),
-        )
-    )
-
-    # === Stage 4: drift detection via YouTube enrichment ===
-    from .compare import (
-        CanonicalMetadata,
-        Stage4Candidate,
-        apply_stage4_result,
-        stage4_enrich_drift,
-        verify_fuzzy_drift,
-    )
-    from .youtube_client import AuthorizationRequiredError, ClientSecretsMissingError, YouTubeClient
-
-    # Build matched track_id exclusion sets.
-    matched_ytm_track_ids = {m.ytmusic_track_id for m in cmp_result.matched}
-    matched_yt_track_ids = {m.youtube_track_id for m in cmp_result.matched}
-
-    # Build ytm_candidates: unmatched ytm rows with a video_id.
-    ytm_candidates: list[Stage4Candidate] = []
-    for i, item in enumerate(ytm_items):
-        if not item.video_id:
-            continue
-        if item.track_id in matched_ytm_track_ids:
-            continue
-        ytm_candidates.append(
-            Stage4Candidate(
-                original_index=i,
-                track_id=item.track_id,
-                video_id=item.video_id,
-                title=item.title,
-            )
-        )
-
-    # Build yt_candidates: deduped union of (possibly_missing) ∪ (ghost) MINUS already-matched.
-    pm_yt_video_ids = {u.video_id for u in cmp_result.possibly_missing_from_ytmusic}
-    yt_unique_by_index: dict[int, Stage4Candidate] = {}
-    for i, item in enumerate(yt_items):
-        if not item.video_id:
-            continue
-        if item.track_id in matched_yt_track_ids:
-            continue
-        is_ghost = item.is_available is False
-        is_in_pm_bucket = item.video_id in pm_yt_video_ids
-        if not (is_ghost or is_in_pm_bucket):
-            continue
-        yt_unique_by_index[i] = Stage4Candidate(
-            original_index=i,
-            track_id=item.track_id,
-            video_id=item.video_id,
-            title=item.title,
-        )
-    yt_candidates = sorted(yt_unique_by_index.values(), key=lambda c: c.original_index)
-
-    # Fuzzy pointer-drift pairs get the same metadata so they can be
-    # re-verified with Stage 4's rule (see verify_fuzzy_drift).
-    video_id_by_track = {it.track_id: it.video_id for it in (*yt_items, *ytm_items) if it.video_id}
-    fuzzy_vids = {
-        video_id_by_track[tid]
-        for m in cmp_result.pointer_drift_candidates
-        for tid in (m.youtube_track_id, m.ytmusic_track_id)
-        if tid in video_id_by_track
-    }
-
-    # Combined unique vids for batch lookup.
-    vids = sorted(
-        {c.video_id for c in ytm_candidates} | {c.video_id for c in yt_candidates} | fuzzy_vids
-    )
-
-    # Construct YouTube client (only when cfg paths are available).
-    yt_client = (
-        YouTubeClient(
-            client_secrets_path=cfg.youtube_oauth_client_path,
-            token_path=cfg.youtube_token_path,
-        )
-        if cfg is not None
-        else None
-    )
-
-    metadata: dict[str, CanonicalMetadata] = {}
-    skip_reason: str | None = None
-    if vids and yt_client is None:
-        skip_reason = "no YouTube auth"
-    elif vids:
-        try:
-            metadata = yt_client.fetch_canonical_metadata(vids)  # type: ignore[union-attr]
-        except (AuthorizationRequiredError, ClientSecretsMissingError, FileNotFoundError):
-            skip_reason = "no YouTube auth"
-        except Exception as exc:  # noqa: BLE001 — boundary catch
-            from googleapiclient.errors import HttpError
-
-            if isinstance(exc, HttpError):
-                skip_reason = f"YouTube API error: {exc}"
-            else:
-                skip_reason = f"unexpected: {exc.__class__.__name__}"
-
-    # Status print — three distinct cases.
-    if not vids:
-        console.print("Stage 4 enrichment: no unmatched candidates to enrich")
-    elif skip_reason is not None:
-        console.print(f"Stage 4 enrichment skipped ({skip_reason})")
-    elif not metadata:
+    # Both times are UTC, but SQLite hands them back naive while a row created
+    # in this session is still aware, so compare them naive.
+    older_scan = min(s.created_at.replace(tzinfo=None) for s in (yt_snap, ytm_snap))
+    if attempts := sync_attempts_since(session, older_scan):
         console.print(
-            f"Stage 4 enrichment: fetched 0 of {len(vids)} candidate(s) "
-            "(rows dropped — missing channel or duration)"
-        )
-    else:
-        console.print(
-            f"Stage 4 enrichment: fetched {len(metadata)} of {len(vids)} canonical record(s)"
+            f"[yellow]⚠[/yellow] {attempts} sync attempt(s) ran after the older of the two "
+            f"scans (YouTube #{yt_snap.id}, YT Music #{ytm_snap.id}), so this diagnosis may "
+            "not match your current likes. Re-scan both sources ([cyan]scan youtube-likes[/cyan]"
+            " and [cyan]scan ytmusic[/cyan]), then re-run compare-likes."
         )
 
-    # Run Stage 4 + apply.
-    stage4 = stage4_enrich_drift(
-        ytm_candidates=ytm_candidates,
-        yt_candidates=yt_candidates,
+    pair_vids = sorted(
+        {
+            vid
+            for b in result.backings
+            if b.kind == "rendered"
+            for vid in (b.ll_item.video_id, b.lm_item.video_id)
+            if vid
+        }
+    )
+    metadata = _fetch_pair_metadata(cfg, pair_vids) if pair_vids else {}
+    diagnosis = create_alignment_diagnosis(
+        session,
+        ytmusic_snapshot_id=ytm_snap.id,
+        youtube_snapshot_id=yt_snap.id,
+        result=result,
         metadata=metadata,
     )
-    cmp_result = apply_stage4_result(cmp_result, stage4)
-    console.print(f"Stage 4 promoted {len(stage4.new_pairs)} drift candidate(s)")
-    cmp_result, verified = verify_fuzzy_drift(
-        cmp_result, video_id_by_track=video_id_by_track, metadata=metadata
-    )
-    if fuzzy_vids:
-        console.print(
-            f"Stage 4 verified {verified} fuzzy drift pair(s) by channel + duration + title"
-        )
 
-    # Stage B — persist Diagnosis + the existing 0.2 finding buckets.
-    diagnosis = create_diagnosis(
-        session,
-        DiagnosisInput(
-            ytmusic_snapshot_id=ytm_snap.id,
-            youtube_snapshot_id=yt_snap.id,
-            result=cmp_result,
-        ),
-    )
-
-    # Stage B1 — append within-source duplicate findings now that we have
-    # ``diagnosis.id``. Builder sees the RAW snapshot items so every
-    # duplicate occurrence is counted.
-    dup_items_yt = build_duplicate_in_source_items(diagnosis.id, yt_items_raw, YOUTUBE_LIKED_VIDEOS)
-    dup_items_ytm = build_duplicate_in_source_items(
-        diagnosis.id, ytm_items_raw, YTMUSIC_LIKED_SONGS
-    )
-    for it in (*dup_items_yt, *dup_items_ytm):
-        session.add(it)
-    duplicate_total = len(dup_items_yt) + len(dup_items_ytm)
-
-    # Stage C — append ghost findings.
-    ghost_items = build_unavailable_video_items(
-        diagnosis.id, yt_items, exclude_yt_indices=stage4.consumed_original_yt_indices
-    )
-    for it in ghost_items:
-        session.add(it)
-
-    # Stage D — append drift findings per source against (latest, prev).
-    # Drift re-fetches from DB inside the loop, so canonicalization must
-    # be reapplied here (rebinding ``yt_items`` / ``ytm_items`` above
-    # doesn't affect these fresh fetches).
-    drift_total = 0
+    # Metadata drift per source against (latest, prev), each video_id once.
     for source in (YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS):
         snaps = latest_snapshots_for_source(session, source, limit=2)
         if len(snaps) < 2:
@@ -723,58 +599,52 @@ def _compare_and_persist(session: Session, cfg: Config | None = None) -> _Pipeli
         curr_items = dedupe_by_video_id(get_snapshot_items(session, curr_snap.id))
         prev_items = dedupe_by_video_id(get_snapshot_items(session, prev_snap.id))
         findings = detect_drift(prev_items, curr_items, source=source)
-        drift_items = build_metadata_drift_items(diagnosis.id, findings, curr_items)
-        drift_total += len(drift_items)
-        for it in drift_items:
-            session.add(it)
+        session.add_all(build_metadata_drift_items(diagnosis.id, findings, curr_items))
 
     session.flush()
-    # Stage E — keep the previous diagnosis's terminal 'skipped' findings
-    # skipped, so a verify-miss or manual suppression survives this re-run.
+    # Keep earlier terminal 'skipped' findings skipped, so a verify-miss or
+    # manual suppression survives this re-run.
     carried = carry_over_skipped(session, diagnosis)
     if carried:
         console.print(f"Kept {carried} finding(s) 'skipped' from the previous diagnosis")
     session.flush()
+
     return _PipelineResult(
         diagnosis_id=diagnosis.id,
-        compare_result=cmp_result,
-        unavailable_count=len(ghost_items),
-        drift_count=drift_total,
-        duplicate_count=duplicate_total,
-        raw_ytmusic_count=len(ytm_items_raw),
-        raw_youtube_total_count=len(yt_items_raw),
-        raw_youtube_music_count=sum(1 for it in yt_items_raw if it.is_music_candidate),
+        lm_count=len(lm),
+        ll_count=len(ll),
+        anchor_count=result.anchor_count,
+        findings=count_findings(session, diagnosis.id),
     )
 
 
 @app.command("compare-likes")
 def compare_likes_cmd() -> None:
-    """Compare latest YouTube Music vs. YouTube liked-videos snapshots."""
+    """Align the latest YouTube liked-videos and YT Music liked-songs snapshots."""
     cfg, factory = _bootstrap()
+    if cfg.fuzzy_threshold is not None:
+        console.print(
+            "[yellow]⚠[/yellow] config.json [cyan]fuzzy_threshold[/cyan] is deprecated and "
+            "ignored: compare-likes aligns the two lists by order, not by title matching."
+        )
     with session_scope(factory) as session:
         outcome = _compare_and_persist(session, cfg)
 
-    result = outcome.compare_result
     console.print(f"[green]✓[/green] Diagnosis [bold]#{outcome.diagnosis_id}[/bold] saved.")
     table = Table(title="compare-likes summary")
     table.add_column("Bucket")
     table.add_column("Count", justify="right")
-    table.add_row("YouTube Music liked songs", str(outcome.raw_ytmusic_count))
-    table.add_row("YouTube liked videos (total)", str(outcome.raw_youtube_total_count))
-    table.add_row("YouTube liked videos (music-like)", str(outcome.raw_youtube_music_count))
-    table.add_row("Matched (any stage)", str(len(result.matched)))
-    table.add_row(
-        "Possibly missing from YT Music",
-        str(len(result.possibly_missing_from_ytmusic)),
-    )
-    table.add_row(
-        "YT Music only (not liked on YouTube)",
-        str(len(result.ytmusic_only_likes)),
-    )
-    table.add_row("Pointer-drift candidates", str(len(result.pointer_drift_candidates)))
-    table.add_row("Unavailable videos (ghost)", str(outcome.unavailable_count))
-    table.add_row("Metadata drift candidates", str(outcome.drift_count))
-    table.add_row("Duplicate likes (within-source)", str(outcome.duplicate_count))
+    table.add_row("YT Music liked songs (LM)", str(outcome.lm_count))
+    table.add_row("YouTube liked videos (LL)", str(outcome.ll_count))
+    table.add_row("LM entries backed by their own video", str(outcome.anchor_count))
+    eligible = outcome.findings.eligible
+    for issue_type, total in outcome.findings.total.items():
+        if issue_type in eligible:
+            table.add_row(
+                f"{issue_type} (write-eligible / total)", f"{eligible[issue_type]} / {total}"
+            )
+        else:
+            table.add_row(issue_type, str(total))
     console.print(table)
     console.print("Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown.")
 
@@ -785,12 +655,7 @@ def issues(
         str | None,
         typer.Option(
             "--type",
-            help=(
-                "Filter findings by issue type. One of: "
-                "possibly_missing_from_ytmusic | possible_pointer_drift | "
-                "ytmusic_only | unavailable_video | metadata_drift | "
-                "duplicate_in_source."
-            ),
+            help=f"Filter findings by issue type. One of: {' | '.join(ALIGNMENT_ISSUE_TYPES)}.",
         ),
     ] = None,
     min_confidence: Annotated[
@@ -808,13 +673,11 @@ def issues(
     """List issues from the latest diagnosis."""
     import json as jsonlib
 
-    from .diagnosis import ISSUE_TYPES, diagnosis_items, latest_diagnosis
-
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
-    if type is not None and type not in ISSUE_TYPES:
-        _fail(f"Unknown issue type: {type!r}. One of: {', '.join(ISSUE_TYPES)}.", code=2)
+    if type is not None and type not in ALIGNMENT_ISSUE_TYPES:
+        _fail(f"Unknown issue type: {type!r}. One of: {', '.join(ALIGNMENT_ISSUE_TYPES)}.", code=2)
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:
@@ -900,7 +763,6 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     'skipped' carries over to later diagnoses (``carry_over_skipped``), so
     this is the durable way to keep ``sync`` off a finding.
     """
-    from .diagnosis import latest_diagnosis
     from .models import DiagnosisItem
 
     source = "open" if to == "skipped" else "skipped"

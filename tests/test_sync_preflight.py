@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,7 @@ from likesurgeon.snapshot import create_snapshot
 from likesurgeon.sync_preflight import (
     diagnosis_staleness,
     stranded_unliked_video_ids,
+    sync_attempts_since,
     youtube_liked_video_ids,
 )
 
@@ -181,3 +182,37 @@ def test_stranded_is_the_last_relike_failing_across_diagnoses(session: Session) 
     _relike_attempt(session, fine, "applied")
 
     assert stranded_unliked_video_ids(session) == {"stuck"}
+
+
+def test_sync_attempts_since_counts_writes_strictly_after(session: Session) -> None:
+    diag = Diagnosis()
+    session.add(diag)
+    session.flush()
+    item = DiagnosisItem(diagnosis_id=diag.id, issue_type="relinked", confidence=1.0, reason="r")
+    session.add(item)
+    session.flush()
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    for minutes, status in [
+        (-1, "applied"),  # before
+        (0, "applied"),  # boundary: not after
+        (1, "applied"),
+        (2, "failed"),  # a failed call may still have landed
+        (3, "skipped"),  # plan-time skip / verify miss: no write
+    ]:
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item.id,
+                kind="yt_unlike",
+                status=status,
+                reason="r",
+                created_at=t + timedelta(minutes=minutes),
+            )
+        )
+    session.flush()
+
+    assert sync_attempts_since(session, t) == 2
+    # SQLite hands timestamps back naive: treated as UTC, like diagnosis_staleness.
+    assert sync_attempts_since(session, t.replace(tzinfo=None)) == 2
+    # An aware non-UTC time is the same instant.
+    assert sync_attempts_since(session, t.astimezone(timezone(timedelta(hours=9)))) == 2
+    assert sync_attempts_since(session, t + timedelta(minutes=2)) == 0

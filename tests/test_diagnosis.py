@@ -32,17 +32,20 @@ from likesurgeon.diagnosis import (
     ISSUE_UNBACKED_LM_ENTRY,
     ISSUE_UNRENDERED_MUSIC,
     ISSUE_YTMUSIC_ONLY,
+    PAIR_ISSUE_TYPES,
     DiagnosisInput,
     _match_reason,
     build_alignment_items,
     build_duplicate_in_source_items,
     build_unavailable_video_items,
+    count_findings,
     create_alignment_diagnosis,
     create_diagnosis,
     diagnosis_items,
+    is_write_eligible,
     latest_diagnosis,
 )
-from likesurgeon.models import Diagnosis
+from likesurgeon.models import Diagnosis, DiagnosisItem
 from likesurgeon.snapshot import create_snapshot, get_snapshot_items
 
 
@@ -668,3 +671,38 @@ def test_create_alignment_diagnosis_persists_row_and_items(session: Session):
     assert diag.ytmusic_snapshot_id == ytm.id and diag.youtube_snapshot_id == yt.id
     [item] = diagnosis_items(session, diag.id)
     assert item.issue_type == ISSUE_RELINKED
+
+
+def test_write_eligibility_and_finding_counts(session: Session):
+    diag = _make_empty_diagnosis(session)
+    rows = [
+        (ISSUE_RELINKED, 1.0, "open"),
+        (ISSUE_RELINKED, 1.0, "skipped"),  # eligible, but carried-over skip
+        (ISSUE_RELINKED, 0.5, "open"),  # report-only pair
+        (ISSUE_SHADOW_DUPLICATE, 1.0, "open"),
+        (ISSUE_UNBACKED_LM_ENTRY, 1.0, "open"),  # a fact, never actionable
+        (ISSUE_YTMUSIC_ONLY, 0.5, "open"),  # pre-alignment type: not counted
+    ]
+    items = [
+        DiagnosisItem(diagnosis_id=diag.id, issue_type=t, confidence=c, reason="r", status=s)
+        for t, c, s in rows
+    ]
+    session.add_all(items)
+    session.flush()
+
+    assert PAIR_ISSUE_TYPES == (ISSUE_RELINKED, ISSUE_RENDERED_AS_OTHER, ISSUE_SHADOW_DUPLICATE)
+    assert [is_write_eligible(it) for it in items] == [True, True, False, True, False, False]
+
+    counts = count_findings(session, diag.id)
+    assert counts.total == {
+        **dict.fromkeys(ALIGNMENT_ISSUE_TYPES, 0),
+        ISSUE_RELINKED: 3,
+        ISSUE_SHADOW_DUPLICATE: 1,
+        ISSUE_UNBACKED_LM_ENTRY: 1,
+    }
+    # Eligible and still open: the skipped relinked one isn't counted.
+    assert counts.eligible == {
+        ISSUE_RELINKED: 1,
+        ISSUE_RENDERED_AS_OTHER: 0,
+        ISSUE_SHADOW_DUPLICATE: 1,
+    }

@@ -78,7 +78,7 @@ For an LL video A rendered as B (availability from scan time):
 
 ## 5. Operational rules
 
-1. **Fresh, unbroken scans.** `compare-likes` refuses to plan writes when one of our own `sync` attempts happened between the two scans it uses (scans that straddle a write misalign). The existing stale-diagnosis warning stays.
+1. **Scans newer than our last write.** `sync` refuses to write when one of our own `sync` attempts happened after the older of the two scans its diagnosis uses — a write between the scans misaligns them, and a write after both makes the diagnosis describe lists that no longer exist. `compare-likes` warns on the same condition. The existing stale-diagnosis warning stays.
 2. **No partial scans.** Remove `--limit` from both `scan` commands; alignment of a truncated scan is meaningless.
 3. **Quota / auth.** Existing quota stop and stranded reporting; YT Music auth probe before sync (cookies from Chrome went stale within about an hour in testing).
 

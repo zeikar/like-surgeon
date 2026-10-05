@@ -326,48 +326,6 @@ def test_counts_summary():
     assert len(res.possibly_missing_from_ytmusic) == 1  # vK has no ytmusic match
 
 
-def test_compare_likes_persists_unavailable_video_findings(session) -> None:
-    """One youtube_liked_videos snapshot with one is_available=False item
-    → DiagnosisItem(issue_type='unavailable_video') is persisted."""
-    from likesurgeon.cli import _compare_and_persist  # introduced in this task
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem
-    from likesurgeon.snapshot import create_snapshot
-
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [
-            {
-                "videoId": "ytm",
-                "title": "T",
-                "artists": [{"name": "A"}],
-            }
-        ],
-    )
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {"title": "T", "channelTitle": "A", "resourceId": {"videoId": "v1"}},
-                "contentDetails": {"videoId": "v1"},
-                "_likesurgeon_video_status": {"is_available": False, "reason": "deleted"},
-            }
-        ],
-    )
-
-    diagnosis_id = _compare_and_persist(session).diagnosis_id
-    rows = (
-        session.query(DiagnosisItem)
-        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_UNAVAILABLE_VIDEO)
-        .all()
-    )
-    assert len(rows) == 1
-    assert rows[0].confidence == 1.0
-    assert "video unavailable: deleted" in rows[0].reason
-
-
 def test_compare_likes_persists_metadata_drift_findings(session) -> None:
     """Two YouTube snapshots of the same source with same video_id but
     different title → DiagnosisItem(issue_type='metadata_drift')."""
@@ -550,53 +508,6 @@ def test_dedupe_by_video_id_is_idempotent():
     twice = dedupe_by_video_id(once)
 
     assert once == twice
-
-
-def test_compare_likes_no_ghost_findings_for_pre_0_3_data(session) -> None:
-    """Pre-0.3 snapshots have `is_available=None` (unknown). The ghost
-    finder must produce zero findings for them, not flag every row.
-    Regression guard: a code change that flipped the predicate to
-    `is not True` would mis-classify all legacy data as ghosts."""
-    from likesurgeon.cli import _compare_and_persist
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem
-    from likesurgeon.snapshot import create_snapshot
-
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [
-            {
-                "videoId": "ytm",
-                "title": "T",
-                "artists": [{"name": "A"}],
-            }
-        ],
-    )
-    # YouTube snapshot WITHOUT `_likesurgeon_video_status` — translator
-    # leaves both columns NULL, mirroring a 0.2 snapshot.
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "Legacy",
-                    "channelTitle": "C",
-                    "resourceId": {"videoId": "v1"},
-                },
-                "contentDetails": {"videoId": "v1"},
-            }
-        ],
-    )
-
-    diagnosis_id = _compare_and_persist(session).diagnosis_id
-    rows = (
-        session.query(DiagnosisItem)
-        .filter_by(diagnosis_id=diagnosis_id, issue_type=ISSUE_UNAVAILABLE_VIDEO)
-        .all()
-    )
-    assert rows == []
 
 
 def test_match_evidence_defaults_to_none():

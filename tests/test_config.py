@@ -231,14 +231,15 @@ def test_load_fuzzy_threshold_raises_for_json_bool(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_config_load_uses_default_when_key_missing(
+def test_config_load_fuzzy_threshold_is_none_when_key_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The key is deprecated; None tells compare-likes there's nothing to warn about."""
     from likesurgeon.config import Config
 
     monkeypatch.setenv("LIKE_SURGEON_HOME", str(tmp_path))
     _write_config(tmp_path, {"region": "KR"})
-    assert Config.load().fuzzy_threshold == 85
+    assert Config.load().fuzzy_threshold is None
 
 
 def test_config_load_uses_config_value_when_present(
@@ -261,14 +262,3 @@ def test_config_load_raises_invalid_fuzzy_threshold_error(
     with pytest.raises(InvalidFuzzyThresholdError) as exc_info:
         Config.load()
     assert "150" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# Drift-invariant: CompareInput and Config share the same default constant
-# ---------------------------------------------------------------------------
-
-
-def test_compare_and_config_share_default_constant() -> None:
-    from likesurgeon.compare import DEFAULT_FUZZY_THRESHOLD, CompareInput
-
-    assert CompareInput(ytmusic=[], youtube=[]).fuzzy_threshold == DEFAULT_FUZZY_THRESHOLD == 85

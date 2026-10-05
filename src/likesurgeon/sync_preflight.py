@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt
@@ -16,6 +16,12 @@ from .snapshot import YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS, latest_snapshot
 from .sync import _video_ids_for_tracks
 
 STALE_AFTER = timedelta(hours=1)
+
+
+def _as_utc(dt: datetime) -> datetime:
+    # SQLite hands DateTime(timezone=True) back naive; values are stored as UTC.
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
 
 # Attempt kinds whose success means "we liked this video on YouTube".
 _YT_LIKE_KINDS = ("yt_like_yt_rate", "yt_relike_like")
@@ -101,11 +107,7 @@ def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> 
         used = session.get(Snapshot, used_id)
         if used is None:
             continue
-        scanned = used.created_at
-        # SQLite hands DateTime(timezone=True) back naive; values are stored as UTC.
-        if scanned.tzinfo is None:
-            scanned = scanned.replace(tzinfo=UTC)
-        age = now - scanned
+        age = now - _as_utc(used.created_at)
         if age > STALE_AFTER:
             warnings.append(
                 f"the {source} scan diagnosis #{diag.id} used (#{used_id}) is "
@@ -113,3 +115,24 @@ def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> 
                 "re-scan + compare-likes before a big sync"
             )
     return warnings
+
+
+def sync_attempts_since(session: Session, since: datetime) -> int:
+    """How many of our own ``sync`` API calls were recorded strictly after ``since``.
+
+    A diagnosis is only trustworthy when no such call happened after the
+    older of its two scans (spec §5.1): one between the scans misaligns them,
+    one after both means the lists have changed since. 'skipped' rows are
+    plan-time skips or verify misses — no write — so they don't count; a
+    'failed' call may still have landed, so it does.
+    """
+    return (
+        session.scalar(
+            select(func.count(SyncAttempt.id)).where(
+                SyncAttempt.status != "skipped",
+                # Bound as UTC wall-clock, which is how the column is stored.
+                SyncAttempt.created_at > _as_utc(since),
+            )
+        )
+        or 0
+    )

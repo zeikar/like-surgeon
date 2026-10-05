@@ -1788,44 +1788,6 @@ def test_summarize_warns_when_plan_exceeds_daily_quota() -> None:
     assert "exceeds" not in summarize(actions[:100], [])
 
 
-def test_version_variant_fuzzy_pair_is_not_planned_end_to_end(session: Session) -> None:
-    """Regression for the review repro: a YouTube topic upload "Spring Day"
-    vs a YT Music "Spring Day (Remix)" fuzzy-matches at 1.0 (token subset).
-    The default sync plan must not unlike the original."""
-    from likesurgeon.cli import _compare_and_persist
-    from likesurgeon.diagnosis import diagnosis_items
-    from likesurgeon.snapshot import create_snapshot
-
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "Spring Day",
-                    "videoOwnerChannelTitle": "BTS - Topic",
-                    "description": "Provided to YouTube by BIGHIT",
-                    "resourceId": {"videoId": "ORIG"},
-                },
-                "contentDetails": {"videoId": "ORIG"},
-                "_likesurgeon_video_status": {"is_available": True, "reason": None},
-            }
-        ],
-    )
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [{"videoId": "REMIX", "title": "Spring Day (Remix)", "artists": [{"name": "BTS"}]}],
-    )
-    items = diagnosis_items(session, _compare_and_persist(session).diagnosis_id)
-    [drift] = [it for it in items if it.issue_type == ISSUE_POINTER_DRIFT]
-    assert drift.confidence == 1.0  # the matcher itself is unchanged
-
-    actions, skips = plan(items, resolve_video_ids(session, items), drift_min_confidence=0.95)
-    assert actions == []
-    assert [s.kind for s in skips] == ["yt_relike"]
-
-
 def test_plan_skips_dedupe_when_youtube_likes_are_unknown(session: Session) -> None:
     """No YouTube scan behind the diagnosis → the guard can't rule out a
     YouTube like, so no dedupe (fail-safe)."""

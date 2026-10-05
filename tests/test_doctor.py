@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.orm import Session
 
-from likesurgeon.compare import (
-    CompareResult,
-    Match,
-    MatchKind,
-    UnmatchedItem,
+from likesurgeon.align import align
+from likesurgeon.diagnosis import (
+    ALIGNMENT_ISSUE_TYPES,
+    ISSUE_RELINKED,
+    ISSUE_UNBACKED_LM_ENTRY,
+    create_alignment_diagnosis,
 )
-from likesurgeon.diagnosis import DiagnosisInput, create_diagnosis
 from likesurgeon.doctor import health_summary
-from likesurgeon.snapshot import create_snapshot
+from likesurgeon.models import Diagnosis, DiagnosisItem
+from likesurgeon.snapshot import create_snapshot, get_snapshot_items
 
 
 def _yt(video_id: str, title: str, channel: str = "Some Music VEVO") -> dict:
@@ -40,7 +42,7 @@ def test_doctor_with_no_snapshots(session: Session):
     assert report.ytmusic.latest_count is None
     assert report.youtube.latest_count is None
     assert report.latest_diagnosis is None
-    assert report.match_rate_percent is None
+    assert report.lm_backed_percent is None
 
 
 def test_doctor_aggregates_both_sources(session: Session):
@@ -63,214 +65,53 @@ def test_doctor_aggregates_both_sources(session: Session):
     assert report.latest_diagnosis is None  # no compare-likes run yet
 
 
-def test_doctor_match_rate_scores_diagnosis(session: Session):
-    """Real ingest path so DiagnosisItem FKs resolve under FK enforcement.
-
-    One YT music match (v1), one YT-only (v3) → match_rate = 1/2 = 50%.
-    """
-    import json as _json
-
-    from likesurgeon.snapshot import get_snapshot_items
-
-    ytm_snap = create_snapshot(
+def _alignment_diagnosis(session: Session, *, lm_ids: tuple[str, ...]) -> Diagnosis:
+    """Align LL [a1, A, a3, C, a5] (A deleted) against ``lm_ids`` and persist it."""
+    ytm = create_snapshot(session, "ytmusic_liked_songs", [_ytm(v, v, ["X"]) for v in lm_ids])
+    ll = [_yt(v, v) for v in ("a1", "A", "a3", "C", "a5")]
+    ll[1]["_likesurgeon_video_status"] = {"is_available": False, "reason": "deleted"}
+    yt = create_snapshot(session, "youtube_liked_videos", ll)
+    result = align(get_snapshot_items(session, yt.id), get_snapshot_items(session, ytm.id))
+    return create_alignment_diagnosis(
         session,
-        "ytmusic_liked_songs",
-        [_ytm("v1", "A", ["X"])],
+        ytmusic_snapshot_id=ytm.id,
+        youtube_snapshot_id=yt.id,
+        result=result,
+        metadata={},
     )
-    session.commit()
-    yt_snap = create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            _yt("v1", "A (Official MV)"),  # music + matched by video_id
-            _yt("v3", "C (Official Audio)"),  # music + unmatched (yt-only)
-        ],
-    )
-    session.commit()
 
-    ytm_items = get_snapshot_items(session, ytm_snap.id)
-    yt_items = get_snapshot_items(session, yt_snap.id)
 
-    fake_result = CompareResult(
-        ytmusic_count=1,
-        youtube_total_count=2,
-        youtube_music_count=2,
-        matched=[
-            Match(
-                ytmusic_track_id=ytm_items[0].track_id,
-                youtube_track_id=yt_items[0].track_id,
-                kind=MatchKind.VIDEO_ID,
-                confidence=1.0,
-                ytmusic_title=ytm_items[0].title,
-                youtube_title=yt_items[0].title,
-            )
-        ],
-        possibly_missing_from_ytmusic=[
-            UnmatchedItem(
-                track_id=yt_items[1].track_id,
-                video_id=yt_items[1].video_id,
-                title=yt_items[1].title,
-                artists=_json.loads(yt_items[1].artists) if yt_items[1].artists else [],
-                canonical_key=yt_items[1].canonical_key,
-            )
-        ],
-        ytmusic_only_likes=[],
-        pointer_drift_candidates=[],
-    )
-    create_diagnosis(
-        session,
-        DiagnosisInput(
-            ytmusic_snapshot_id=ytm_snap.id,
-            youtube_snapshot_id=yt_snap.id,
-            result=fake_result,
-        ),
+def test_doctor_counts_alignment_findings_and_lm_backed_share(session: Session):
+    # A renders as B; the a3–a5 gap shows two LM entries for one LL video, so
+    # neither can be backed.
+    diag = _alignment_diagnosis(session, lm_ids=("a1", "B", "a3", "D1", "D2", "a5"))
+    # Issue types from a pre-alignment diagnosis aren't counted.
+    session.add(
+        DiagnosisItem(diagnosis_id=diag.id, issue_type="ytmusic_only", confidence=0.5, reason="r")
     )
     session.commit()
 
     report = health_summary(session)
-    assert report.match_rate_percent is not None
-    assert 49 <= report.match_rate_percent <= 51  # ~50%
+
     assert report.latest_diagnosis is not None
-    assert report.latest_diagnosis.possibly_missing_from_ytmusic == 1
+    assert report.latest_diagnosis.diagnosis_id == diag.id
+    assert report.latest_diagnosis.counts == {
+        **dict.fromkeys(ALIGNMENT_ISSUE_TYPES, 0),
+        ISSUE_RELINKED: 1,
+        ISSUE_UNBACKED_LM_ENTRY: 2,
+    }
+    # 1 − 2 unbacked / 6 LM entries.
+    assert report.lm_backed_percent == pytest.approx(100 * 4 / 6)
 
 
-def test_doctor_summary_counts_new_issue_types(session) -> None:
-    """`unavailable_videos` and `metadata_drift` counts come from the
-    DiagnosisSummary aggregation alongside the existing types."""
-    from likesurgeon.cli import _compare_and_persist
-    from likesurgeon.doctor import health_summary
-    from likesurgeon.snapshot import create_snapshot
+def test_doctor_lm_backed_share_is_none_without_lm_snapshot_or_entries(session: Session):
+    diag = _alignment_diagnosis(session, lm_ids=())
+    session.commit()
+    # An empty LM has nothing to back.
+    assert health_summary(session).lm_backed_percent is None
 
-    # YT Music snapshot.
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [
-            {
-                "videoId": "ytm",
-                "title": "T",
-                "artists": [{"name": "A"}],
-            }
-        ],
-    )
-    # Two YT snapshots: first establishes prev, second adds a ghost AND a drift.
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "Original",
-                    "channelTitle": "C",
-                    "resourceId": {"videoId": "v"},
-                },
-                "contentDetails": {"videoId": "v"},
-            },
-        ],
-    )
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "New Title Entirely Different",
-                    "channelTitle": "C",
-                    "resourceId": {"videoId": "v"},
-                },
-                "contentDetails": {"videoId": "v"},
-                "_likesurgeon_video_status": {"is_available": False, "reason": "deleted"},
-            },
-        ],
-    )
-
-    _compare_and_persist(session)
+    diag.ytmusic_snapshot_id = None  # LM snapshot deleted (FK is SET NULL)
+    session.commit()
     report = health_summary(session)
     assert report.latest_diagnosis is not None
-    assert report.latest_diagnosis.unavailable_videos >= 1
-    assert report.latest_diagnosis.metadata_drift >= 1
-
-
-def test_doctor_summary_counts_duplicate_in_source(session) -> None:
-    """`duplicate_in_source` count surfaces in DiagnosisSummary aggregation."""
-    from likesurgeon.cli import _compare_and_persist
-    from likesurgeon.doctor import health_summary
-    from likesurgeon.snapshot import create_snapshot
-
-    # YT Music snapshot with a duplicated video_id.
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [
-            {"videoId": "dup", "title": "T", "artists": [{"name": "A"}]},
-            {"videoId": "dup", "title": "T", "artists": [{"name": "A"}]},
-        ],
-    )
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "Music",
-                    "channelTitle": "C",
-                    "resourceId": {"videoId": "yt_only"},
-                },
-                "contentDetails": {"videoId": "yt_only"},
-            },
-        ],
-    )
-
-    _compare_and_persist(session)
-    report = health_summary(session)
-    assert report.latest_diagnosis is not None
-    assert report.latest_diagnosis.duplicate_in_source == 1
-
-
-def test_doctor_match_rate_denominator_is_canonicalized(session) -> None:
-    """Regression: when YouTube has within-source duplicates, the doctor
-    health score must compute the denominator on the canonicalized view
-    (same as the diagnosis), not on raw snapshot rows. Otherwise the
-    numerator (canonicalized missing count) and denominator (raw rows)
-    disagree and the percentage misleads — e.g. an entirely-unmatched
-    YouTube snapshot with one video duplicated would falsely report 50%.
-
-    Setup: YT side has video_id 'x' twice (music-candidate), no ytmusic
-    match. Canonicalized view = 1 music candidate, 1 missing → 0%.
-    Raw view (the bug) = 2 candidates, 1 missing → 50%.
-    """
-    from likesurgeon.cli import _compare_and_persist
-    from likesurgeon.snapshot import create_snapshot
-
-    create_snapshot(
-        session,
-        "ytmusic_liked_songs",
-        [],  # no ytmusic matches at all
-    )
-    create_snapshot(
-        session,
-        "youtube_liked_videos",
-        [
-            {
-                "snippet": {
-                    "title": "Song (Official Audio)",
-                    "channelTitle": "Artist - Topic",
-                    "resourceId": {"videoId": "x"},
-                },
-                "contentDetails": {"videoId": "x"},
-            },
-            {
-                "snippet": {
-                    "title": "Song (Official Audio)",
-                    "channelTitle": "Artist - Topic",
-                    "resourceId": {"videoId": "x"},
-                },
-                "contentDetails": {"videoId": "x"},
-            },
-        ],
-    )
-
-    _compare_and_persist(session)
-    report = health_summary(session)
-    # Canonicalized: 1 unique music candidate, 1 missing → 0%.
-    assert report.match_rate_percent == 0.0
+    assert report.lm_backed_percent is None

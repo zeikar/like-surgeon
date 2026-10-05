@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .compare import dedupe_by_video_id
+from .diagnosis import ISSUE_UNBACKED_LM_ENTRY, count_findings, latest_diagnosis
 from .diff import DiffResult, diff_snapshots
 from .models import Snapshot
-from .snapshot import get_snapshot_items, latest_snapshot
+from .snapshot import latest_snapshot
 
 YTMUSIC = "ytmusic_liked_songs"
 YOUTUBE = "youtube_liked_videos"
@@ -32,12 +32,7 @@ class SourceHealth:
 @dataclass(frozen=True)
 class DiagnosisSummary:
     diagnosis_id: int
-    possibly_missing_from_ytmusic: int
-    pointer_drift: int
-    ytmusic_only: int
-    unavailable_videos: int
-    metadata_drift: int
-    duplicate_in_source: int
+    counts: dict[str, int]  # ``FindingCounts.total``
 
 
 @dataclass(frozen=True)
@@ -45,9 +40,10 @@ class MultiSourceHealthReport:
     ytmusic: SourceHealth
     youtube: SourceHealth
     latest_diagnosis: DiagnosisSummary | None
-    # match_rate = matched_youtube_music / max(youtube_music_count, 1) * 100.
-    # ``None`` when the latest diagnosis is missing or has no music candidates.
-    match_rate_percent: float | None
+    # Share of the diagnosed LM entries traced to a YouTube like:
+    # (1 − unbacked_lm_entry / LM snapshot rows) * 100. ``None`` without a
+    # diagnosis, or when its LM snapshot is gone or empty.
+    lm_backed_percent: float | None
 
 
 def _source_health(session: Session, source: str) -> SourceHealth:
@@ -81,67 +77,27 @@ def _source_health(session: Session, source: str) -> SourceHealth:
 
 
 def _latest_diagnosis_summary(session: Session) -> tuple[DiagnosisSummary | None, float | None]:
-    from .diagnosis import (
-        ISSUE_DUPLICATE_IN_SOURCE,
-        ISSUE_METADATA_DRIFT,
-        ISSUE_POINTER_DRIFT,
-        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-        ISSUE_UNAVAILABLE_VIDEO,
-        ISSUE_YTMUSIC_ONLY,
-        diagnosis_items,
-        latest_diagnosis,
-    )
-
     diag = latest_diagnosis(session)
     if diag is None:
         return None, None
 
-    items = diagnosis_items(session, diag.id)
-    counts = {
-        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC: 0,
-        ISSUE_POINTER_DRIFT: 0,
-        ISSUE_YTMUSIC_ONLY: 0,
-        ISSUE_UNAVAILABLE_VIDEO: 0,
-        ISSUE_METADATA_DRIFT: 0,
-        ISSUE_DUPLICATE_IN_SOURCE: 0,
-    }
-    for it in items:
-        if it.issue_type in counts:
-            counts[it.issue_type] += 1
-    summary = DiagnosisSummary(
-        diagnosis_id=diag.id,
-        possibly_missing_from_ytmusic=counts[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC],
-        pointer_drift=counts[ISSUE_POINTER_DRIFT],
-        ytmusic_only=counts[ISSUE_YTMUSIC_ONLY],
-        unavailable_videos=counts[ISSUE_UNAVAILABLE_VIDEO],
-        metadata_drift=counts[ISSUE_METADATA_DRIFT],
-        duplicate_in_source=counts[ISSUE_DUPLICATE_IN_SOURCE],
-    )
+    counts = count_findings(session, diag.id).total
+    summary = DiagnosisSummary(diagnosis_id=diag.id, counts=counts)
 
-    # Health: match_rate = (yt_music_candidates - unmatched) / yt_music_candidates.
-    # The "unmatched" count is exactly the high-priority bucket from this run.
-    #
-    # Denominator must use the same canonicalized view the diagnosis used —
-    # ``compare`` dedupes by video_id before matching, so the unmatched count
-    # is per unique video_id, not per raw row. Mixing raw denominator with
-    # canonicalized numerator would falsely inflate the score whenever the
-    # YouTube snapshot contains within-source duplicates.
-    if diag.youtube_snapshot_id is None:
+    if diag.ytmusic_snapshot_id is None:
         return summary, None
-    yt_items = dedupe_by_video_id(get_snapshot_items(session, diag.youtube_snapshot_id))
-    yt_music_count = sum(1 for it in yt_items if it.is_music_candidate)
-    if yt_music_count == 0:
+    lm_snap = session.get(Snapshot, diag.ytmusic_snapshot_id)
+    if lm_snap is None or lm_snap.raw_count == 0:
         return summary, None
-    matched_music = yt_music_count - counts[ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC]
-    return summary, max(0.0, min(100.0, matched_music / yt_music_count * 100))
+    return summary, (1 - counts[ISSUE_UNBACKED_LM_ENTRY] / lm_snap.raw_count) * 100
 
 
 def health_summary(session: Session) -> MultiSourceHealthReport:
     """Multi-source health snapshot. No source argument — always covers both."""
-    summary, match_rate = _latest_diagnosis_summary(session)
+    summary, lm_backed = _latest_diagnosis_summary(session)
     return MultiSourceHealthReport(
         ytmusic=_source_health(session, YTMUSIC),
         youtube=_source_health(session, YOUTUBE),
         latest_diagnosis=summary,
-        match_rate_percent=match_rate,
+        lm_backed_percent=lm_backed,
     )

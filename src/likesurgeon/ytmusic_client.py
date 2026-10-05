@@ -235,8 +235,8 @@ class YTMusicClient:
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YTMusicWriteError(video_id, str(exc)) from exc
 
-    def fetch_liked_songs(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Fetch up to ``limit`` liked songs. Returns the raw track dicts.
+    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Fetch up to ``limit`` liked songs (``None``: all). Returns the raw track dicts.
 
         Raises ``UnexpectedResponseError`` if ytmusicapi returns anything
         other than a ``dict`` containing a list under ``"tracks"``. We'd
@@ -247,7 +247,9 @@ class YTMusicClient:
         """
         client = self._build()
         try:
-            result = client.get_liked_songs(limit=limit)
+            # Typed ``int`` upstream, but forwarded as-is to ``get_playlist``,
+            # where ``None`` follows every continuation.
+            result = client.get_liked_songs(limit=limit)  # type: ignore[arg-type]
         except (KeyError, IndexError) as exc:
             # ytmusicapi's response parser (`ytmusicapi.navigation.nav`) re-raises
             # whichever of KeyError / IndexError it caught — string keys vs. list

@@ -52,12 +52,14 @@ class _FakeYouTubeClient:
     # each test.
     last_user_region: Any = "<unset-sentinel>"
     fetch_called: bool = False
+    fetch_limit: Any = "<unset-sentinel>"
 
     def __init__(self, **kwargs: Any) -> None:
         # Accept and ignore client_secrets_path / token_path / etc.
         pass
 
-    def fetch_liked_videos(self, *, limit: int) -> list[dict[str, Any]]:
+    def fetch_liked_videos(self, limit: int | None = None) -> list[dict[str, Any]]:
+        type(self).fetch_limit = limit
         return [
             {
                 "snippet": {"title": "Song", "channelTitle": "C", "resourceId": {"videoId": "v1"}},
@@ -78,6 +80,7 @@ def _reset_fake_client() -> Iterable[None]:
     """Reset class-level recording state between tests."""
     _FakeYouTubeClient.last_user_region = "<unset-sentinel>"
     _FakeYouTubeClient.fetch_called = False
+    _FakeYouTubeClient.fetch_limit = "<unset-sentinel>"
     yield
 
 
@@ -155,6 +158,57 @@ def test_scan_youtube_likes_rejects_invalid_region_flag(
 
     assert result.exit_code == 2
     assert "ISO 3166-1 alpha-2" in result.output
+    assert patch_youtube_client.fetch_called is False
+
+
+def test_scan_youtube_likes_fetches_every_liked_video(
+    fake_home: Path,
+    patch_youtube_client: type[_FakeYouTubeClient],
+) -> None:
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["scan", "youtube-likes"])
+
+    assert result.exit_code == 0, result.output
+    assert patch_youtube_client.fetch_limit is None
+
+
+def test_scan_ytmusic_fetches_every_liked_song(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import likesurgeon.cli as _cli_mod
+
+    limits: list[Any] = []
+
+    class _FakeYTMusic:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+            limits.append(limit)
+            return [{"videoId": "v1", "title": "Song", "artists": [{"name": "X"}]}]
+
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", _FakeYTMusic)
+
+    result = CliRunner().invoke(_cli_mod.app, ["scan", "ytmusic"])
+
+    assert result.exit_code == 0, result.output
+    assert limits == [None]
+
+
+@pytest.mark.parametrize("command", ["ytmusic", "youtube-likes"])
+def test_scan_commands_reject_limit(
+    fake_home: Path,
+    patch_youtube_client: type[_FakeYouTubeClient],
+    command: str,
+) -> None:
+    """A truncated scan can't be aligned (spec §5.2), so there is no --limit."""
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["scan", command, "--limit", "5"])
+
+    assert result.exit_code == 2, result.output
+    assert "No such option" in result.output
     assert patch_youtube_client.fetch_called is False
 
 
@@ -1140,12 +1194,13 @@ def test_sync_limit_with_mixed_dedupe_and_unlike(
 
 
 # ---------------------------------------------------------------------------
-# duplicate_in_source — compare-likes pipeline + canonicalization.
+# compare-likes — LL → LM alignment pipeline.
 #
 # These tests drive the on-disk DB through the CliRunner like the sync tests
-# above, then inspect persisted DiagnosisItem rows. Stdout assertions are
-# label-presence-only (Rich table column wrapping is brittle); the real
-# correctness check is the SQL row count.
+# above, then inspect persisted DiagnosisItem rows. The YouTubeClient used for
+# the videos.list same-recording check is patched on the youtube_client module
+# so the function-local `from .youtube_client import YouTubeClient` resolves to
+# the fake.
 # ---------------------------------------------------------------------------
 
 
@@ -1168,390 +1223,287 @@ def _yt_raw(video_id: str, title: str, channel: str = "ArtistVEVO") -> dict:
     }
 
 
-def test_compare_likes_reports_duplicate_in_source_bucket(
-    fake_home: Path,
-) -> None:
-    """One ytmusic video_id duplicated twice → exactly 1 duplicate_in_source row
-    and the bucket label appears in compare-likes stdout."""
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_DUPLICATE_IN_SOURCE
-    from likesurgeon.models import DiagnosisItem
-    from likesurgeon.snapshot import create_snapshot
+class _FakeYouTubeMetadata:
+    """Stub YouTubeClient for compare-likes: serves ``fetch_canonical_metadata``.
 
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [
-                _ytm_raw("dup", "Day by Day", ["X"]),
-                _ytm_raw("dup", "Day by Day", ["X"]),
-                _ytm_raw("unique", "Other", ["Y"]),
-            ],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
-        )
-        s.commit()
-    finally:
-        s.close()
+    Raises AuthorizationRequiredError unless a test sets ``metadata``;
+    ``raise_instead`` overrides both. ``requested`` records each call's ids.
+    """
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
+    metadata: dict | None = None
+    raise_instead: Exception | None = None
+    requested: list[list[str]] = []
 
-    assert result.exit_code == 0, result.output
-    assert "Duplicate likes (within-source)" in result.output
+    def __init__(self, **kwargs: Any) -> None:
+        pass
 
-    s = _open_db(fake_home)
-    try:
-        from sqlalchemy import select as _select
+    def fetch_canonical_metadata(self, video_ids: list[str]) -> dict:
+        from likesurgeon.youtube_client import AuthorizationRequiredError
 
-        rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_DUPLICATE_IN_SOURCE)
-            ).all()
-        )
-    finally:
-        s.close()
-    assert len(rows) == 1
+        type(self).requested.append(list(video_ids))
+        if type(self).raise_instead is not None:
+            raise type(self).raise_instead
+        if type(self).metadata is None:
+            raise AuthorizationRequiredError("no auth")
+        return type(self).metadata
 
 
-def test_duplicate_does_not_phantom_inflate_ytmusic_only_bucket(fake_home: Path) -> None:
-    """Canonicalization removes phantom surplus rows from ytmusic_only: a
-    video_id duplicated twice (pre-fix: 2 phantom ``ytmusic_only`` rows)
-    must collapse to exactly 1 — the canonical row remains because it
-    genuinely has no YT counterpart. The phantom inflation is what
-    ``sync`` could previously act on by mistake."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_YTMUSIC_ONLY
-    from likesurgeon.models import DiagnosisItem, Track
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [
-                _ytm_raw("dup", "Day by Day", ["X"]),
-                _ytm_raw("dup", "Day by Day", ["X"]),
-            ],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
-        )
-        s.commit()
-    finally:
-        s.close()
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-
-    s = _open_db(fake_home)
-    try:
-        dup_track = s.scalar(
-            _select(Track).where(Track.source == "ytmusic_liked_songs", Track.video_id == "dup")
-        )
-        assert dup_track is not None
-        ytm_only_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(
-                    DiagnosisItem.issue_type == ISSUE_YTMUSIC_ONLY,
-                    DiagnosisItem.source_track_id == dup_track.id,
-                )
-            ).all()
-        )
-    finally:
-        s.close()
-    # Exactly 1 canonical row — the phantom surplus row is gone.
-    assert len(ytm_only_rows) == 1
+@pytest.fixture(autouse=True)
+def _reset_metadata_fake() -> Iterable[None]:
+    _FakeYouTubeMetadata.metadata = None
+    _FakeYouTubeMetadata.raise_instead = None
+    _FakeYouTubeMetadata.requested = []
+    yield
 
 
-def test_compare_likes_handles_youtube_side_duplicate(fake_home: Path) -> None:
-    """Rare-but-possible: YouTube has a duplicated music-candidate video_id
-    with no ytmusic counterpart. Pre-canonicalization, the surplus row
-    would surface as a phantom ``possibly_missing_from_ytmusic`` that sync
-    would happily act on (this is the bug). After canonicalization: 1
-    duplicate_in_source finding tagged to the YouTube side, and the
-    canonical row produces exactly 1 ``possibly_missing_from_ytmusic``
-    (phantom surplus is gone — only the genuine row remains)."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import (
-        ISSUE_DUPLICATE_IN_SOURCE,
-        ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-    )
-    from likesurgeon.models import DiagnosisItem, Track
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [_ytm_raw("other", "Other Song", ["Y"])],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [
-                _yt_raw("dup_yt", "Some Music Video (Official MV)", "MusicVEVO"),
-                _yt_raw("dup_yt", "Some Music Video (Official MV)", "MusicVEVO"),
-            ],
-        )
-        s.commit()
-    finally:
-        s.close()
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-
-    s = _open_db(fake_home)
-    try:
-        # 1 duplicate_in_source row tagged to the YouTube side.
-        dup_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_DUPLICATE_IN_SOURCE)
-            ).all()
-        )
-        assert len(dup_rows) == 1
-        assert "youtube_liked_videos" in dup_rows[0].reason
-
-        # Exactly 1 (canonical) possibly_missing row for the duplicated
-        # YouTube video_id — the phantom surplus is gone.
-        dup_track = s.scalar(
-            _select(Track).where(Track.source == "youtube_liked_videos", Track.video_id == "dup_yt")
-        )
-        assert dup_track is not None
-        rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(
-                    DiagnosisItem.issue_type == ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-                    DiagnosisItem.source_track_id == dup_track.id,
-                )
-            ).all()
-        )
-    finally:
-        s.close()
-    assert len(rows) == 1
+@pytest.fixture
+def patch_metadata_client(monkeypatch: pytest.MonkeyPatch) -> type[_FakeYouTubeMetadata]:
+    monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakeYouTubeMetadata)
+    return _FakeYouTubeMetadata
 
 
-def test_issues_filter_by_duplicate_in_source_type(fake_home: Path) -> None:
-    """`issues --type duplicate_in_source` returns exactly the 1 dup finding;
-    `--type ytmusic_only` does not include the duplicated video_id."""
-    from likesurgeon.cli import app
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [
-                _ytm_raw("dup", "Day by Day", ["X"]),
-                _ytm_raw("dup", "Day by Day", ["X"]),
-            ],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
-        )
-        s.commit()
-    finally:
-        s.close()
-
-    runner = CliRunner()
-    assert runner.invoke(app, ["compare-likes"]).exit_code == 0
-
-    dup_result = runner.invoke(app, ["issues", "--type", "duplicate_in_source", "--format", "json"])
-    assert dup_result.exit_code == 0, dup_result.output
-    import json as _json
-
-    payload = _json.loads(dup_result.stdout)
-    assert len(payload["items"]) == 1
-    assert payload["items"][0]["issue_type"] == "duplicate_in_source"
-
-    ytm_only = runner.invoke(app, ["issues", "--type", "ytmusic_only", "--format", "json"])
-    assert ytm_only.exit_code == 0
-    payload2 = _json.loads(ytm_only.stdout)
-    # The duplicated "dup" video_id appears in ytmusic_only at most once
-    # (its canonical row) — phantom surplus is eliminated by
-    # canonicalization.
-    dup_in_only = [it for it in payload2["items"] if it["source_video_id"] == "dup"]
-    assert len(dup_in_only) <= 1
-
-
-def test_compare_likes_raw_total_counts_include_duplicates(
-    fake_home: Path,
-) -> None:
-    """User-facing semantic: the raw ``YouTube Music liked songs`` count
-    reflects the snapshot's actual row count (= what's in the user's
-    account) even when duplicates are present. Buckets reflect post-
-    canonicalization findings."""
-    from likesurgeon.cli import app
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [
-                _ytm_raw("a", "A", ["X"]),
-                _ytm_raw("b", "B", ["Y"]),
-                _ytm_raw("dup", "D", ["Z"]),
-                _ytm_raw("dup", "D", ["Z"]),
-                _ytm_raw("c", "C", ["W"]),
-            ],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [_yt_raw("yt_only", "Random Music Video", "MusicVEVO")],
-        )
-        s.commit()
-    finally:
-        s.close()
-
-    runner = CliRunner()
-    # Use a wide terminal so Rich doesn't wrap the count column.
-    result = runner.invoke(app, ["compare-likes"], terminal_width=200)
-    assert result.exit_code == 0, result.output
-    out = result.output
-    # The raw ytmusic count row must reflect 5 (the snapshot has 5 rows),
-    # not 4 (the canonicalized matcher view).
-    assert "YouTube Music liked songs" in out
-
-    # Stronger check via _PipelineResult directly: the CLI surfaces raw
-    # counts in the totals rows while the bucket counts reflect the
-    # canonicalized comparison.
-    from likesurgeon.cli import _compare_and_persist
-
-    s = _open_db(fake_home)
-    try:
-        # Fresh pipeline run for the assertion. The CLI invocation above
-        # already persisted a Diagnosis; this is purely about the in-
-        # memory counts the renderer would feed Rich.
-        outcome = _compare_and_persist(s)
-        s.rollback()
-    finally:
-        s.close()
-    assert outcome.raw_ytmusic_count == 5
-    # compare_result.ytmusic_count is the post-canonicalization view: 4.
-    assert outcome.compare_result.ytmusic_count == 4
-
-
-# ---------------------------------------------------------------------------
-# fuzzy_threshold wiring — _compare_and_persist passes cfg.fuzzy_threshold
-# through to CompareInput, and _safe_config_load converts out-of-range values
-# to a clean exit-2 before any pipeline logic runs.
-# ---------------------------------------------------------------------------
-
-
-def _seed_minimal_snapshots(home: Path) -> None:
-    """Seed one ytmusic row and one youtube row so _compare_and_persist
-    doesn't short-circuit on a missing snapshot."""
+def _seed_relink(home: Path) -> None:
+    """LL [a1, A, a3] / LM [a1, B, a3], newest first: a1 and a3 anchor, so the
+    LM entry between them renders the unavailable LL video A as B."""
     from likesurgeon.snapshot import create_snapshot
 
     s = _open_db(home)
     try:
-        create_snapshot(s, "ytmusic_liked_songs", [_ytm_raw("ytm1", "A Song", ["Artist"])])
-        create_snapshot(s, "youtube_liked_videos", [_yt_raw("yt1", "A Song", "ArtistVEVO")])
+        create_snapshot(
+            s, "ytmusic_liked_songs", [_ytm_raw(v, f"Song {v}", ["X"]) for v in ("a1", "B", "a3")]
+        )
+        ll = [_yt_raw(v, f"Song {v}") for v in ("a1", "A", "a3")]
+        ll[1]["_likesurgeon_video_status"] = {"is_available": False, "reason": "deleted"}
+        create_snapshot(s, "youtube_liked_videos", ll)
         s.commit()
     finally:
         s.close()
 
 
-def test_compare_and_persist_passes_fuzzy_threshold_from_config(
-    fake_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_compare_and_persist must forward cfg.fuzzy_threshold to CompareInput."""
-    import likesurgeon.cli as _cli_mod
-    from likesurgeon.compare import CompareInput, CompareResult
-    from likesurgeon.config import Config
+def _relink_metadata() -> dict:
+    """videos.list metadata under which A → B passes the same-recording check."""
+    from likesurgeon.compare import CanonicalMetadata
 
-    _seed_minimal_snapshots(fake_home)
+    return {
+        vid: CanonicalMetadata(video_id=vid, title="Song", channel_id="UC1", duration_seconds=200)
+        for vid in ("A", "B")
+    }
 
-    captured: list[CompareInput] = []
 
-    def _fake_compare_likes(inp: CompareInput) -> CompareResult:
-        captured.append(inp)
-        return CompareResult(
-            ytmusic_count=0,
-            youtube_total_count=0,
-            youtube_music_count=0,
-            matched=[],
-            possibly_missing_from_ytmusic=[],
-        )
+def _only_finding(home: Path):
+    """The single DiagnosisItem in the DB plus the A / B track ids."""
+    from sqlalchemy import select
 
-    monkeypatch.setattr(_cli_mod, "compare_likes", _fake_compare_likes)
+    from likesurgeon.models import DiagnosisItem, Track
 
-    cfg = Config(
-        app_dir=fake_home,
-        db_path=fake_home / "like-surgeon.sqlite",
-        ytmusic_browser_path=fake_home / "browser.json",
-        youtube_oauth_client_path=fake_home / "youtube-oauth-client.json",
-        youtube_token_path=fake_home / "youtube-token.json",
-        region=None,
-        fuzzy_threshold=80,
-    )
-
-    s = _open_db(fake_home)
+    s = _open_db(home)
     try:
-        _cli_mod._compare_and_persist(s, cfg)
-        s.rollback()
+        [item] = s.scalars(select(DiagnosisItem)).all()
+        track = {t.video_id: t.id for t in s.scalars(select(Track))}
+        return item, track["A"], track["B"]
     finally:
         s.close()
 
-    assert len(captured) == 1
-    assert captured[0].fuzzy_threshold == 80
 
-
-def test_compare_and_persist_uses_default_85_when_cfg_is_none(
+def test_compare_likes_relinked_pair_is_write_eligible_with_metadata(
     fake_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
 ) -> None:
-    """When cfg=None, _compare_and_persist must use DEFAULT_FUZZY_THRESHOLD (85)."""
-    import likesurgeon.cli as _cli_mod
-    from likesurgeon.compare import DEFAULT_FUZZY_THRESHOLD, CompareInput, CompareResult
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
 
-    _seed_minimal_snapshots(fake_home)
+    _seed_relink(fake_home)
+    patch_metadata_client.metadata = _relink_metadata()
 
-    captured: list[CompareInput] = []
+    result = CliRunner().invoke(app, ["compare-likes"])
 
-    def _fake_compare_likes(inp: CompareInput) -> CompareResult:
-        captured.append(inp)
-        return CompareResult(
-            ytmusic_count=0,
-            youtube_total_count=0,
-            youtube_music_count=0,
-            matched=[],
-            possibly_missing_from_ytmusic=[],
-        )
+    assert result.exit_code == 0, result.output
+    # Both sides of every rendered pair, fetched once.
+    assert patch_metadata_client.requested == [["A", "B"]]
+    item, a_track, b_track = _only_finding(fake_home)
+    assert (item.issue_type, item.confidence) == (ISSUE_RELINKED, 1.0)
+    assert (item.source_track_id, item.related_track_id) == (a_track, b_track)
+    assert "report-only" not in result.output
+    assert "fuzzy_threshold" not in result.output
+    assert "sync attempt" not in result.output
 
-    monkeypatch.setattr(_cli_mod, "compare_likes", _fake_compare_likes)
 
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        (None, "no YouTube auth"),  # the fake's default: AuthorizationRequiredError
+        (_yt_mod.ClientSecretsMissingError("no client secrets"), "no YouTube auth"),
+        (RuntimeError("network boom"), "RuntimeError: network boom"),
+    ],
+)
+def test_compare_likes_keeps_pairs_report_only_when_metadata_fetch_fails(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+    error: Exception | None,
+    shown: str,
+) -> None:
+    """Missing auth (fake default) or any other error: one line, then carry on."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_relink(fake_home)
+    patch_metadata_client.raise_instead = error
+
+    result = CliRunner().invoke(app, ["compare-likes"])
+
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert shown in out
+    assert "report-only" in out
+    item, _, _ = _only_finding(fake_home)
+    assert (item.issue_type, item.confidence) == (ISSUE_RELINKED, 0.5)
+
+
+def test_compare_likes_summary_shows_alignment_rows(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    import re
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ALIGNMENT_ISSUE_TYPES
+
+    _seed_relink(fake_home)
+    patch_metadata_client.metadata = _relink_metadata()
+
+    result = CliRunner().invoke(app, ["compare-likes"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0, result.output
+    rows = {line for line in result.output.splitlines() if "│" in line or "|" in line}
+
+    def row(label: str) -> str:
+        [line] = [r for r in rows if label in r]
+        return line
+
+    assert re.search(r"\b3\b", row("YT Music liked songs (LM)"))
+    assert re.search(r"\b3\b", row("YouTube liked videos (LL)"))
+    assert re.search(r"\b2\b", row("LM entries backed by their own video"))
+    assert "1 / 1" in row("relinked (write-eligible / total)")
+    assert "0 / 0" in row("shadow_duplicate (write-eligible / total)")
+    for issue_type in ALIGNMENT_ISSUE_TYPES:
+        assert row(issue_type)
+
+
+def test_compare_likes_warns_when_a_sync_ran_after_the_older_scan(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    """Spec §5.1: a sync attempt after the older scan — here after both —
+    means the diagnosis may not describe the current lists. The window rules
+    themselves are covered by ``sync_attempts_since`` tests."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.models import Snapshot, SyncAttempt
+
+    def at(hour: int) -> datetime:
+        return datetime(2026, 10, 5, tzinfo=UTC) + timedelta(hours=hour)
+
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_RELINKED])
+    _seed_relink(fake_home)
     s = _open_db(fake_home)
     try:
-        _cli_mod._compare_and_persist(s, cfg=None)
-        s.rollback()
+        lm_snap, ll_snap = s.scalars(select(Snapshot).order_by(Snapshot.id)).all()
+        lm_snap.created_at, ll_snap.created_at = at(1), at(3)
+        s.add(
+            SyncAttempt(
+                diagnosis_item_id=ids[ISSUE_RELINKED],
+                kind="yt_unlike",
+                status="applied",
+                reason="r",
+                created_at=at(4),
+            )
+        )
+        s.commit()
     finally:
         s.close()
 
-    assert len(captured) == 1
-    assert captured[0].fuzzy_threshold == DEFAULT_FUZZY_THRESHOLD
-    assert DEFAULT_FUZZY_THRESHOLD == 85
+    result = CliRunner().invoke(app, ["compare-likes"])
+
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "1 sync attempt(s) ran after the older of the two scans" in out
+    assert "Re-scan both sources" in out
+
+
+def test_compare_likes_shadow_duplicate_from_a_duplicated_lm_entry(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    """LL [a1, A, T, a4] / LM [a1, T, T, a4]: T's own like anchors one copy and
+    the other copy renders A. Only the raw (non-deduped) LM shows this."""
+    import re
+
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.compare import CanonicalMetadata
+    from likesurgeon.diagnosis import ISSUE_SHADOW_DUPLICATE
+    from likesurgeon.models import DiagnosisItem, Track
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(
+            s,
+            "ytmusic_liked_songs",
+            [_ytm_raw(v, f"Song {v}", ["X"]) for v in ("a1", "T", "T", "a4")],
+        )
+        ll = [_yt_raw(v, f"Song {v}") for v in ("a1", "A", "T", "a4")]
+        ll[1]["_likesurgeon_video_status"] = {"is_available": True, "reason": None}
+        create_snapshot(s, "youtube_liked_videos", ll)
+        s.commit()
+    finally:
+        s.close()
+    patch_metadata_client.metadata = {
+        vid: CanonicalMetadata(video_id=vid, title="Song", channel_id="UC1", duration_seconds=200)
+        for vid in ("A", "T")
+    }
+
+    result = CliRunner().invoke(app, ["compare-likes"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0, result.output
+    assert patch_metadata_client.requested == [["A", "T"]]
+    [lm_row] = [r for r in result.output.splitlines() if "YT Music liked songs (LM)" in r]
+    assert re.search(r"\b4\b", lm_row)
+    s = _open_db(fake_home)
+    try:
+        [item] = s.scalars(select(DiagnosisItem)).all()
+        a_track = s.scalar(select(Track.id).where(Track.video_id == "A"))
+        t_track = s.scalar(
+            select(Track.id).where(Track.source == "ytmusic_liked_songs", Track.video_id == "T")
+        )
+    finally:
+        s.close()
+    assert (item.issue_type, item.confidence) == (ISSUE_SHADOW_DUPLICATE, 1.0)
+    assert (item.source_track_id, item.related_track_id) == (a_track, t_track)
+
+
+def test_compare_likes_warns_that_fuzzy_threshold_is_ignored(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+
+    _seed_relink(fake_home)
+    (fake_home / "config.json").write_text(json.dumps({"fuzzy_threshold": 80}))
+
+    result = CliRunner().invoke(app, ["compare-likes"])
+
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "fuzzy_threshold" in out
+    assert "ignored" in out
 
 
 def test_invalid_fuzzy_threshold_in_config_exits_2_cleanly(
@@ -1573,367 +1525,48 @@ def test_invalid_fuzzy_threshold_in_config_exits_2_cleanly(
     assert "Traceback" not in result.output
 
 
-# ---------------------------------------------------------------------------
-# Stage 4 enrichment — compare-likes pipeline.
-#
-# These tests exercise the Stage 4 drift-detection path wired into
-# _compare_and_persist. The YouTubeClient is patched on the youtube_client
-# module so the function-local `from .youtube_client import YouTubeClient`
-# resolves to the fake. Each test drives the full CLI via CliRunner + fake_home
-# and then inspects persisted DiagnosisItem rows.
-# ---------------------------------------------------------------------------
-
-
-class _FakeYouTubeStage4:
-    """Stub YouTubeClient for Stage 4 tests.
-
-    Provides fetch_canonical_metadata and the minimal interface that
-    compare-likes expects. By default raises AuthorizationRequiredError;
-    individual tests override `canonical_metadata_return` on the class.
-    """
-
-    canonical_metadata_return: dict | None = None  # None → raise AuthorizationRequiredError
-    raise_instead: Exception | None = None
-
-    def __init__(self, **kwargs: Any) -> None:
-        pass
-
-    def fetch_canonical_metadata(self, video_ids: list[str]) -> dict:
-        from likesurgeon.youtube_client import AuthorizationRequiredError
-
-        if type(self).raise_instead is not None:
-            raise type(self).raise_instead
-        if type(self).canonical_metadata_return is None:
-            raise AuthorizationRequiredError("no auth")
-        return type(self).canonical_metadata_return
-
-    # Satisfy the VideoStatus-based scan path (not called in compare-likes).
-    def fetch_video_statuses(self, video_ids: list[str], *, user_region: str | None = None) -> dict:
-        return {}
-
-
-@pytest.fixture(autouse=True)
-def _reset_stage4_fake() -> Iterable[None]:
-    _FakeYouTubeStage4.canonical_metadata_return = None
-    _FakeYouTubeStage4.raise_instead = None
-    yield
-
-
-@pytest.fixture
-def patch_stage4_client(monkeypatch: pytest.MonkeyPatch) -> type[_FakeYouTubeStage4]:
-    monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakeYouTubeStage4)
-    return _FakeYouTubeStage4
-
-
-def _seed_stage4_snapshots(home: Path, *, ghost: bool = False) -> None:
-    """Seed one ytm item (video_id='ytm_vid') and one yt item (video_id='yt_vid').
-
-    The two items do NOT match via stages 1-3 (different video_ids and very
-    different titles — fuzzy score ~29). The yt item uses an "Artist - Title"
-    pattern so it is classified as a music candidate. Stage 4 matches them via
-    canonical metadata that shares channel_id + duration + normalized title.
-
-    The yt item has is_available=False if ghost=True.
-    """
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [_ytm_raw("ytm_vid", "Rainbow Dreams", ["Artist"])],
-        )
-        # "Sunshine Road - Into the Light" triggers the "artist - title" heuristic
-        # (score >= threshold) so it is classified as a music candidate.
-        yt_raw = _yt_raw("yt_vid", "Sunshine Road - Into the Light", "ArtistVEVO")
-        if ghost:
-            yt_raw["_likesurgeon_video_status"] = {"is_available": False, "reason": "deleted"}
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [yt_raw],
-        )
-        s.commit()
-    finally:
-        s.close()
-
-
-def _stage4_canonical_metadata() -> dict:
-    """Return stub metadata where both ytm_vid and yt_vid share channel+duration+norm-title."""
-    from likesurgeon.compare import CanonicalMetadata
-
-    return {
-        "ytm_vid": CanonicalMetadata(
-            video_id="ytm_vid",
-            title="Common Song Title",
-            channel_id="UCxxx",
-            duration_seconds=200,
-        ),
-        "yt_vid": CanonicalMetadata(
-            video_id="yt_vid",
-            title="Common Song Title",
-            channel_id="UCxxx",
-            duration_seconds=200,
-        ),
-    }
-
-
-def test_compare_likes_stage4_promotes_drift_with_stub_metadata(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """Stage 4 promotes the drift pair; reason contains 'normalized title match'."""
-    from sqlalchemy import select as _select
+def test_issues_type_filter_uses_alignment_issue_types(fake_home: Path) -> None:
+    import json
 
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT, ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem
+    from likesurgeon.diagnosis import ISSUE_RELINKED, ISSUE_UNBACKED_LM_ENTRY
 
-    _seed_stage4_snapshots(fake_home, ghost=True)
-    patch_stage4_client.canonical_metadata_return = _stage4_canonical_metadata()
-
+    _seed_diagnosis(fake_home, issue_types=[ISSUE_RELINKED, ISSUE_UNBACKED_LM_ENTRY])
     runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
+
+    result = runner.invoke(app, ["issues", "--type", "relinked", "--format", "json"])
     assert result.exit_code == 0, result.output
+    [item] = json.loads(result.stdout)["items"]
+    assert item["issue_type"] == ISSUE_RELINKED
 
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-        ghost_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_UNAVAILABLE_VIDEO)
-            ).all()
-        )
-    finally:
-        s.close()
+    for old_type in ("ytmusic_only", "duplicate_in_source", "possible_pointer_drift"):
+        result = runner.invoke(app, ["issues", "--type", old_type])
+        assert result.exit_code == 2, result.output
+        assert "Unknown issue type" in result.output
 
-    assert len(drift_rows) == 1, f"expected 1 drift row, got {len(drift_rows)}"
-    assert "normalized title match" in drift_rows[0].reason
-    # yt_vid was consumed by Stage 4 — must NOT also appear as unavailable_video.
-    ghost_vids = {r.source_track_id for r in ghost_rows}
-    drift_yt_track = drift_rows[0].source_track_id
-    assert drift_yt_track not in ghost_vids, "yt_vid must not be double-counted as ghost"
+    help_text = " ".join(runner.invoke(app, ["issues", "--help"]).output.split())
+    assert "unbacked_lm_entry" in help_text
+    assert "ytmusic_only" not in help_text
 
 
-def test_compare_likes_stage4_skips_when_no_yt_auth(
+def test_doctor_reports_alignment_counts_and_lm_backed_share(
     fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
+    patch_metadata_client: type[_FakeYouTubeMetadata],
 ) -> None:
-    """AuthorizationRequiredError → exit 0; output mentions 'Stage 4 enrichment skipped'."""
-    from sqlalchemy import select as _select
-
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT
-    from likesurgeon.models import DiagnosisItem
 
-    _seed_stage4_snapshots(fake_home)
-    # Default canonical_metadata_return=None → raises AuthorizationRequiredError.
-
+    _seed_relink(fake_home)
     runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
+    assert runner.invoke(app, ["compare-likes"]).exit_code == 0
+
+    result = runner.invoke(app, ["doctor"])
 
     assert result.exit_code == 0, result.output
-    assert "Stage 4 enrichment skipped" in result.output
-
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-    finally:
-        s.close()
-
-    assert drift_rows == [], "no Stage 4 drift rows expected when auth fails"
-
-
-def test_compare_likes_stage4_recovers_from_http_error(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """A generic exception → exit 0; output mentions the error class; existing stages intact."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT, ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC
-    from likesurgeon.models import DiagnosisItem
-
-    _seed_stage4_snapshots(fake_home)
-    patch_stage4_client.raise_instead = RuntimeError("network boom")
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-
-    assert result.exit_code == 0, result.output
-    assert "Stage 4 enrichment skipped" in result.output
-    assert "RuntimeError" in result.output
-
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-        pm_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(
-                    DiagnosisItem.issue_type == ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC
-                )
-            ).all()
-        )
-    finally:
-        s.close()
-
-    # No Stage 4 drift promoted.
-    assert drift_rows == []
-    # Stages 1-3 results persisted: yt_vid was a music candidate not matched → possibly_missing.
-    assert len(pm_rows) == 1
-
-
-def test_compare_likes_stage4_consumed_unavailable_yt_is_not_also_ghost(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """A ghost yt_vid promoted by Stage 4 must NOT appear as unavailable_video."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT, ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem
-
-    _seed_stage4_snapshots(fake_home, ghost=True)
-    patch_stage4_client.canonical_metadata_return = _stage4_canonical_metadata()
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-        ghost_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_UNAVAILABLE_VIDEO)
-            ).all()
-        )
-    finally:
-        s.close()
-
-    assert len(drift_rows) == 1
-    # The consumed yt_vid must not also appear as a ghost.
-    assert len(ghost_rows) == 0, f"expected 0 ghost rows, got {len(ghost_rows)}"
-
-
-def test_compare_likes_stage4_dedupes_yt_row_in_both_buckets(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """A yt_vid in both possibly_missing AND ghost enters Stage 4 exactly once → 1 drift row."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT, ISSUE_UNAVAILABLE_VIDEO
-    from likesurgeon.models import DiagnosisItem
-
-    # ghost=True makes yt_vid is_available=False (ghost bucket)
-    # AND yt_vid will land in possibly_missing_from_ytmusic because it's a music candidate
-    # with no stages 1-3 match.
-    _seed_stage4_snapshots(fake_home, ghost=True)
-    patch_stage4_client.canonical_metadata_return = _stage4_canonical_metadata()
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-        ghost_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_UNAVAILABLE_VIDEO)
-            ).all()
-        )
-    finally:
-        s.close()
-
-    # Exactly one promotion (not doubled).
-    assert len(drift_rows) == 1
-    # Consumed row excluded from ghost findings.
-    assert len(ghost_rows) == 0
-
-
-def test_compare_likes_stage4_skips_yt_row_already_matched_by_stage_1(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """A yt_vid matched by stage 1 (same video_id in both sources) is excluded from Stage 4."""
-    from sqlalchemy import select as _select
-
-    from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT
-    from likesurgeon.models import DiagnosisItem
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        # Both sources share the same video_id "shared_vid" → stage 1 exact match.
-        # The yt title uses "Artist - Song" so it is classified as a music candidate.
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [_ytm_raw("shared_vid", "Artist - Shared Song", ["Artist"])],
-        )
-        yt_raw = _yt_raw("shared_vid", "Artist - Shared Song", "ArtistVEVO")
-        yt_raw["_likesurgeon_video_status"] = {"is_available": False, "reason": "deleted"}
-        create_snapshot(s, "youtube_liked_videos", [yt_raw])
-        s.commit()
-    finally:
-        s.close()
-
-    # Provide metadata for shared_vid — but Stage 4 should never see it since
-    # stage 1 already consumed the track_id from both sides.
-    from likesurgeon.compare import CanonicalMetadata
-
-    patch_stage4_client.canonical_metadata_return = {
-        "shared_vid": CanonicalMetadata(
-            video_id="shared_vid",
-            title="Artist - Shared Song",
-            channel_id="UCxxx",
-            duration_seconds=180,
-        ),
-    }
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-
-    s = _open_db(fake_home)
-    try:
-        drift_rows = list(
-            s.scalars(
-                _select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-            ).all()
-        )
-    finally:
-        s.close()
-
-    # Stage 1 matched it; Stage 4 must not also promote it as drift.
-    assert drift_rows == [], f"expected no drift rows, got {drift_rows}"
+    out = " ".join(result.output.split())
+    assert "1 relinked" in out
+    assert "0 unbacked_lm_entry" in out
+    assert "LM backed: 100.0%" in out
+    assert "Match-rate" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -2062,7 +1695,6 @@ def test_issues_rejects_unknown_type(fake_home: Path) -> None:
 @pytest.mark.parametrize(
     "args",
     [
-        ["scan", "ytmusic", "--limit", "0"],
         ["sync", "--limit", "-1"],
         ["sync", "--drift-min-confidence", "1.5"],
     ],
@@ -2119,74 +1751,6 @@ def test_sync_surfaces_and_prioritizes_videos_stranded_by_an_earlier_run(
     assert "liked nowhere right now: src_1" in out
     # --limit 1 picked the stranded re-like, not the 1.0-confidence ghost unlike.
     assert _FakeYouTubeWrite.instances[0].rate_calls == [("src_1", "none"), ("src_1", "like")]
-
-
-def test_compare_likes_verifies_fuzzy_relink_so_sync_plans_it(
-    fake_home: Path,
-    patch_stage4_client: type[_FakeYouTubeStage4],
-) -> None:
-    """A YT Music relink whose display title gained a romanized suffix is a
-    fuzzy (title-only) pair; when videos.list shows the same channel,
-    duration and title it becomes Stage-4 grade and sync applies it."""
-    from sqlalchemy import select
-
-    from likesurgeon.cli import app
-    from likesurgeon.compare import CanonicalMetadata
-    from likesurgeon.diagnosis import ISSUE_POINTER_DRIFT
-    from likesurgeon.models import DiagnosisItem
-    from likesurgeon.snapshot import create_snapshot
-
-    s = _open_db(fake_home)
-    try:
-        create_snapshot(
-            s,
-            "ytmusic_liked_songs",
-            [_ytm_raw("YTM_B", "夢の歌 - Yume no Uta", ["Example Unit"])],
-        )
-        create_snapshot(
-            s,
-            "youtube_liked_videos",
-            [
-                {
-                    "snippet": {
-                        "title": "夢の歌",
-                        "videoOwnerChannelTitle": "Example Unit - Topic",
-                        "description": "Provided to YouTube by Example Records",
-                        "resourceId": {"videoId": "YT_A"},
-                    },
-                    "contentDetails": {"videoId": "YT_A"},
-                    "_likesurgeon_video_status": {"is_available": True, "reason": None},
-                }
-            ],
-        )
-        s.commit()
-    finally:
-        s.close()
-    patch_stage4_client.canonical_metadata_return = {
-        vid: CanonicalMetadata(
-            video_id=vid, title="夢の歌", channel_id="UCexample", duration_seconds=250
-        )
-        for vid in ("YT_A", "YTM_B")
-    }
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["compare-likes"])
-    assert result.exit_code == 0, result.output
-    assert "verified 1 fuzzy drift pair" in result.output
-
-    s = _open_db(fake_home)
-    try:
-        [drift] = s.scalars(
-            select(DiagnosisItem).where(DiagnosisItem.issue_type == ISSUE_POINTER_DRIFT)
-        ).all()
-        assert drift.reason.startswith("enriched (verified fuzzy 100/100)")
-        assert drift.confidence == 0.95
-    finally:
-        s.close()
-
-    result = runner.invoke(app, ["sync", "--dry-run"])
-    assert result.exit_code == 0, result.output
-    assert "\n  yt_relike: 1" in result.output
 
 
 def test_skip_and_unskip_flip_latest_findings(fake_home: Path) -> None:

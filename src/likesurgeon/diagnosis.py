@@ -42,6 +42,15 @@ ALIGNMENT_ISSUE_TYPES = (
     ISSUE_UNBACKED_LM_ENTRY,
     ISSUE_METADATA_DRIFT,
 )
+# The findings that pair an LL video A with the LM entry B rendering it.
+PAIR_ISSUE_TYPES = (ISSUE_RELINKED, ISSUE_RENDERED_AS_OTHER, ISSUE_SHADOW_DUPLICATE)
+
+
+def is_write_eligible(item: DiagnosisItem) -> bool:
+    """A pair finding that passed the same-recording check with A's
+    availability known — see ``build_alignment_items``. Ignores ``status``."""
+    return item.issue_type in PAIR_ISSUE_TYPES and item.confidence == 1.0
+
 
 # Every Stage-4 pointer-drift reason starts with this. ``sync.plan`` keys
 # auto-apply eligibility on it: Stage-4 pairs (channel + duration + title all
@@ -354,7 +363,7 @@ def build_alignment_items(
     A finding is **write-eligible** iff its ``issue_type`` is one of those
     three AND ``confidence == 1.0``: the pair passed ``pair_passes_sanity`` on
     the ``videos.list`` metadata and A's availability is known; otherwise 0.5
-    (report-only). The sync planner keys on this. ``unbacked_lm_entry``,
+    (report-only). ``is_write_eligible`` encodes this. ``unbacked_lm_entry``,
     ``dead_unrendered`` and ``unrendered_music`` are facts, so 1.0, but they
     are report-only types and never actionable regardless of confidence.
     """
@@ -503,3 +512,24 @@ def diagnosis_items(session: Session, diagnosis_id: int) -> list[DiagnosisItem]:
         .order_by(DiagnosisItem.confidence.desc(), DiagnosisItem.id)
     )
     return list(session.scalars(stmt).all())
+
+
+@dataclass(frozen=True)
+class FindingCounts:
+    # One key per ``ALIGNMENT_ISSUE_TYPES`` entry, in that order. Types from a
+    # pre-alignment diagnosis aren't counted.
+    total: dict[str, int]
+    # One key per ``PAIR_ISSUE_TYPES`` entry: write-eligible findings not
+    # already 'skipped' (e.g. carried over by ``carry_over_skipped``).
+    eligible: dict[str, int]
+
+
+def count_findings(session: Session, diagnosis_id: int) -> FindingCounts:
+    total = dict.fromkeys(ALIGNMENT_ISSUE_TYPES, 0)
+    eligible = dict.fromkeys(PAIR_ISSUE_TYPES, 0)
+    for it in diagnosis_items(session, diagnosis_id):
+        if it.issue_type in total:
+            total[it.issue_type] += 1
+        if is_write_eligible(it) and it.status != "skipped":
+            eligible[it.issue_type] += 1
+    return FindingCounts(total=total, eligible=eligible)

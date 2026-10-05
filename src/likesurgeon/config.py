@@ -8,8 +8,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .compare import DEFAULT_FUZZY_THRESHOLD
-
 DEFAULT_APP_DIR_NAME = ".like-surgeon"
 DEFAULT_DB_FILENAME = "like-surgeon.sqlite"
 YTMUSIC_BROWSER_FILENAME = "browser.json"
@@ -34,10 +32,10 @@ class InvalidRegionError(ValueError):
 class InvalidFuzzyThresholdError(ValueError):
     """Raised when a fuzzy_threshold value is not an int in [0, 100].
 
-    Values outside this range are rejected fail-fast at config load.
-    Note: lower thresholds increase false-positive drift candidates
-    (pointer-drift noise); raising above 95 risks missing real drifts.
-    Only integers are accepted — bool, float, str, None are rejected.
+    The key is deprecated and ignored (``compare-likes`` aligns by order, not
+    by title matching), but a malformed value still fails fast at config load
+    rather than passing silently. Only integers are accepted — bool, float,
+    str, None are rejected.
     """
 
 
@@ -129,13 +127,14 @@ class Config:
     youtube_oauth_client_path: Path
     youtube_token_path: Path
     region: str | None  # ISO 3166-1 alpha-2, or None when not configured
-    fuzzy_threshold: int  # RapidFuzz score 0–100; >= threshold counts as match
+    # Deprecated: no longer used for matching; read only so compare-likes can
+    # warn that it's ignored. None when unset.
+    fuzzy_threshold: int | None
 
     @classmethod
     def load(cls) -> Config:
         env = os.environ.get(ENV_HOME)
         app_dir = Path(env).expanduser() if env else Path.home() / DEFAULT_APP_DIR_NAME
-        loaded = _load_fuzzy_threshold(app_dir)
         return cls(
             app_dir=app_dir,
             db_path=app_dir / DEFAULT_DB_FILENAME,
@@ -143,7 +142,7 @@ class Config:
             youtube_oauth_client_path=app_dir / YOUTUBE_OAUTH_CLIENT_FILENAME,
             youtube_token_path=app_dir / YOUTUBE_TOKEN_FILENAME,
             region=_load_region(app_dir),
-            fuzzy_threshold=loaded if loaded is not None else DEFAULT_FUZZY_THRESHOLD,
+            fuzzy_threshold=_load_fuzzy_threshold(app_dir),
         )
 
     def ensure_app_dir(self) -> None:

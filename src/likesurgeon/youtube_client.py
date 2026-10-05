@@ -398,8 +398,8 @@ class YouTubeClient:
                 return likes
         return LIKED_VIDEOS_FALLBACK_PLAYLIST_ID
 
-    def fetch_liked_videos(self, limit: int = 5000) -> list[dict[str, Any]]:
-        """Fetch up to ``limit`` items from the user's Liked videos playlist.
+    def fetch_liked_videos(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Fetch up to ``limit`` items (``None``: all) from the user's Liked videos playlist.
 
         Resolves the playlist id from ``channels.relatedPlaylists.likes``
         first, falling back to ``"LL"`` only if the channel resource lacks
@@ -410,12 +410,11 @@ class YouTubeClient:
         playlist_id = self._resolve_likes_playlist_id(service)
         items: list[dict[str, Any]] = []
         page_token: str | None = None
-        while len(items) < limit:
-            page_size = min(50, limit - len(items))
+        while limit is None or len(items) < limit:
             request = service.playlistItems().list(
                 part="snippet,contentDetails",
                 playlistId=playlist_id,
-                maxResults=page_size,
+                maxResults=50 if limit is None else min(50, limit - len(items)),
                 pageToken=page_token,
             )
             response = request.execute()
