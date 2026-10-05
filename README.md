@@ -22,7 +22,7 @@ Snapshots preserve **point-in-time metadata** — the title, channel, descriptio
 
 ## Roadmap
 
-Shipped per-release scope and the full changelog live in [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). Unreleased: the LL→LM alignment redesign of `compare-likes` / `sync` unreleased. Next: **1.0** — local web UI / Electron app.
+Shipped per-release scope and the full changelog live in [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). 0.11 shipped the LL→LM alignment redesign of `compare-likes` / `sync`. Next: **1.0** — local web UI / Electron app.
 
 ## Install
 

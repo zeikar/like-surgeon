@@ -1,6 +1,6 @@
 # Design: LL → LM alignment model (sync redesign)
 
-Status: **implemented (unreleased)** — spec r3 (2026-10-05). r1 was the proposal; r2 added every fix from an adversarial review; r3 keeps the ones that guard against observed losses and drops the rest (deferred to dogfooding). Supersedes the relink handling in `CLAUDE.md` ("Domain model") and the 0.4–0.10 sync actions built on it.
+Status: **implemented in 0.11.0** — spec r3 (2026-10-05). r1 was the proposal; r2 added every fix from an adversarial review; r3 keeps the ones that guard against observed losses and drops the rest (deferred to dogfooding). Supersedes the relink handling in `CLAUDE.md` ("Domain model") and the 0.4–0.10 sync actions built on it.
 
 ## TL;DR
 
