@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .compare import CompareResult, Match, MatchKind, UnmatchedItem
+from .align import AlignmentResult, LMBacking, pair_passes_sanity
+from .compare import CanonicalMetadata, CompareResult, Match, MatchKind, UnmatchedItem
 from .drift import DriftFinding
 from .models import Diagnosis, DiagnosisItem, SnapshotItem
+from .normalize import normalize_for_match
 
 ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC = "possibly_missing_from_ytmusic"
 ISSUE_POINTER_DRIFT = "possible_pointer_drift"
@@ -24,6 +26,21 @@ ISSUE_TYPES = (
     ISSUE_UNAVAILABLE_VIDEO,
     ISSUE_METADATA_DRIFT,
     ISSUE_DUPLICATE_IN_SOURCE,
+)
+ISSUE_RELINKED = "relinked"
+ISSUE_RENDERED_AS_OTHER = "rendered_as_other"
+ISSUE_SHADOW_DUPLICATE = "shadow_duplicate"
+ISSUE_DEAD_UNRENDERED = "dead_unrendered"
+ISSUE_UNRENDERED_MUSIC = "unrendered_music"
+ISSUE_UNBACKED_LM_ENTRY = "unbacked_lm_entry"
+ALIGNMENT_ISSUE_TYPES = (
+    ISSUE_RELINKED,
+    ISSUE_RENDERED_AS_OTHER,
+    ISSUE_SHADOW_DUPLICATE,
+    ISSUE_DEAD_UNRENDERED,
+    ISSUE_UNRENDERED_MUSIC,
+    ISSUE_UNBACKED_LM_ENTRY,
+    ISSUE_METADATA_DRIFT,
 )
 
 # Every Stage-4 pointer-drift reason starts with this. ``sync.plan`` keys
@@ -271,6 +288,167 @@ def build_duplicate_in_source_items(
             )
         )
     return out
+
+
+def _availability_text(item: SnapshotItem) -> str:
+    if item.is_available is None:
+        return "availability unknown"
+    if item.is_available:
+        return "available"
+    return f"unavailable: {item.unavailable_reason}" if item.unavailable_reason else "unavailable"
+
+
+def _same_recording_text(
+    sanity: bool, a_meta: CanonicalMetadata | None, b_meta: CanonicalMetadata | None
+) -> str:
+    if a_meta is None or b_meta is None:
+        return "no videos.list metadata"
+    parts = [f"\u0394{abs(a_meta.duration_seconds - b_meta.duration_seconds)}s"]
+    if a_meta.channel_id == b_meta.channel_id:
+        parts.append("same channel")
+    else:
+        parts.append("different channel")
+        a_title, b_title = normalize_for_match(a_meta.title), normalize_for_match(b_meta.title)
+        overlap = bool(a_title and b_title) and (a_title in b_title or b_title in a_title)
+        parts.append("titles overlap" if overlap else "titles differ")
+    return f"{'passed' if sanity else 'failed'}, {', '.join(parts)}"
+
+
+def _alignment_pair_reason(
+    b: LMBacking,
+    sanity: bool,
+    a_meta: CanonicalMetadata | None,
+    b_meta: CanonicalMetadata | None,
+) -> str:
+    a, lm = b.ll_item, b.lm_item
+    check = _same_recording_text(sanity, a_meta, b_meta)
+    if a_meta is None or b_meta is None:
+        verdict = f"report-only: {check}"
+        check = "not run"
+    elif not sanity:
+        verdict = "report-only: same-recording check failed"
+    elif a.is_available is None:
+        verdict = "report-only: availability unknown"
+    else:
+        verdict = None
+    reason = (
+        f"YouTube video {a.video_id} '{a.title}' (LL #{b.ll_index}, {_availability_text(a)}) "
+        f"shows in YT Music as {lm.video_id} '{lm.title}' (LM #{b.lm_index}); "
+        f"same-recording check: {check}"
+    )
+    return f"{reason}; {verdict}" if verdict else reason
+
+
+def build_alignment_items(
+    diagnosis_id: int,
+    result: AlignmentResult,
+    *,
+    metadata: dict[str, CanonicalMetadata],
+) -> list[DiagnosisItem]:
+    """Build DiagnosisItem rows from an LL→LM ``AlignmentResult`` (spec §4).
+
+    ``rendered`` backings (A = LL video, B = the LM entry's video) classify as
+    ``shadow_duplicate`` (B is itself liked on YouTube), ``relinked`` (A is
+    unavailable) or ``rendered_as_other``.
+
+    A finding is **write-eligible** iff its ``issue_type`` is one of those
+    three AND ``confidence == 1.0``: the pair passed ``pair_passes_sanity`` on
+    the ``videos.list`` metadata and A's availability is known; otherwise 0.5
+    (report-only). The sync planner keys on this. ``unbacked_lm_entry``,
+    ``dead_unrendered`` and ``unrendered_music`` are facts, so 1.0, but they
+    are report-only types and never actionable regardless of confidence.
+    """
+    ll_ids = {it.video_id for it in result.ll if it.video_id}
+    out: list[DiagnosisItem] = []
+
+    def add(
+        issue: str,
+        confidence: float,
+        reason: str,
+        source_track_id: int,
+        related_track_id: int | None = None,
+    ) -> None:
+        out.append(
+            DiagnosisItem(
+                diagnosis_id=diagnosis_id,
+                issue_type=issue,
+                confidence=confidence,
+                reason=reason,
+                source_track_id=source_track_id,
+                related_track_id=related_track_id,
+                status="open",
+            )
+        )
+
+    for b in result.backings:
+        if b.kind == "unbacked":
+            add(
+                ISSUE_UNBACKED_LM_ENTRY,
+                1.0,
+                f"YT Music entry {b.lm_item.video_id} '{b.lm_item.title}' (LM #{b.lm_index}) "
+                "has no determinable YouTube like behind it",
+                b.lm_item.track_id,
+            )
+        elif b.kind == "rendered":
+            a, lm = b.ll_item, b.lm_item
+            a_meta = metadata.get(a.video_id)
+            b_meta = metadata.get(lm.video_id)
+            sanity = pair_passes_sanity(a_meta, b_meta)
+            eligible = sanity and a.is_available is not None
+            # B already liked on YouTube wins over relinked: the fix is then
+            # removing A, not re-pointing it.
+            if lm.video_id in ll_ids:
+                issue = ISSUE_SHADOW_DUPLICATE
+            elif a.is_available is False:
+                issue = ISSUE_RELINKED
+            else:
+                issue = ISSUE_RENDERED_AS_OTHER
+            add(
+                issue,
+                1.0 if eligible else 0.5,
+                _alignment_pair_reason(b, sanity, a_meta, b_meta),
+                a.track_id,
+                lm.track_id,
+            )
+
+    for i, it in enumerate(result.ll):
+        if i in result.rendered_ll or i in result.ambiguous_ll:
+            continue
+        where = f"YouTube video {it.video_id} '{it.title}' (LL #{i}"
+        if it.is_available is False:
+            add(
+                ISSUE_DEAD_UNRENDERED,
+                1.0,
+                f"{where}, {_availability_text(it)}) is not shown in YT Music",
+                it.track_id,
+            )
+        elif it.is_available is True and it.is_music_candidate:
+            add(
+                ISSUE_UNRENDERED_MUSIC,
+                1.0,
+                f"{where}) looks like music but is not shown in YT Music",
+                it.track_id,
+            )
+    return out
+
+
+def create_alignment_diagnosis(
+    session: Session,
+    *,
+    ytmusic_snapshot_id: int | None,
+    youtube_snapshot_id: int | None,
+    result: AlignmentResult,
+    metadata: dict[str, CanonicalMetadata],
+) -> Diagnosis:
+    """Persist a Diagnosis row plus the items from ``build_alignment_items``."""
+    diagnosis = Diagnosis(
+        ytmusic_snapshot_id=ytmusic_snapshot_id, youtube_snapshot_id=youtube_snapshot_id
+    )
+    session.add(diagnosis)
+    session.flush()
+    session.add_all(build_alignment_items(diagnosis.id, result, metadata=metadata))
+    session.flush()
+    return diagnosis
 
 
 def latest_diagnosis(session: Session) -> Diagnosis | None:
