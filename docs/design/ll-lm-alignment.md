@@ -41,7 +41,7 @@ LL (YouTube ratings, like-time order)          LM (YT Music Liked songs, same or
 
 Pure function over two complete snapshots `LL[0..n)` and `LM[0..k)`, newest first.
 
-1. **Anchors**: LM entries whose `videoId` is itself in LL, restricted to a **maximum-length strictly increasing subsequence** of their LL indices (LIS; a greedy pass collapses on real data). When an LL video has several LM copies, anchor the earliest copy that keeps the subsequence maximal.
+1. **Anchors**: LM entries whose `videoId` is itself in LL, restricted to a **maximum-length strictly increasing subsequence** of their LL indices (LIS; a greedy pass collapses on real data). When an LL video has several LM copies that fit the same anchor window, anchor the copy that leaves the fewest unbacked LM entries in the two adjacent gaps; ties go to the earliest copy. (Whether B's own like is newer or older than the shadow A decides which copy is B's own, so neither "earliest" nor "latest" is right on its own.)
 2. **Gaps**: between consecutive anchors, the non-anchor LM entries (*k*) are rendered from the unanchored LL videos in the same gap (*m*), in order.
 3. **Write eligibility**: only gaps with *k* = *m*, and only pairs that pass a sanity check — `videos.list` duration within ±3 s and (same channel or one normalized title contains the other). Everything else (*k* ≠ *m*, failed check, missing metadata) is **report-only**.
 
