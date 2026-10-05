@@ -61,7 +61,7 @@ def normalize_artists(artists: Iterable[str]) -> str:
 
 
 def normalize_for_match(text: str) -> str:
-    """Normalize text for compare-likes Stage 4 title matching.
+    """Normalize text for the same-recording title check on aligned pairs.
 
     After NFKC, the wave dash U+301C still needs explicit mapping to ASCII ``~``
     because NFKC does not unify it with U+FF5E fullwidth tilde.

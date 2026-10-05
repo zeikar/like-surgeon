@@ -148,22 +148,21 @@ class Diagnosis(Base):
 class DiagnosisItem(Base):
     """A single finding produced by a ``compare-likes`` run.
 
-    ``issue_type`` is one of:
-      - ``possibly_missing_from_ytmusic`` — music candidate liked on YouTube
-        but with no corresponding YT Music track (the high-priority bucket).
-      - ``possible_pointer_drift`` — fuzzy match between sources, neither
-        ``video_id`` nor ``canonical_key`` exact.
-      - ``ytmusic_only`` — YT Music has it but no YT like (informational —
-        often just "user never liked it on YouTube").
-      - ``unavailable_video`` — the underlying YouTube video is no longer
-        playable (deleted/private/unavailable), detected at scan time via
-        ``videos.list``.
+    ``issue_type`` is one of (see ``diagnosis.ALIGNMENT_ISSUE_TYPES``):
+      - ``relinked`` / ``rendered_as_other`` / ``shadow_duplicate`` — pair
+        findings: YouTube like A and the YT Music entry B that renders it
+        (``source_track_id`` = A, ``related_track_id`` = B). Only these can
+        be write-eligible (``confidence == 1.0``).
+      - ``dead_unrendered`` — a dead YouTube like with no YT Music entry.
+      - ``unrendered_music`` — a playable music like with no YT Music entry.
+      - ``unbacked_lm_entry`` — a YT Music entry with no YouTube like behind it.
       - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
         of one source with meaningfully different title or artists.
-      - ``duplicate_in_source`` — the same ``video_id`` appears more than
-        once in a single snapshot (ytmusic accumulates these over time).
-        ``sync`` no longer acts on it: the ``ytm_dedupe`` action was removed
-        with the LL → LM alignment redesign.
+
+    Rows written before the LL → LM alignment redesign may carry legacy
+    values (``possibly_missing_from_ytmusic``, ``possible_pointer_drift``,
+    ``ytmusic_only``, ``unavailable_video``, ``duplicate_in_source``); nothing
+    produces or acts on them any more.
     """
 
     __tablename__ = "diagnosis_items"

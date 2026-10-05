@@ -11,7 +11,6 @@ from likesurgeon.diagnosis import (
     ISSUE_RELINKED,
     ISSUE_RENDERED_AS_OTHER,
     ISSUE_SHADOW_DUPLICATE,
-    ISSUE_UNAVAILABLE_VIDEO,
     ISSUE_UNBACKED_LM_ENTRY,
 )
 from likesurgeon.models import DiagnosisItem
@@ -143,7 +142,7 @@ def test_plan_drops_finished_items_and_non_pair_types_silently(session: Session)
                 ISSUE_DEAD_UNRENDERED,
                 ISSUE_UNBACKED_LM_ENTRY,
                 ISSUE_METADATA_DRIFT,
-                ISSUE_UNAVAILABLE_VIDEO,  # pre-alignment type
+                "unavailable_video",  # pre-alignment type
             )
         ),
     ]

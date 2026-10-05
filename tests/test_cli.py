@@ -1400,11 +1400,11 @@ def test_out_of_range_numeric_options_are_rejected(fake_home: Path) -> None:
 
 def test_skip_and_unskip_flip_latest_findings(fake_home: Path) -> None:
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY
+    from likesurgeon.diagnosis import ISSUE_DEAD_UNRENDERED, ISSUE_UNBACKED_LM_ENTRY
     from likesurgeon.models import DiagnosisItem
 
-    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY])
-    ghost, ytm_only = ids[ISSUE_UNAVAILABLE_VIDEO], ids[ISSUE_YTMUSIC_ONLY]
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_DEAD_UNRENDERED, ISSUE_UNBACKED_LM_ENTRY])
+    ghost, ytm_only = ids[ISSUE_DEAD_UNRENDERED], ids[ISSUE_UNBACKED_LM_ENTRY]
     runner = CliRunner()
 
     result = runner.invoke(app, ["skip", str(ghost), str(ytm_only)])
@@ -1424,19 +1424,19 @@ def test_skip_and_unskip_flip_latest_findings(fake_home: Path) -> None:
 
 def test_skip_is_all_or_nothing_on_bad_ids(fake_home: Path) -> None:
     from likesurgeon.cli import app
-    from likesurgeon.diagnosis import ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY
+    from likesurgeon.diagnosis import ISSUE_DEAD_UNRENDERED, ISSUE_UNBACKED_LM_ENTRY
     from likesurgeon.models import DiagnosisItem
 
-    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_UNAVAILABLE_VIDEO, ISSUE_YTMUSIC_ONLY])
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_DEAD_UNRENDERED, ISSUE_UNBACKED_LM_ENTRY])
     s = _open_db(fake_home)
     try:
-        s.get(DiagnosisItem, ids[ISSUE_YTMUSIC_ONLY]).status = "applied"
+        s.get(DiagnosisItem, ids[ISSUE_UNBACKED_LM_ENTRY]).status = "applied"
         s.commit()
     finally:
         s.close()
 
     result = CliRunner().invoke(
-        app, ["skip", str(ids[ISSUE_UNAVAILABLE_VIDEO]), str(ids[ISSUE_YTMUSIC_ONLY]), "9999"]
+        app, ["skip", str(ids[ISSUE_DEAD_UNRENDERED]), str(ids[ISSUE_UNBACKED_LM_ENTRY]), "9999"]
     )
 
     assert result.exit_code == 2, result.output
@@ -1445,6 +1445,6 @@ def test_skip_is_all_or_nothing_on_bad_ids(fake_home: Path) -> None:
     assert "#9999 is not a finding of the latest diagnosis" in out
     s = _open_db(fake_home)
     try:
-        assert s.get(DiagnosisItem, ids[ISSUE_UNAVAILABLE_VIDEO]).status == "open"
+        assert s.get(DiagnosisItem, ids[ISSUE_DEAD_UNRENDERED]).status == "open"
     finally:
         s.close()

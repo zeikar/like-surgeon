@@ -1,4 +1,4 @@
-"""Diagnosis persistence: turn CompareResult into Diagnosis + DiagnosisItem rows."""
+"""Diagnosis persistence: alignment results and drift findings as DiagnosisItem rows."""
 
 from __future__ import annotations
 
@@ -8,25 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .align import AlignmentResult, LMBacking, pair_passes_sanity
-from .compare import CanonicalMetadata, CompareResult, Match, MatchKind, UnmatchedItem
+from .compare import CanonicalMetadata
 from .drift import DriftFinding
 from .models import Diagnosis, DiagnosisItem, SnapshotItem
 from .normalize import normalize_for_match
 
-ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC = "possibly_missing_from_ytmusic"
-ISSUE_POINTER_DRIFT = "possible_pointer_drift"
-ISSUE_YTMUSIC_ONLY = "ytmusic_only"
-ISSUE_UNAVAILABLE_VIDEO = "unavailable_video"
 ISSUE_METADATA_DRIFT = "metadata_drift"
-ISSUE_DUPLICATE_IN_SOURCE = "duplicate_in_source"
-ISSUE_TYPES = (
-    ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-    ISSUE_POINTER_DRIFT,
-    ISSUE_YTMUSIC_ONLY,
-    ISSUE_UNAVAILABLE_VIDEO,
-    ISSUE_METADATA_DRIFT,
-    ISSUE_DUPLICATE_IN_SOURCE,
-)
 ISSUE_RELINKED = "relinked"
 ISSUE_RENDERED_AS_OTHER = "rendered_as_other"
 ISSUE_SHADOW_DUPLICATE = "shadow_duplicate"
@@ -50,167 +37,6 @@ def is_write_eligible(item: DiagnosisItem) -> bool:
     """A pair finding that passed the same-recording check with A's
     availability known — see ``build_alignment_items``. Ignores ``status``."""
     return item.issue_type in PAIR_ISSUE_TYPES and item.confidence == 1.0
-
-
-# Every Stage-4 pointer-drift reason starts with this. ``sync.plan`` keys
-# auto-apply eligibility on it: Stage-4 pairs (channel + duration + title all
-# agree) are auto-applied by default, while Stage-3 fuzzy pairs are title-only
-# — ``token_set_ratio`` scores a version variant ("Song" vs "Song (Remix)")
-# 100 — so they need an explicit opt-in.
-STAGE4_REASON_PREFIX = "enriched"
-
-
-def is_stage4_drift_reason(reason: str) -> bool:
-    return reason.startswith(STAGE4_REASON_PREFIX)
-
-
-@dataclass(frozen=True)
-class DiagnosisInput:
-    ytmusic_snapshot_id: int | None
-    youtube_snapshot_id: int | None
-    result: CompareResult
-
-
-def create_diagnosis(session: Session, inp: DiagnosisInput) -> Diagnosis:
-    """Persist a Diagnosis row plus one DiagnosisItem per finding."""
-    diagnosis = Diagnosis(
-        ytmusic_snapshot_id=inp.ytmusic_snapshot_id,
-        youtube_snapshot_id=inp.youtube_snapshot_id,
-    )
-    session.add(diagnosis)
-    session.flush()
-
-    # High-priority bucket: the user liked it on YouTube but YT Music doesn't
-    # have it — these are the candidates the "backup" half of the project
-    # should surface most loudly.
-    for unmatched in inp.result.possibly_missing_from_ytmusic:
-        session.add(
-            _unmatched_item(
-                diagnosis.id,
-                unmatched,
-                ISSUE_POSSIBLY_MISSING_FROM_YTMUSIC,
-                0.9,
-            )
-        )
-
-    for match in inp.result.pointer_drift_candidates:
-        session.add(_match_item(diagnosis.id, match, ISSUE_POINTER_DRIFT))
-
-    # Low-priority informational bucket: YT Music has it, YouTube doesn't.
-    # Often this is just "user never liked it on YouTube" rather than a
-    # problem, so the confidence is intentionally low.
-    for unmatched in inp.result.ytmusic_only_likes:
-        session.add(
-            _unmatched_item(
-                diagnosis.id,
-                unmatched,
-                ISSUE_YTMUSIC_ONLY,
-                0.5,
-            )
-        )
-
-    session.flush()
-    return diagnosis
-
-
-def _unmatched_item(
-    diagnosis_id: int,
-    item: UnmatchedItem,
-    issue_type: str,
-    confidence: float,
-) -> DiagnosisItem:
-    return DiagnosisItem(
-        diagnosis_id=diagnosis_id,
-        issue_type=issue_type,
-        confidence=confidence,
-        reason=_unmatched_reason(item),
-        source_track_id=item.track_id,
-        related_track_id=None,
-        status="open",
-    )
-
-
-def _match_reason(match: Match) -> str:
-    if match.kind is MatchKind.STAGE4_ENRICHMENT:
-        ev = match.evidence
-        if ev is None:
-            return f"{STAGE4_REASON_PREFIX} drift match"
-        via = "" if ev.fuzzy_score is None else f" (verified fuzzy {ev.fuzzy_score:.0f}/100)"
-        return (
-            f"{STAGE4_REASON_PREFIX}{via}: channel={ev.channel_id[:8]}… "
-            f"+ duration={ev.duration_seconds}s + normalized title match"
-        )
-    return (
-        f"fuzzy match (score {match.confidence * 100:.0f}/100): "
-        f"YT '{match.youtube_title}' ↔ YT Music '{match.ytmusic_title}'"
-    )
-
-
-def _match_item(
-    diagnosis_id: int,
-    match: Match,
-    issue_type: str,
-) -> DiagnosisItem:
-    return DiagnosisItem(
-        diagnosis_id=diagnosis_id,
-        issue_type=issue_type,
-        confidence=match.confidence,
-        reason=_match_reason(match),
-        source_track_id=match.youtube_track_id,
-        related_track_id=match.ytmusic_track_id,
-        status="open",
-    )
-
-
-def _unmatched_reason(item: UnmatchedItem) -> str:
-    artists = ", ".join(item.artists) if item.artists else "(no artists)"
-    return f"'{item.title}' by {artists}"
-
-
-def build_unavailable_video_items(
-    diagnosis_id: int,
-    snapshot_items: list[SnapshotItem],
-    *,
-    exclude_yt_indices: frozenset[int] | None = None,
-) -> list[DiagnosisItem]:
-    """Build DiagnosisItem rows for SnapshotItems with is_available=False.
-
-    ``confidence=1.0`` because availability is a fact, not a probability —
-    using a lower confidence would let ``--min-confidence`` filters hide
-    real ghosts.
-
-    ``exclude_yt_indices`` skips the items at the given positions in
-    ``snapshot_items`` (by enumerate index). Stage 4 passes its
-    ``consumed_original_yt_indices`` here so promoted drift rows don't
-    also surface as ghost findings.
-
-    ``region_blocked`` videos are skipped — the video still exists and may
-    become available again when the region restriction lifts (or the user
-    travels / VPNs). Unliking these would permanently lose the like if the
-    restriction is later removed. Only genuinely-unavailable reasons
-    (deleted, private, rejected, unavailable, missing_from_videos_list)
-    produce ghost findings.
-    """
-    out: list[DiagnosisItem] = []
-    for i, item in enumerate(snapshot_items):
-        if exclude_yt_indices is not None and i in exclude_yt_indices:
-            continue
-        if item.is_available is not False:
-            continue
-        if item.unavailable_reason == "region_blocked":
-            continue
-        out.append(
-            DiagnosisItem(
-                diagnosis_id=diagnosis_id,
-                issue_type=ISSUE_UNAVAILABLE_VIDEO,
-                confidence=1.0,
-                reason=f"video unavailable: {item.unavailable_reason}",
-                source_track_id=item.track_id,
-                related_track_id=None,
-                status="open",
-            )
-        )
-    return out
 
 
 def build_metadata_drift_items(
@@ -249,49 +75,6 @@ def build_metadata_drift_items(
                 confidence=1.0,
                 reason=reason,
                 source_track_id=track_id,
-                related_track_id=None,
-                status="open",
-            )
-        )
-    return out
-
-
-def build_duplicate_in_source_items(
-    diagnosis_id: int,
-    snapshot_items: list[SnapshotItem],
-    source: str,
-) -> list[DiagnosisItem]:
-    """Build DiagnosisItem rows for within-source duplicate ``video_id`` groups.
-
-    ``confidence=1.0`` because a duplicate row is a deterministic fact about
-    the snapshot — there's no probability to surface. Filtering with
-    ``--min-confidence`` should never hide a real duplicate.
-
-    Rows with falsy ``video_id`` are skipped (no identity to dedupe). For
-    each duplicated ``video_id`` group, the group is sorted by ``position``
-    ascending and ``source_track_id`` resolves to the position-1 row's
-    ``track_id`` so output is deterministic regardless of caller input order.
-    """
-    groups: dict[str, list[SnapshotItem]] = {}
-    for item in snapshot_items:
-        if not item.video_id:
-            continue
-        groups.setdefault(item.video_id, []).append(item)
-
-    out: list[DiagnosisItem] = []
-    for group in groups.values():
-        if len(group) < 2:
-            continue
-        sorted_group = sorted(group, key=lambda it: it.position)
-        positions = ", ".join(str(it.position) for it in sorted_group)
-        reason = f"appears {len(sorted_group)} times in {source} snapshot (positions: {positions})"
-        out.append(
-            DiagnosisItem(
-                diagnosis_id=diagnosis_id,
-                issue_type=ISSUE_DUPLICATE_IN_SOURCE,
-                confidence=1.0,
-                reason=reason,
-                source_track_id=sorted_group[0].track_id,
                 related_track_id=None,
                 status="open",
             )
@@ -475,7 +258,7 @@ def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
     would silently re-open on the next run and re-fire the same writes.
     A finding matches on ``(issue_type, source_track_id, related_track_id)``,
     and its status is taken from the most recent earlier diagnosis that
-    contains it — so a gap (e.g. a ``scan --limit`` run that missed it)
+    contains it — so a gap (e.g. a diagnosis that didn't contain it)
     doesn't drop the skip, while flipping the item to ``'open'`` on the
     latest diagnosis still un-skips it for good.
     """
