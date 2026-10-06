@@ -79,7 +79,7 @@ _DESCRIPTION_PROVIDED_RE = re.compile(r"provided to youtube by", re.IGNORECASE)
 _NEGATIVE_SIGNALS: tuple[tuple[str, int, str], ...] = (
     (r"\bvlog\b", 3, "vlog"),
     (r"\btutorial\b", 3, "tutorial"),
-    (r"\bhow[\s-]to\b", 2, "how-to"),
+    (r"\bhow(?:\s+|-)to\b", 2, "how-to"),
     (r"\breview\b", 2, "review"),
     (r"\breaction\b", 3, "reaction"),
     (r"\bgameplay\b", 3, "gameplay"),

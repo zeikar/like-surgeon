@@ -30,8 +30,9 @@ _UNLIKE_KINDS = ("repoint_unlike", "unlike_shadow_unlike", "relike_unlike")
 # ``relike_like`` is left out: only its verify proves the like landed, so a kill
 # before that verify keeps ``relike_unlike`` the newest settling row.
 # ``relike_unlike_pending`` is always 'failed' and marks A unresolved after an
-# unconfirmed unlike until a later ``relike_verify`` applied. ``relike_lm_check``
-# is left out too: A is confirmed liked before it.
+# unconfirmed unlike until a later YouTube scan contains A: the recovery re-like
+# (``relike_recover_like`` / ``relike_recover_verify``) and ``relike_lm_check``
+# are left out, since an unlike may still land after either.
 _SETTLING_KINDS = (
     *_UNLIKE_KINDS,
     "relike_verify",
@@ -54,6 +55,7 @@ _WRITE_KINDS = (
     "repoint_rollback",
     "relike_unlike",
     "relike_like",
+    "relike_recover_like",
     "interrupted",
     # Writes recorded by versions before the LL -> LM alignment; their rows stay
     # in existing databases. (``ytm_like`` / ``yt_relike`` / ``yt_like`` alone were

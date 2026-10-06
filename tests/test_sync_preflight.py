@@ -185,7 +185,8 @@ def test_stranded_covers_unlikes_that_never_settled(session: Session) -> None:
 def test_stranded_covers_relike_histories(session: Session) -> None:
     """``relike_like`` and ``relike_lm_check`` never settle A: a 2xx like can land
     nothing, and A is confirmed liked before the LM check. Only ``relike_verify``
-    and the always-failed ``relike_unlike_pending`` note do."""
+    and the always-failed ``relike_unlike_pending`` note do; the recovery re-like
+    never settles a pending note, since the unlike may land after it."""
     t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
     stranded = {
         "unlike_last": [("relike_unlike", "applied")],
@@ -205,12 +206,17 @@ def test_stranded_covers_relike_histories(session: Session) -> None:
         "recovery_like_rejected": [
             ("relike_unlike_pending", "failed"),
             ("relike_lm_check", "applied"),
-            ("relike_like", "failed"),
+            ("relike_recover_like", "failed"),
         ],
         "recovery_verify_failed": [
             ("relike_unlike_pending", "failed"),
-            ("relike_like", "applied"),
-            ("relike_verify", "failed"),
+            ("relike_recover_like", "applied"),
+            ("relike_recover_verify", "failed"),
+        ],
+        "recovery_confirmed": [
+            ("relike_unlike_pending", "failed"),
+            ("relike_recover_like", "applied"),
+            ("relike_recover_verify", "applied"),
         ],
     }
     fine = {
@@ -224,11 +230,6 @@ def test_stranded_covers_relike_histories(session: Session) -> None:
             ("relike_unlike", "applied"),
             ("relike_verify", "applied"),
             ("relike_lm_check", "failed"),
-        ],
-        "recovered": [
-            ("relike_unlike_pending", "failed"),
-            ("relike_like", "applied"),
-            ("relike_verify", "applied"),
         ],
     }
     for vid, rows in {**stranded, **fine}.items():
@@ -365,9 +366,9 @@ def test_relike_writes_count_but_its_reads_and_notes_do_not(session: Session) ->
         _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
     _write_at(session, t + timedelta(hours=1), status="skipped", kind="relike")
     assert sync_attempts_since_older_scan(session, diag) == 0
-    for kind in ("relike_unlike", "relike_like"):
+    for kind in ("relike_unlike", "relike_like", "relike_recover_like"):
         _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
-    assert sync_attempts_since_older_scan(session, diag) == 2
+    assert sync_attempts_since_older_scan(session, diag) == 3
 
 
 @pytest.mark.parametrize(

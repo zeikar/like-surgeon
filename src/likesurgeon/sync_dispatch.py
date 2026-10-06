@@ -28,12 +28,15 @@ runs; it accepts LM unchanged (A still not shown) or one entry added, and
 anything else — an entry gone, or more than one added — stops the run. An
 unlike that wasn't confirmed may land after the re-like, and an unrendered A
 gives the check nothing to catch: a ``relike_unlike_pending`` row marks A
-possibly unliked, A gets one recovery re-like after the check, and the run
-stops. An A whose re-like (or recovery) can't be confirmed is reported in
-``left_unliked`` and stops the run too. ``restored`` is untouched — nothing
-is undone. ``relike_like`` and ``relike_lm_check`` are not settling rows for
-``stranded_unliked_video_ids``: only a ``relike_verify`` proves the like
-landed, and LM can't show an unrendered A either way.
+possibly unliked, A gets one recovery re-like after the check
+(``relike_recover_like`` / ``relike_recover_verify``), and the run stops. The
+pending row is only cleared by a later YouTube scan containing A, because the
+unlike may land even after the recovery's verify. An A whose re-like (or
+recovery) can't be confirmed is also reported in ``left_unliked`` and stops the
+run too. ``restored`` is untouched — nothing is undone. ``relike_like`` and
+``relike_lm_check`` are not settling rows for ``stranded_unliked_video_ids``:
+only a ``relike_verify`` proves the like landed, and LM can't show an
+unrendered A either way.
 
 Invariants:
   * ``DiagnosisItem.reason`` is never modified — that field is the
@@ -379,10 +382,10 @@ class _SyncRun:
                     "relike_unlike_pending",
                     "failed",
                     "unlike not confirmed before the re-like, so it may still land — A counts "
-                    "as possibly unliked until a recovery re-like is confirmed",
+                    "as possibly unliked until a later YouTube scan contains it",
                 )
                 # On disk before the LM check's wait, as a write's row is: from here
-                # only a later confirmed re-like settles A, even after a hard kill.
+                # only a later YouTube scan containing A clears it, even after a hard kill.
                 self.session.commit()
 
             after = self._lm_after(
@@ -416,11 +419,13 @@ class _SyncRun:
                 return "failed"
             if unliked is not True:
                 # The unlike may land after the re-like, and an unrendered A gives
-                # LM nothing to catch: only this re-like's confirmed verify clears
-                # the pending row. An unlike landing even after this verify goes
-                # undetected — no fixed number of re-likes closes that gap, and
-                # ``_settle``'s restore has the same kind.
-                if not relike_a():
+                # LM nothing to catch. The recovery's rows aren't settling, so even a
+                # confirmed verify leaves A reported stranded until a later YouTube
+                # scan contains it: an unlike landing after that verify is
+                # undetectable, and no fixed number of re-likes closes the gap.
+                if not self._relike(
+                    item_id, a, like_kind="relike_recover_like", verify_kind="relike_recover_verify"
+                ):
                     self.left_unliked.append(a)
                 self.aborted = self.aborted or RELIKE_STOP
                 return "failed"

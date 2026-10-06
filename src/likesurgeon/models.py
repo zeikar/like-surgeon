@@ -200,7 +200,8 @@ class SyncAttempt(Base):
     ``restore_verify``; ``repoint_rollback``,
     ``repoint_rollback_verify``; ``relike_precheck``, ``relike_unlike``,
     ``relike_unlike_verify``, ``relike_like``, ``relike_verify``,
-    ``relike_unlike_pending``, ``relike_lm_check``; or the action kind
+    ``relike_unlike_pending``, ``relike_recover_like``,
+    ``relike_recover_verify``, ``relike_lm_check``; or the action kind
     (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
     action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
     authoritative list. Rows written before the LL → LM alignment redesign may

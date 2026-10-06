@@ -134,6 +134,7 @@ def test_cover_ost_remix_families_are_music(title, label):
         "Top 10 game soundtracks explained",
         "Studio vlog: recording the cover",
         "Flower arrangement how-to",
+        "How  to cover a chair",
         "Remastered documentary trailer",
         "Soundtrack podcast episode 3",
     ],
