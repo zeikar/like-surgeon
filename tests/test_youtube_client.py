@@ -54,20 +54,37 @@ class _FakeChannels:
         return _FakeRequest(self._response)
 
 
+class _FakePlaylists:
+    """Mimics ``service.playlists().list(...).execute()``."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def list(self, **kwargs: Any) -> _FakeRequest:
+        self.calls.append(kwargs)
+        return _FakeRequest(self._response)
+
+
 class _FakeService:
     def __init__(
         self,
         playlist_items: _FakePlaylistItems,
         channels: _FakeChannels,
+        playlists: _FakePlaylists,
     ) -> None:
         self._pi = playlist_items
         self._channels = channels
+        self._playlists = playlists
 
     def playlistItems(self) -> _FakePlaylistItems:  # noqa: N802 (mimics google API)
         return self._pi
 
     def channels(self) -> _FakeChannels:
         return self._channels
+
+    def playlists(self) -> _FakePlaylists:
+        return self._playlists
 
 
 class _FakeClient(YouTubeClient):
@@ -76,15 +93,21 @@ class _FakeClient(YouTubeClient):
         pages: list[dict[str, Any]],
         *,
         likes_playlist_id: str = "LL_resolved",
+        likes_item_count: int | dict[str, Any] = 0,
     ) -> None:
         super().__init__(client_secrets_path=None, token_path=None)
         self._fake_pi = _FakePlaylistItems(pages)
         self._fake_channels = _FakeChannels(
             {"items": [{"contentDetails": {"relatedPlaylists": {"likes": likes_playlist_id}}}]}
         )
+        self._fake_playlists = _FakePlaylists(
+            likes_item_count
+            if isinstance(likes_item_count, dict)
+            else {"items": [{"contentDetails": {"itemCount": likes_item_count}}]}
+        )
 
     def _service(self) -> Any:  # type: ignore[override]
-        return _FakeService(self._fake_pi, self._fake_channels)
+        return _FakeService(self._fake_pi, self._fake_channels, self._fake_playlists)
 
 
 def test_fetch_liked_videos_returns_items_from_single_page():
@@ -120,6 +143,27 @@ def test_fetch_liked_videos_uses_resolved_playlist_id():
     # And the channels resolver was actually consulted.
     assert c._fake_channels.calls[0]["mine"] is True
     assert c._fake_channels.calls[0]["part"] == "contentDetails"
+
+
+def test_fetch_likes_item_count_returns_integer():
+    c = _FakeClient([], likes_item_count=1234)
+    assert c.fetch_likes_item_count() == 1234
+
+
+def test_fetch_likes_item_count_queries_resolved_playlist_id():
+    c = _FakeClient([], likes_playlist_id="LL_real_id", likes_item_count=7)
+    c.fetch_likes_item_count()
+    assert c._fake_playlists.calls == [{"part": "contentDetails", "id": "LL_real_id"}]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [{"items": []}, {"items": [{"contentDetails": {}}]}],
+)
+def test_fetch_likes_item_count_raises_on_malformed_response(response):
+    c = _FakeClient([], likes_item_count=response)
+    with pytest.raises((KeyError, IndexError, ValueError)):
+        c.fetch_likes_item_count()
 
 
 def test_fetch_liked_videos_without_limit_follows_every_page():

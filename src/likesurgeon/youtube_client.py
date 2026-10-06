@@ -425,6 +425,19 @@ class YouTubeClient:
                 break
         return items[:limit]
 
+    def fetch_likes_item_count(self) -> int:
+        """Return the likes playlist's ``itemCount`` (2 quota units).
+
+        This is the number the YouTube app shows, which includes likes that
+        ``playlistItems.list`` hides (spec section 7 Q3, README caveat). A
+        malformed response raises rather than yielding a bogus 0; the CLI
+        downgrades any error to a warning.
+        """
+        service = self._service()
+        playlist_id = self._resolve_likes_playlist_id(service)
+        response = service.playlists().list(part="contentDetails", id=playlist_id).execute()
+        return int(response["items"][0]["contentDetails"]["itemCount"])
+
     def rate_video(self, video_id: str, rating: Literal["like", "none"]) -> None:
         """Apply a rating to a video via ``videos.rate``.
 
