@@ -45,6 +45,8 @@ from __future__ import annotations
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -330,7 +332,7 @@ class _SyncRun:
         """Unlike A, then ``_settle`` it. If anything — Ctrl-C included — stops
         this once the unlike call has started, an ``interrupted`` row is
         committed before it propagates, marking A as possibly stranded."""
-        try:
+        with self._interrupt_marks_a(item_id, a):
             rated = self._rate(item_id, unlike_kind, a, "none")
             if rated == "quota":
                 self.unlike_rejected = True
@@ -344,6 +346,13 @@ class _SyncRun:
                 expected=expected,
                 still_liked=still_liked,
             )
+
+    @contextmanager
+    def _interrupt_marks_a(self, item_id: int, a: str) -> Iterator[None]:
+        """Whatever stops the body — Ctrl-C included — commits an ``interrupted``
+        row before propagating, marking A as possibly stranded."""
+        try:
+            yield
         except BaseException as exc:
             try:
                 self._record(
@@ -400,13 +409,14 @@ class _SyncRun:
                 return "applied" if sent and unliked else "failed"
         return self._restore(item_id, a)
 
-    def _check_lm(self, item_id: int, before: _LM, expected: _LM) -> bool:
-        """Re-read LM and compare it with ``expected``, once more after a wait
-        on a mismatch; records one ``lm_check`` row.
+    def _lm_after(
+        self, item_id: int, accept: Callable[[_LM], bool], *, kind: str = "lm_check"
+    ) -> _LM | None:
+        """Read LM, once more after a wait if ``accept`` rejects it; returns the
+        last read.
 
-        A match becomes the next action's baseline (``self.lm``). A failed
-        read counts as a mismatch and sets ``aborted``, which stops the run
-        after this action.
+        A failed read records its ``kind`` row, sets ``aborted`` (which stops
+        the run after this action) and returns None.
         """
         for attempt in range(2):
             if attempt:
@@ -415,14 +425,26 @@ class _SyncRun:
                 after = _read_lm(self.ytm)
             except (UnexpectedResponseError, AuthFileMissingError) as exc:
                 self.aborted = f"could not read YT Music liked songs to check an action: {exc}"
-                self._record(item_id, "lm_check", "failed", f"read failed: {exc}")
-                return False
-            if after == expected:
-                self.lm = after
-                self._record(
-                    item_id, "lm_check", "applied", f"as expected: {_lm_diff(before, after)}"
-                )
-                return True
+                self._record(item_id, kind, "failed", f"read failed: {exc}")
+                return None
+            if accept(after):
+                break
+        return after
+
+    def _check_lm(self, item_id: int, before: _LM, expected: _LM) -> bool:
+        """Re-read LM and compare it with ``expected``, once more after a wait
+        on a mismatch; records one ``lm_check`` row.
+
+        A match becomes the next action's baseline (``self.lm``). A failed
+        read counts as a mismatch.
+        """
+        after = self._lm_after(item_id, lambda lm: lm == expected)
+        if after is None:
+            return False
+        if after == expected:
+            self.lm = after
+            self._record(item_id, "lm_check", "applied", f"as expected: {_lm_diff(before, after)}")
+            return True
         self._record(
             item_id,
             "lm_check",
@@ -432,15 +454,22 @@ class _SyncRun:
         )
         return False
 
-    def _relike(self, item_id: int, a: str) -> bool:
-        """``rate(A, like)`` confirmed by ``getRating`` (``restore_like`` /
-        ``restore_verify``).
+    def _relike(
+        self,
+        item_id: int,
+        a: str,
+        *,
+        like_kind: str = "restore_like",
+        verify_kind: str = "restore_verify",
+    ) -> bool:
+        """``rate(A, like)`` confirmed by ``getRating`` (by default recorded as
+        ``restore_like`` / ``restore_verify``).
 
         Runs even after the quota ran out: the rejected call's failed row is
         what records A as stranded for later runs (``stranded_unliked_video_ids``).
         """
-        return self._rate(item_id, "restore_like", a, "like") == "ok" and (
-            self._has_rating(item_id, "restore_verify", a, "like", miss="failed") is True
+        return self._rate(item_id, like_kind, a, "like") == "ok" and (
+            self._has_rating(item_id, verify_kind, a, "like", miss="failed") is True
         )
 
     def _restore(self, item_id: int, a: str) -> _DispatchOutcome:
