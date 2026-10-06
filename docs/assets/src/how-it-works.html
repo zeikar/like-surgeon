@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- Source of docs/assets/how-it-works.png. Re-render: see docs/DEVELOPMENT.md (README assets). -->
+<html>
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #15181c; --panel: #1c2026; --line: #2c323a; --text: #e8ecf0; --muted: #8a949e;
+    --teal: #5fd4c6; --coral: #ff6f61; --amber: #f2b45a;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: transparent; }
+  body { font-family: Inter, -apple-system, "Segoe UI", sans-serif; color: var(--text); }
+  .card {
+    width: 1200px; padding: 44px 48px 36px; border-radius: 22px;
+    background:
+      linear-gradient(var(--bg), var(--bg)) padding-box,
+      linear-gradient(140deg, #2f3740, #1d2228) border-box;
+    border: 1px solid transparent;
+    background-image:
+      linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size: 28px 28px; background-color: var(--bg);
+  }
+  .eyebrow { font: 600 13px/1 Inter, sans-serif; letter-spacing: .14em; color: var(--teal); text-transform: uppercase; }
+  h1 { font-size: 30px; font-weight: 700; margin-top: 12px; letter-spacing: -.01em; }
+  .lede { color: var(--muted); font-size: 16px; line-height: 1.55; margin-top: 10px; max-width: 900px; }
+  .lede b { color: var(--text); font-weight: 600; }
+
+  .grid { display: grid; grid-template-columns: 300px 120px 250px 1fr; column-gap: 0; row-gap: 12px; margin-top: 34px; align-items: center; }
+  .colhead { font-size: 13px; font-weight: 600; color: var(--muted); padding-bottom: 6px; }
+  .colhead span { display: block; font-size: 12px; font-weight: 500; color: #616b75; margin-top: 3px; }
+  .row-label { grid-column: 1 / -1; }
+
+  .item {
+    height: 52px; display: flex; align-items: center; gap: 12px; padding: 0 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; font-size: 15px; font-weight: 500;
+  }
+  .item small { display: block; font-size: 12px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--teal); box-shadow: 0 0 10px rgba(95,212,198,.45); }
+  .dot.dead { background: var(--coral); box-shadow: 0 0 10px rgba(255,111,97,.5); }
+  .dot.mv { background: var(--amber); box-shadow: 0 0 10px rgba(242,180,90,.45); }
+  .item.dead { border-color: rgba(255,111,97,.45); }
+  .item.dead .t { color: #c9ced3; text-decoration: line-through; text-decoration-color: rgba(255,111,97,.7); }
+  .item.dup { border-color: rgba(242,180,90,.55); }
+  .empty { height: 52px; border: 1px dashed #333a42; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #5b646d; font-size: 13px; }
+
+  .wire { position: relative; height: 52px; }
+  .wire::before { content: ""; position: absolute; left: 6px; right: 14px; top: 50%; border-top: 2px solid var(--teal); opacity: .8; }
+  .wire::after { content: ""; position: absolute; right: 6px; top: calc(50% - 6px); border: 6px solid transparent; border-left: 9px solid var(--teal); opacity: .8; }
+  .wire.coral::before { border-top: 2px dashed var(--coral); opacity: 1; }
+  .wire.coral::after { border-left-color: var(--coral); opacity: 1; }
+  .wire.amber::before { border-top-color: var(--amber); }
+  .wire.amber::after { border-left-color: var(--amber); }
+  .wire.none::before { border-top: 2px dotted #4a525b; right: 40px; }
+  .wire.none::after { content: "×"; border: 0; right: 18px; top: calc(50% - 12px); color: #6b747d; font-size: 20px; line-height: 1; }
+
+  .note { padding-left: 26px; font-size: 14px; line-height: 1.45; color: var(--muted); }
+  .note .tag { display: inline-block; font: 500 12px/1 "JetBrains Mono", ui-monospace, monospace; padding: 5px 8px; border-radius: 6px; margin-bottom: 6px; }
+  .tag.ok { color: var(--teal); background: rgba(95,212,198,.1); }
+  .tag.fix { color: var(--coral); background: rgba(255,111,97,.12); }
+  .tag.dup { color: var(--amber); background: rgba(242,180,90,.12); }
+  .tag.rep { color: #aab3bc; background: rgba(255,255,255,.06); }
+  .note b { color: var(--text); font-weight: 600; }
+  .note code { font: 500 12.5px "JetBrains Mono", ui-monospace, monospace; color: #c9ced3; white-space: nowrap; }
+  .span2 { grid-row: span 2; align-self: center; }
+
+  .foot { margin-top: 30px; padding-top: 20px; border-top: 1px solid var(--line); display: flex; gap: 36px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .foot div { flex: 1; }
+  .foot b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="eyebrow">How it works</div>
+  <h1>Your YT Music likes are a view of your YouTube likes</h1>
+  <p class="lede">YouTube <b>Liked videos</b> is where every like is stored. YT Music <b>Liked songs</b> shows the same list, in the same order, but each entry may play a different video than the like behind it. like-surgeon lines the two lists up by position to find out which like is behind each song.</p>
+
+  <div class="grid">
+    <div class="colhead">YouTube · Liked videos<span>where the likes live</span></div>
+    <div></div>
+    <div class="colhead">YT Music · Liked songs<span>what you see</span></div>
+    <div class="colhead" style="padding-left:26px">What like-surgeon does</div>
+
+    <div class="item"><i class="dot"></i><div class="t">Song 1<small>playable</small></div></div>
+    <div class="wire"></div>
+    <div class="item"><i class="dot"></i><div class="t">Song 1</div></div>
+    <div class="note"><span class="tag ok">backed by its own like</span><br>Nothing to do.</div>
+
+    <div class="item dead"><i class="dot dead"></i><div><div class="t">Song 2 · old upload</div><small>unavailable in your region</small></div></div>
+    <div class="wire coral"></div>
+    <div class="item"><i class="dot"></i><div class="t">Song 2 · new release<small>plays fine</small></div></div>
+    <div class="note"><span class="tag fix">relinked → repoint</span><br><b>Like the new release on YouTube</b>, then unlike the dead upload.</div>
+
+    <div class="item dup"><i class="dot mv"></i><div class="t">Song 3 · music video<small>also liked</small></div></div>
+    <div class="wire amber"></div>
+    <div class="item dup"><i class="dot"></i><div class="t">Song 3 · audio</div></div>
+    <div class="note span2"><span class="tag dup">shadow duplicate → unlike_shadow</span><br>Both likes show as the same track, so it appears twice. <b>Unlike the MV</b> and the song stays once — opt-in (<code>--include-playable</code>) while the MV still plays.</div>
+
+    <div class="item"><i class="dot"></i><div class="t">Song 3 · audio</div></div>
+    <div class="wire"></div>
+    <div class="item"><i class="dot"></i><div class="t">Song 3 · audio</div></div>
+
+    <div class="item dead"><i class="dot dead"></i><div><div class="t">Song 4</div><small>deleted video</small></div></div>
+    <div class="wire none"></div>
+    <div class="empty">not shown</div>
+    <div class="note"><span class="tag rep">dead → report only</span><br>Listed for you to clean up by hand.</div>
+  </div>
+
+  <div class="foot">
+    <div><b>Order is the only link.</b> YT Music doesn't expose which like backs a song, so pairs come from position, never from fuzzy title matching.</div>
+    <div><b>Every unlike is checked.</b> After each change the whole Liked songs list is read again; if anything else moved, the like is restored and the run stops.</div>
+  </div>
+</div>
+</body>
+</html>

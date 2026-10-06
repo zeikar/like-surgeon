@@ -1,47 +1,88 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/hero.jpg" alt="like-surgeon: back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/likesurgeon/"><img src="https://img.shields.io/pypi/v/likesurgeon" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/likesurgeon/"><img src="https://img.shields.io/pypi/pyversions/likesurgeon" alt="Python versions"></a>
+  <a href="https://github.com/zeikar/like-surgeon/actions/workflows/ci.yml"><img src="https://github.com/zeikar/like-surgeon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/zeikar/like-surgeon/blob/main/LICENSE"><img src="https://img.shields.io/github/license/zeikar/like-surgeon" alt="MIT license"></a>
+</p>
+
 # like-surgeon
 
-> Diagnose and repair mismatches between your YouTube Music liked songs and YouTube likes.
+**Back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove.**
 
-**Status:** Local-first CLI, no server. Per-release scope and changelog: [GitHub Releases](https://github.com/zeikar/like-surgeon/releases).
+like-surgeon is a local-first command-line tool. It snapshots your YouTube Music *Liked songs* and your YouTube *Liked videos* into a SQLite file on your machine, works out which YouTube like is behind every song, and repairs the cases it can prove — with a check after every change. No server, no account of ours: your data and credentials stay on your computer.
 
-**The model.** YouTube Liked videos (**LL**) is the only store of likes. YT Music Liked songs (**LM**) is a rendering of it, in the same order, and each LM entry can be shown as a different video than the YouTube video whose like backs it. Below, **A** is the YouTube video whose like backs an LM entry and **B** is the video that entry shows (relinked tracks, official MVs shown as their audio track, and duplicates all follow from this). Details: [docs/design/ll-lm-alignment.md](docs/design/ll-lm-alignment.md).
+## Why
 
-## What it does today
+Use YouTube Music for a few years and your Liked songs drifts:
 
-- Authenticates with YouTube Music (`ytmusicapi`, browser-header) and YouTube Data API v3 (Google OAuth, desktop client).
-- Snapshots `ytmusic_liked_songs` (YouTube Music likes) and `youtube_liked_videos` (YouTube LL playlist) into a local SQLite DB.
-- Diffs any two snapshots, exports any snapshot to JSON.
-- Classifies YouTube liked videos as music-candidate / not via title and channel heuristics.
-- `compare-likes` aligns the latest LL and LM scans by order — position reveals which YouTube like backs each LM entry — and persists the findings as a `Diagnosis`. Snapshots stay frozen.
-- Detects ghost YouTube likes (deleted, private, region-blocked, unavailable) at scan time, and metadata drift (title or artists changes) between snapshots. Region-blocked detection needs a country code in `config.json` (see Scan).
-- `sync` repairs the inconsistencies the alignment finds, on YouTube only, with an LM-wide check after every unlike and an automatic re-like if YT Music doesn't change as expected.
-- `issues` lists the latest diagnosis with type/confidence filters and JSON output.
-- `doctor` is multi-source: per-source counts, latest diagnosis, LM backed % (share of YT Music liked songs traced to the YouTube like behind them).
+- **Songs YT Music swapped behind your back.** The upload you liked was pulled or blocked in your region, so YT Music now plays a different release of the song — but your YouTube likes still hold the old, dead video.
+- **The same song twice.** You liked the official music video *and* the audio track; YT Music shows both as the same track.
+- **Songs that are just gone.** A deleted or region-blocked video stays in your likes, invisible in YT Music.
+- **No backup.** YouTube Music has no in-app export for your likes, and titles change over time.
 
-Snapshots preserve **point-in-time metadata** — the title, channel, description, etc. that the provider returned at scan time are frozen on each `SnapshotItem`. A later rename in YouTube Music or YouTube doesn't rewrite history.
+## How it works
 
-## Roadmap
+<p align="center">
+  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/how-it-works.png" alt="Diagram: YouTube Liked videos on the left, YT Music Liked songs on the right, lined up by position. A dead upload shown as a new release is re-pointed, a music video shown as a duplicate audio track can be unliked (opt-in while it still plays), and a deleted video is reported." width="100%">
+</p>
 
-Shipped per-release scope and the full changelog live in [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). 0.11 shipped the LL→LM alignment redesign of `compare-likes` / `sync`. Next: **1.0** — local web UI / Electron app.
+Your YouTube **Liked videos** list is the only place likes are stored. YT Music **Liked songs** is a view of it — same order, filtered to what YT Music shows, and each entry may play a different video than the like behind it. YT Music never says which like backs which song, so like-surgeon lines the two lists up by position (no fuzzy title matching) and repairs the mismatches it can prove, on YouTube. The full model and the evidence for it: [docs/design/ll-lm-alignment.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/ll-lm-alignment.md). (The docs call the two lists **LL** and **LM**, after their playlist ids.)
 
-## Install
+## Quick start
 
-Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
+Requires Python ≥ 3.11.
 
 ```bash
-git clone https://github.com/zeikar/like-surgeon.git
-cd like-surgeon
-uv sync --extra dev
+uv tool install likesurgeon          # or: pipx install likesurgeon
+likesurgeon init
+likesurgeon auth ytmusic --from-browser chrome   # reads cookies from a browser signed in to music.youtube.com
+likesurgeon auth youtube                          # prints the Google Cloud setup steps; run it again to sign in
+likesurgeon scan ytmusic
+likesurgeon scan youtube-likes --region US        # your country code, so region-blocked videos are caught
+likesurgeon compare-likes                         # what's wrong, and what can be fixed
+likesurgeon sync --dry-run                        # the plan, without writing anything
 ```
 
-The CLI is exposed as `likesurgeon`. Use it via `uv run likesurgeon ...` or activate the venv (`source .venv/bin/activate`) and call `likesurgeon` directly.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/terminal.png" alt="Terminal: compare-likes finds 13 relinked songs, 3 shadow duplicates and 6 dead likes in a library of about 1,200; sync --dry-run plans 11 repoints and 2 shadow unlikes for 1,250 quota units" width="640">
+</p>
+
+Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — no Google Cloud setup needed.
+
+## What it finds
+
+`compare-likes` lines up the latest scans of both lists and records one finding per mismatch. **A** is the YouTube video whose like is behind a YT Music entry, **B** is the video that entry plays.
+
+| Finding | What happened | What `sync` does (proven pairs only) |
+|---|---|---|
+| `relinked` | A is unavailable, and YT Music plays B instead; B isn't liked | **repoint**: like B, then unlike A |
+| `rendered_as_other` | A isn't known to be unavailable (usually a playable MV or fan upload) but YT Music shows B | repoint with `--include-playable`, if A is known to play |
+| `shadow_duplicate` | A is shown as B while B is also liked, so B appears twice | **unlike A**; a playable A only with `--include-playable` |
+| `dead_unrendered` | A is unavailable and not shown in YT Music at all | report only — [clean up by hand](https://github.com/zeikar/like-surgeon#dead-likes) |
+| `unrendered_music` | A plays fine and looks like music, but isn't shown in YT Music | report only |
+| `unbacked_lm_entry` | a YT Music entry with no like that can be pinned behind it | report only |
+| `metadata_drift` | a title or artist changed between two scans | report only |
+
+## Safety
+
+- **Read-only until you say so.** Only `sync` writes, after showing the plan and a y/N prompt; `--dry-run` writes nothing, `--limit N` ramps up, `skip <id>` keeps a finding out for good.
+- **Only proven pairs.** A pair is acted on only when its gap in the alignment is one-to-one and A's availability is known; repoints also need the same recording (duration within ±3 s and same channel or overlapping titles).
+- **Every unlike is checked.** After each change `sync` confirms the rating and re-reads your whole Liked songs list. If anything else moved, A is re-liked and the run stops.
+- **Writes only on YouTube.** YT Music's own like button is never pressed: it shares the same rating, and pressing it duplicates or reverts entries.
+- **Local credentials.** Cookies and OAuth tokens stay in `~/.like-surgeon/`; the files the tool writes are owner-only (`0600`) on macOS and Linux.
 
 ## Usage
+
+The commands below assume `likesurgeon` is on your `PATH`. From a source checkout, prefix them with `uv run`.
 
 ### 1. Initialize local storage
 
 ```bash
-uv run likesurgeon init
+likesurgeon init
 ```
 
 Creates `~/.like-surgeon/` and the SQLite database at `~/.like-surgeon/like-surgeon.sqlite`. Override with `LIKE_SURGEON_HOME=/some/path`.
@@ -51,50 +92,28 @@ Creates `~/.like-surgeon/` and the SQLite database at `~/.like-surgeon/like-surg
 **YouTube Music** (browser-header flow, auto-extracted from your browser):
 
 ```bash
-uv run likesurgeon auth ytmusic --from-browser chrome
+likesurgeon auth ytmusic --from-browser chrome
 ```
 
-Replace `chrome` above with whichever browser you're signed into music.youtube.com
-on. Supported lowercase names (13 total): `chrome`, `chromium`, `firefox`, `edge`,
-`brave`, `safari`, `opera`, `opera_gx`, `librewolf`, `vivaldi`, `arc`, `w3m`,
-`lynx`. The command reads cookies from that browser's local store and writes
-`~/.like-surgeon/browser.json` (POSIX mode `0o600`) — no DevTools copy-paste
-required.
+Replace `chrome` with whichever browser you're signed into music.youtube.com on. Supported names: `chrome`, `chromium`, `firefox`, `edge`, `brave`, `safari`, `opera`, `opera_gx`, `librewolf`, `vivaldi`, `arc`, `w3m`, `lynx`. The command reads cookies from that browser's local store and writes `~/.like-surgeon/browser.json` (mode `0600`) — no DevTools copy-paste required.
 
-> **macOS quirk.** Chrome (and Chromium-family browsers) on macOS encrypt
-> their cookie store with a Keychain entry; the first run prompts you to
-> allow `python` (or `Terminal`) to access it. Firefox usually avoids that
-> prompt because it stores cookies in plain SQLite. Safari may still be
-> blocked by macOS privacy settings — if extraction fails, give Terminal
-> (or your IDE) **Full Disk Access** in System Settings → Privacy &
-> Security and retry.
+> **macOS.** Chrome (and Chromium-family browsers) encrypt their cookie store with a Keychain entry; the first run asks you to allow `python` (or Terminal) to access it. Firefox usually avoids the prompt because it stores cookies in plain SQLite. If extraction is still blocked, give Terminal (or your IDE) **Full Disk Access** in System Settings → Privacy & Security and retry.
 
-If `--from-browser` doesn't work in your environment (sandboxed browser,
-headless server, locked DB), fall back to the manual flow:
+If `--from-browser` doesn't work in your environment (sandboxed browser, headless server, locked DB), `likesurgeon auth ytmusic` prints the manual recipe instead: copy request headers from DevTools and paste them into `uvx --from ytmusicapi ytmusicapi browser`.
 
-```bash
-uv run likesurgeon auth ytmusic
-```
-
-This prints the four-step `ytmusicapi browser` paste recipe.
-
-> **Treat `~/.like-surgeon/browser.json` like a session token.** It contains
-> live YouTube Music cookies — anyone who reads the file can act as you on
-> music.youtube.com until those cookies rotate. The tool stores it with
-> POSIX mode `0o600` (owner read/write only). Don't commit it, share it,
-> or leave it in shared filesystems.
+> **Treat `~/.like-surgeon/browser.json` like a session token.** It holds live YouTube Music cookies: anyone who reads it can act as you on music.youtube.com until they rotate. Don't commit it, share it, or leave it on a shared filesystem.
 
 **YouTube Data API** (Google OAuth, desktop client):
 
 ```bash
-uv run likesurgeon auth youtube
+likesurgeon auth youtube
 ```
 
-The first run prints a 6-step setup walkthrough that ends with you placing a `youtube-oauth-client.json` (downloaded from Google Cloud Console as a "Desktop app" OAuth client) into `~/.like-surgeon/`. Run the command again and it will open your browser for consent and persist the resulting refresh token to `~/.like-surgeon/youtube-token.json`.
+The first run prints a 6-step walkthrough: create a free Google Cloud project, enable YouTube Data API v3, and download a "Desktop app" OAuth client as `~/.like-surgeon/youtube-oauth-client.json`. Run the command again and it opens your browser for consent and stores the refresh token in `~/.like-surgeon/youtube-token.json`.
 
 ### 3. Scan
 
-**Optional but recommended: configure your region.** Region-blocked videos only get classified as ghosts when likesurgeon knows your region. Create `~/.like-surgeon/config.json`:
+**Recommended: set your region.** Region-blocked videos are only detected when like-surgeon knows your country. Create `~/.like-surgeon/config.json`:
 
 ```json
 {
@@ -102,84 +121,71 @@ The first run prints a 6-step setup walkthrough that ends with you placing a `yo
 }
 ```
 
-Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) code for your country. Without this, `scan youtube-likes` prints a one-time warning and falls back to status-only ghost detection (no region check).
-
-> `fuzzy_threshold` in `config.json` is deprecated: it is ignored (with a warning from `compare-likes`) now that matching is order-based.
+Use the [ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2) code for your country, or pass `--region <code>` to `scan youtube-likes`. Without either, each scan warns and checks only for deleted, private and rejected videos — a region-blocked video then counts as playable, so its relink shows up as `rendered_as_other` instead of `relinked`.
 
 ```bash
-uv run likesurgeon scan ytmusic                 # YT Music likes
-uv run likesurgeon scan youtube-likes           # YouTube LL playlist
+likesurgeon scan ytmusic          # YT Music Liked songs
+likesurgeon scan youtube-likes    # YouTube Liked videos
 ```
 
-Scans always fetch the full list — there is no `--limit`, because aligning a truncated list is meaningless.
+Scans always fetch the full list; aligning a truncated list would be meaningless. Each scan is stored as a snapshot with the metadata of that moment, so a later rename doesn't rewrite history.
 
-> **Cookie staleness.** YT Music browser cookies extracted from Chrome went stale within about an hour in practice. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
+> **Cookie staleness.** YT Music cookies extracted from Chrome can go stale within about an hour. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
 
-### 4. Inspect
+### 4. Inspect and back up
 
 ```bash
-uv run likesurgeon snapshots
-uv run likesurgeon diff <old_snapshot_id> <new_snapshot_id>
-uv run likesurgeon export <snapshot_id> --format json
-uv run likesurgeon export <snapshot_id> --format json --output likes.json
-uv run likesurgeon doctor
+likesurgeon snapshots
+likesurgeon diff <old_snapshot_id> <new_snapshot_id>
+likesurgeon export <snapshot_id> --format json --output likes.json
+likesurgeon doctor
 ```
 
-### 5. Compare across sources
+`doctor` summarizes both sources: counts, the latest diagnosis, and how many YT Music songs are traced to the like behind them.
+
+### 5. Compare
 
 ```bash
-uv run likesurgeon compare-likes
-uv run likesurgeon issues
-uv run likesurgeon issues --type relinked
-uv run likesurgeon issues --type shadow_duplicate
-uv run likesurgeon issues --type metadata_drift
-uv run likesurgeon issues --min-confidence 1.0 --format json
+likesurgeon compare-likes
+likesurgeon issues
+likesurgeon issues --type relinked
+likesurgeon issues --min-confidence 1.0 --format json
 ```
 
-`compare-likes` requires a snapshot from each source. It aligns the two lists (LIS anchors, then in-order pairing of the gaps between them), fetches `videos.list` metadata for each aligned pair, and persists the run as a `Diagnosis`. The summary shows the LM / LL counts, how many LM entries are backed by their own video, and one row per finding type (the three pair types as `write-eligible / total`). It warns when one of our own `sync` attempts happened after the older of the two scans (re-scan both, then re-run). Without YouTube auth the metadata fetch is skipped and every pair is report-only. `issues` surfaces the per-item breakdown.
+`compare-likes` needs a snapshot of each source. It aligns the two lists (anchors on songs liked as themselves, then pairs the gaps between them in order), fetches `videos.list` metadata for each pair, and saves the result as a diagnosis — see [What it finds](https://github.com/zeikar/like-surgeon#what-it-finds). It warns when one of our own `sync` writes happened after the older of the two scans (re-scan both, then re-run). Without YouTube auth, `relinked` and `rendered_as_other` pairs are report-only. `issues` lists the findings one by one.
 
-| `issue_type` | Meaning | `sync` |
-|---|---|---|
-| `relinked` | A YouTube like (A, unavailable) is shown in YT Music as another video B, B not liked | repoint |
-| `rendered_as_other` | Same, but A is not known to be unavailable (usually a playable MV or fan upload; unknown availability is report-only) | repoint, only with `--include-playable` |
-| `shadow_duplicate` | A is shown as B, and B is also liked, so YT Music shows B twice | unlike A if A is unavailable; playable A only with `--include-playable` |
-| `dead_unrendered` | Unavailable YouTube like not shown in YT Music | report only (a restriction can lift) |
-| `unrendered_music` | Playable, music-looking YouTube like not shown in YT Music | report only |
-| `unbacked_lm_entry` | YT Music entry with no determinable YouTube like behind it | report only |
-| `metadata_drift` | Title/artists changed between two scans of one source | report only |
+A pair (A shown as B) is **write-eligible** only at confidence 1.0: A's availability is known and — except for `shadow_duplicate` — it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles). A shadow is usually a different upload (an MV, a fan or making-of video), so `sync` proves it while acting instead: B must show at least twice before, and exactly one B must disappear after, or A is re-liked. YouTube likes in gaps whose two counts differ get no finding; the YT Music entries there are reported as `unbacked_lm_entry`.
 
-A pair (A shown as B) is **write-eligible** only at confidence 1.0: A's availability is known and — except for `shadow_duplicate` — it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles). A shadow is usually a different upload (MV, fan or making-of video), so instead `sync` proves it while acting: B must show twice before, and exactly one B must disappear after, or A is re-liked. Everything else is report-only. LL videos in gaps whose LM and LL counts differ get no finding.
+#### Dead likes
 
-`dead_unrendered` is yours to clean up by hand. A region block can lift, so unlike a blocked video only once you have liked a replacement. A **deleted** video can't be unliked through the YouTube Data API (`videos.rate` returns 404), but YT Music's rating call still removes the like — ytmusicapi `rate_song(videoId, "INDIFFERENT")`; check with `videos.getRating`, which still reads deleted videos. The video isn't shown in YT Music, so no other entry depends on it.
+`dead_unrendered` findings are yours to clean up by hand. A region block can lift, so unlike a blocked video only once you have liked a replacement. A **deleted** video can't be unliked through the YouTube Data API (`videos.rate` returns 404), but YT Music's rating call still removes the like — ytmusicapi `rate_song(videoId, "INDIFFERENT")`; check with `videos.getRating`, which still reads deleted videos. The video isn't shown in YT Music, so no other entry depends on it.
 
 ### 6. Sync (write actions)
 
-`sync` applies the latest diagnosis's write-eligible findings, on YouTube only (it never calls YT Music `rate_song`). Default is **actually write** after a y/N prompt — use `--dry-run` to see the plan without writing, `--yes` to skip the prompt, `--limit N` to ramp, `--include-playable` to also act on playable originals. Before the prompt it prints the plan, warns if the diagnosis looks stale (a newer scan exists than the one it used, or a scan it used is over an hour old), and names any video an earlier run may have left unliked.
+`sync` applies the latest diagnosis's write-eligible findings, on YouTube only. It prints the plan and a quota estimate, warns if the diagnosis looks stale (a newer scan exists, or a scan it used is over an hour old), names any video an earlier run may have left unliked, then asks before writing.
 
 ```bash
-uv run likesurgeon sync --dry-run                 # plan + quota estimate, no writes
-uv run likesurgeon sync                            # apply, with confirmation prompt
-uv run likesurgeon sync --yes                      # apply, no prompt
-uv run likesurgeon sync --limit 20 --yes           # apply first 20 actions only
-uv run likesurgeon sync --include-playable         # also MV / fan-upload originals
-uv run likesurgeon skip 812 813                    # keep sync off findings #812, #813 (unskip to undo)
+likesurgeon sync --dry-run              # plan + quota estimate, no writes
+likesurgeon sync                        # apply, with confirmation prompt
+likesurgeon sync --yes                  # apply, no prompt
+likesurgeon sync --limit 20 --yes       # apply the first 20 actions only
+likesurgeon sync --include-playable     # also act on MV / fan-upload originals
+likesurgeon skip 812 813                # keep sync off findings #812 and #813 (unskip to undo)
 ```
-
-#### Actions
 
 | Action | For | Steps | Quota (`videos.rate` 50 units, `getRating` 1) |
 |---|---|---|---|
-| repoint | `relinked`; `rendered_as_other` with `--include-playable` | confirm A still liked, confirm B isn't liked yet, like B, confirm via `getRating`, unlike A, confirm, full-LM check | 104 units |
-| unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, confirm A still liked, unlike A, confirm, full-LM check | 53 units |
+| repoint | `relinked`; `rendered_as_other` with `--include-playable` | confirm A still liked and B not yet liked, like B, confirm, unlike A, confirm, full Liked songs check | 104 units |
+| unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, confirm A still liked, unlike A, confirm, full Liked songs check | 53 units |
 
-**LM check and restore.** After each unlike `sync` reads the whole LM again: repoint expects it unchanged, unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed. Unliking a wrongly paired A would otherwise silently drop an unrelated song. A restore re-like (~51 units) happens only when the unlike didn't take or the check failed. For a repoint, the undo of the B like it added (~51 units) happens whenever A stays liked after B's like may have landed: after a restore, when the quota rejects A's unlike, or when B's like errors but landed. Neither is in the plan's estimate. Any action that needs a restore, successful or not, and any B undo that can't be confirmed also stops the run, since other pairs from the same diagnosis may be wrong too. The default daily YouTube quota is 10,000 units; the plan prints the estimate (warning above 10,000), and `--limit` slices a run.
+**Check and restore.** After each unlike `sync` reads the whole Liked songs list again: a repoint expects it unchanged, an unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed, because unliking a wrongly paired A would otherwise silently drop an unrelated song. For a repoint, the B like it added is undone whenever A stays liked after B's like may have landed (after a restore, when the quota rejects A's unlike, or when B's like errors but landed). A restore (~51 units) and a B undo (~51 units) aren't in the plan's estimate. The default daily YouTube quota is 10,000 units; the plan warns above that, and `--limit` slices a run.
 
 `--include-playable` is off by default: it removes a real like you made (an official MV, a fan upload) so that YT Music shows only the audio track. Keep individual findings out with `skip`.
 
 #### If something goes wrong
 
-- **Restored** — A was re-liked and the finding marked `skipped`, because A's unlike didn't take or the LM check didn't match. The run stops; re-scan both sources and run `compare-likes` before syncing again. Separately, for a repoint `sync` tries to unlike the B it liked, whenever A stays liked (also when A's unlike was rejected by the quota, or B's like errored but landed). If that undo fails or can't be confirmed, `sync` names the video and stops the run: B may still be liked, so unlike it on YouTube by hand if you don't want it (no song is lost).
-- **Stale finding** — A is no longer liked on YouTube (you unliked it after the scan), or B is already liked, so the finding is `skipped` without any write.
+- **Restored** — A was re-liked and the finding marked `skipped`, because A's unlike didn't take or the Liked songs check didn't match. The run stops; re-scan both sources and run `compare-likes` before syncing again. If undoing a repoint's B like fails or can't be confirmed, `sync` names the video and stops: B may still be liked, so unlike it on YouTube by hand if you don't want it (no song is lost).
+- **Stale finding** — A is no longer liked (you unliked it after the scan), or B is already liked, so the finding is `skipped` without any write.
 - **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike: the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
 - **Aborted or quota stop** — remaining actions stay `open`. Re-scan both sources, run `compare-likes`, then `sync` again.
 
@@ -188,7 +194,7 @@ uv run likesurgeon skip 812 813                    # keep sync off findings #812
 - `skipped` is terminal until you run `likesurgeon unskip <id>`: a finding becomes `skipped` when B's like didn't land, a precheck failed, A was restored, or you ran `skip`.
 - `skipped` carries over to later diagnoses: each `compare-likes` copies it onto the matching new finding.
 
-#### Safety
+#### When sync refuses or stops
 
 Sync refuses (exit 1) when:
 - any of its own writes happened after the older of the two scans the diagnosis is built from — a write between scans misaligns them, and one after both makes the diagnosis stale. Re-scan both sources, then `compare-likes`.
@@ -196,18 +202,19 @@ Sync refuses (exit 1) when:
 - the YT Music auth probe fails (needs `browser.json`; re-run `auth ytmusic --from-browser`).
 
 Sync stops early when:
-- YT Music liked songs can't be read (no baseline to check against),
+- YT Music Liked songs can't be read (no baseline to check against),
 - an action had to be restored, or a repoint's B like couldn't be confirmed undone (the diagnosis' pairs can't be trusted), or
 - YouTube's daily quota runs out.
 
-The run exits non-zero if any action failed or it stopped early on an unreadable LM, after a restore, or after an unconfirmed B undo.
+The run exits non-zero if any action failed or it stopped early on an unreadable Liked songs list, after a restore, or after an unconfirmed B undo.
 
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
-- **Order alignment has limits.** YT Music exposes no backing id, so pairing relies on order. Gaps where the LM and LL counts differ stay report-only, and the YouTube API may stop at 5000 likes (unverified) — if your library is that large, compare the counts in `doctor` with what you see on YouTube.
-- **YouTube Data API quota.** A scan of 5000 likes is ~200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list?part=status,contentDetails` for ghost detection — `contentDetails` adds the `regionRestriction` field for region-blocked detection, but `videos.list` is 1 unit/call regardless of `part=` selection); the default daily quota is 10000. Re-scanning a few times a day is fine.
-- **Music classification is heuristic.** Edge cases will misclassify (e.g. covers labelled "tutorial"). The `compare-likes` output is a *starting point* for review, not a verdict — only `sync` writes, and only write-eligible findings.
+- **Order alignment has limits.** YT Music exposes no backing id, so pairing relies on order. Gaps where the two counts differ stay report-only, and the YouTube API may stop at 5000 likes (unverified) — if your library is that large, compare the counts in `doctor` with what you see on YouTube.
+- **Google sign-in may expire weekly.** While your OAuth consent screen is in *Testing* (the setup `auth youtube` prints), Google expires its refresh tokens after 7 days; if YouTube calls start failing with an auth error, run `likesurgeon auth youtube` again.
+- **YouTube Data API quota.** A scan of 5000 likes costs about 200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list` calls for availability and region checks); the default daily quota is 10,000. Re-scanning a few times a day is fine.
+- **Music classification is heuristic.** `unrendered_music` relies on title and channel heuristics, so edge cases will misclassify (e.g. covers labelled "tutorial"). Findings are a starting point for review — only `sync` writes, and only write-eligible findings.
 
 ## Local layout
 
@@ -215,26 +222,33 @@ The run exits non-zero if any action failed or it stopped early on an unreadable
 ~/.like-surgeon/
 ├── like-surgeon.sqlite        # all snapshots, tracks, diagnoses
 ├── browser.json               # ytmusicapi browser-header auth
-├── youtube-oauth-client.json  # downloaded Google OAuth client (Desktop app)
-├── youtube-token.json         # persisted refresh token (created on first auth)
-└── config.json                # optional user settings (e.g. {"region": "KR"})
+├── youtube-oauth-client.json  # your Google OAuth client (Desktop app)
+├── youtube-token.json         # refresh token (created on first auth)
+└── config.json                # optional settings, e.g. {"region": "KR"}
 ```
+
+## Roadmap
+
+Releases and the full changelog: [GitHub Releases](https://github.com/zeikar/like-surgeon/releases). Next: **1.0** — a local web UI.
 
 ## Development
 
 ```bash
+git clone https://github.com/zeikar/like-surgeon.git
+cd like-surgeon
+uv sync --extra dev
 uv run ruff check .
 uv run ruff format .
 uv run pytest               # unit suite; live e2e is deselected by default
 uv run pytest -m live       # opt-in: needs a logged-in music.youtube.com session
 ```
 
-The `live` test extracts cookies from a real browser, writes `browser.json`, and round-trips a `fetch_liked_songs` call against `music.youtube.com`. Set `LIKESURGEON_LIVE_BROWSER=firefox` (or any other supported name) to point it at a browser other than `chrome`.
+The `live` test extracts cookies from a real browser, writes `browser.json`, and round-trips a `fetch_liked_songs` call against `music.youtube.com`. Set `LIKESURGEON_LIVE_BROWSER=firefox` (or any other supported name) to use a browser other than `chrome`.
 
 For deeper context:
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system overview, module responsibilities, DB schema, key design decisions.
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — test strategy, auth setup details, debugging tips, release process.
+- [docs/ARCHITECTURE.md](https://github.com/zeikar/like-surgeon/blob/main/docs/ARCHITECTURE.md) — system overview, module responsibilities, DB schema, key design decisions.
+- [docs/DEVELOPMENT.md](https://github.com/zeikar/like-surgeon/blob/main/docs/DEVELOPMENT.md) — test strategy, auth setup details, debugging tips, release process.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/zeikar/like-surgeon/blob/main/LICENSE).

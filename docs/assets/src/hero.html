@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- Source of docs/assets/hero.jpg and social-preview.jpg. Art: hero-art.jpg (generated). Re-render: render.sh. -->
+<html>
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: transparent; }
+  .hero {
+    position: relative; width: 1280px; height: 640px; overflow: hidden;
+    background: #15181c url("hero-art.jpg") right center / cover no-repeat;
+    font-family: Inter, -apple-system, "Segoe UI", sans-serif; color: #eef2f5;
+  }
+  /* Keep the text side calm even where the art bleeds left. */
+  .hero::before {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, rgba(14,17,20,.92) 0%, rgba(14,17,20,.75) 38%, rgba(14,17,20,0) 58%);
+  }
+  .copy { position: absolute; left: 84px; top: 50%; transform: translateY(-50%); width: 560px; }
+  .eyebrow { font: 600 14px/1 Inter, sans-serif; letter-spacing: .16em; text-transform: uppercase; color: #5fd4c6; }
+  h1 { margin-top: 18px; font-size: 76px; line-height: 1; font-weight: 800; letter-spacing: -.035em; }
+  h1 .like { color: #ff6f61; }
+  .tagline { margin-top: 22px; max-width: 490px; font-size: 22px; line-height: 1.45; color: #c4ccd3; font-weight: 500; text-wrap: balance; }
+  .tagline b { color: #eef2f5; font-weight: 700; }
+  .install {
+    display: inline-flex; align-items: center; gap: 12px; margin-top: 34px; padding: 13px 18px;
+    border: 1px solid rgba(95,212,198,.35); border-radius: 10px; background: rgba(95,212,198,.08);
+    font: 500 19px/1 "JetBrains Mono", ui-monospace, monospace; color: #dff7f3;
+  }
+  .install span { color: #5fd4c6; }
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="copy">
+    <div class="eyebrow">YouTube Music · liked songs</div>
+    <h1><span class="like">like</span>-surgeon</h1>
+    <p class="tagline">Back up your liked songs, find <b>relinked</b>, <b>duplicate</b> and <b>dead</b> likes, and fix the ones it can prove.</p>
+    <div class="install"><span>$</span> uv tool install likesurgeon</div>
+  </div>
+</div>
+</body>
+</html>
