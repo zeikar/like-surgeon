@@ -3,11 +3,13 @@
 ``plan`` and ``summarize`` are pure; ``resolve_video_ids`` looks up the video
 ids ``plan`` needs. A write-eligible pair finding (A = the YouTube video whose
 like backs an LM entry, B = the ``videoId`` that entry shows) becomes one of
-two actions, which ``sync_dispatch.execute`` runs:
+two actions, which ``sync_dispatch.execute`` runs. An ``unrendered_music``
+finding (a like YT Music doesn't show) can become a third, ``relike``:
 
   * ``repoint``: like B, confirm, unlike A, confirm.
   * ``unlike_shadow`` (B is already liked): confirm B is liked, unlike A,
     confirm.
+  * ``relike``: unlike A and like it again, so YT Music picks it up.
 """
 
 from __future__ import annotations
@@ -22,12 +24,13 @@ from sqlalchemy.orm import Session
 from .diagnosis import (
     ISSUE_RENDERED_AS_OTHER,
     ISSUE_SHADOW_DUPLICATE,
+    ISSUE_UNRENDERED_MUSIC,
     PAIR_ISSUE_TYPES,
     is_write_eligible,
 )
 from .models import DiagnosisItem, Track
 
-ActionKind = Literal["repoint", "unlike_shadow"]
+ActionKind = Literal["repoint", "unlike_shadow", "relike"]
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -72,12 +75,13 @@ def resolve_video_ids(session: Session, items: list[DiagnosisItem]) -> dict[int,
 @dataclass(frozen=True)
 class PlannedAction:
     """A = the YouTube video to unlike; B = the YT Music track to keep —
-    liked first by ``repoint``, confirmed already liked by ``unlike_shadow``."""
+    liked first by ``repoint``, confirmed already liked by ``unlike_shadow``.
+    ``None`` for ``relike``, which has no B."""
 
     item_id: int
     kind: ActionKind
     a_video_id: str
-    b_video_id: str
+    b_video_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,8 @@ def plan(
     availability: dict[int, bool | None],
     *,
     include_playable: bool = False,
+    relike_unrendered: bool = False,
+    ll_index: dict[int, int] | None = None,
 ) -> tuple[list[PlannedAction], list[SkipRecord]]:
     """Map pair findings to actions / skips. Pure — no I/O, no client calls.
 
@@ -116,12 +122,32 @@ def plan(
     Acting on a playable A removes a like the user made, hence the opt-in.
     Pairs that aren't write-eligible, are opted out, or lack a video id
     become ``SkipRecord``s.
+
+    ``unrendered_music`` → ``relike`` only with ``relike_unrendered``; without
+    it they are dropped silently. ``ll_index`` maps A's track id to its LL
+    position (0 = newest). Relikes follow the pair actions, highest position
+    first: a re-like moves the video to the top of both lists, so doing the
+    oldest first keeps their relative order. Missing positions go last.
     """
     actions: list[PlannedAction] = []
     skips: list[SkipRecord] = []
+    relikes: list[tuple[int, PlannedAction]] = []
+    positions = ll_index or {}
 
     for item in items:
-        if item.status in ("applied", "skipped") or item.issue_type not in PAIR_ISSUE_TYPES:
+        if item.status in ("applied", "skipped"):
+            continue
+        if item.issue_type == ISSUE_UNRENDERED_MUSIC:
+            if not relike_unrendered:
+                continue
+            a = _video_id_for(video_ids, item.source_track_id)
+            if a is None:
+                skips.append(SkipRecord(item.id, "relike", "no video_id for A (YouTube video)"))
+            else:
+                position = positions.get(item.source_track_id, -1)
+                relikes.append((position, PlannedAction(item.id, "relike", a_video_id=a)))
+            continue
+        if item.issue_type not in PAIR_ISSUE_TYPES:
             continue
         kind: ActionKind = (
             "unlike_shadow" if item.issue_type == ISSUE_SHADOW_DUPLICATE else "repoint"
@@ -142,6 +168,7 @@ def plan(
         else:
             actions.append(PlannedAction(item_id=item.id, kind=kind, a_video_id=a, b_video_id=b))
 
+    actions += [action for _, action in sorted(relikes, key=lambda r: -r[0])]
     return actions, skips
 
 
@@ -167,7 +194,7 @@ def _video_id_for(video_ids: dict[int, str], track_id: int | None) -> str | None
     return video_ids.get(track_id)
 
 
-_ACTION_KINDS: tuple[ActionKind, ...] = ("repoint", "unlike_shadow")
+_ACTION_KINDS: tuple[ActionKind, ...] = ("repoint", "unlike_shadow", "relike")
 
 # YouTube quota: ``videos.rate`` = 50 units, ``videos.getRating`` = 1. A
 # restore (re-like + getRating = 51) only runs after a failed LM check, so it
@@ -179,6 +206,8 @@ _QUOTA_COST: dict[ActionKind, int] = {
     "repoint": 104,
     # getRating B + getRating A + unlike A + getRating A
     "unlike_shadow": 53,
+    # getRating A + unlike A + getRating A + like A + getRating A
+    "relike": 103,
 }
 
 
@@ -192,6 +221,10 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
     lines += [f"  {kind}: {by_action[kind]}" for kind in _ACTION_KINDS]
     lines.append(f"  skipped: {len(skips)}")
     lines += [f"    {kind}: {by_skip[kind]}" for kind in _ACTION_KINDS if by_skip[kind]]
+    if by_action["relike"]:
+        lines.append(
+            "  note: each relike moves that video to the top of Liked videos and Liked songs"
+        )
     lines.append(f"Estimated YouTube quota: {quota} units (daily default {_DAILY_QUOTA})")
     if quota > _DAILY_QUOTA:
         lines.append(

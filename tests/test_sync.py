@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -16,7 +18,7 @@ from likesurgeon.diagnosis import (
 from likesurgeon.models import DiagnosisItem
 from likesurgeon.sync import PlannedAction, SkipRecord, plan, resolve_video_ids, summarize
 
-from .sync_items import make_diagnosis, pair, repoint, unlike_shadow
+from .sync_items import make_diagnosis, pair, relike, repoint, unlike_shadow, unrendered
 
 # ---------------------------------------------------------------------------
 # resolve_video_ids
@@ -66,7 +68,7 @@ def _plan(
     session: Session,
     items: list[DiagnosisItem],
     availability: dict[int, bool | None] | None = None,
-    **kwargs: bool,
+    **kwargs: Any,
 ) -> tuple[list[PlannedAction], list[SkipRecord]]:
     return plan(items, resolve_video_ids(session, items), availability or {}, **kwargs)
 
@@ -165,6 +167,63 @@ def test_plan_skips_pairs_without_video_ids(session: Session) -> None:
     assert all("no video_id" in s.reason for s in skips)
 
 
+def test_plan_drops_unrendered_music_without_the_flag(session: Session) -> None:
+    item = unrendered(session, make_diagnosis(session))
+
+    assert _plan(session, [item]) == ([], [])
+
+
+def test_plan_relikes_unrendered_music_with_the_flag(session: Session) -> None:
+    item = unrendered(session, make_diagnosis(session))
+
+    assert _plan(session, [item], relike_unrendered=True) == ([relike(item)], [])
+
+
+def test_plan_drops_finished_unrendered_items_even_with_the_flag(session: Session) -> None:
+    diag = make_diagnosis(session)
+    items = [
+        unrendered(session, diag, status="applied"),
+        unrendered(session, diag, status="skipped"),
+    ]
+
+    assert _plan(session, items, relike_unrendered=True) == ([], [])
+
+
+def test_plan_skips_unrendered_music_without_a_video_id(session: Session) -> None:
+    item = unrendered(session, make_diagnosis(session), a=None)
+
+    actions, skips = _plan(session, [item], relike_unrendered=True)
+
+    assert actions == []
+    assert [(s.item_id, s.kind) for s in skips] == [(item.id, "relike")]
+    assert "no video_id" in skips[0].reason
+
+
+def test_plan_relikes_oldest_first_after_the_pair_actions(session: Session) -> None:
+    diag = make_diagnosis(session)
+    p = pair(session, diag, ISSUE_RELINKED)
+    t0, t1, t2 = (unrendered(session, diag, a=f"a{i}") for i in range(3))
+    ll_index = {t0.source_track_id: 0, t1.source_track_id: 5, t2.source_track_id: 2}
+
+    actions, _ = _plan(session, [t0, t1, p, t2], relike_unrendered=True, ll_index=ll_index)
+
+    assert actions == [repoint(p), relike(t1, "a1"), relike(t2, "a2"), relike(t0, "a0")]
+
+
+def test_plan_relike_missing_from_ll_index_sorts_last(session: Session) -> None:
+    diag = make_diagnosis(session)
+    unknown, known = unrendered(session, diag, a="u"), unrendered(session, diag, a="k")
+
+    actions, _ = _plan(
+        session,
+        [unknown, known],
+        relike_unrendered=True,
+        ll_index={known.source_track_id: 1},
+    )
+
+    assert actions == [relike(known, "k"), relike(unknown, "u")]
+
+
 # ---------------------------------------------------------------------------
 # summarize
 # ---------------------------------------------------------------------------
@@ -194,3 +253,21 @@ def test_summarize_warns_when_plan_exceeds_daily_quota() -> None:
 
     assert "exceeds the default daily quota" in summarize(actions, [])
     assert "exceeds" not in summarize(actions[:96], [])  # 96 × 104 = 9984
+
+
+def test_summarize_counts_relikes_and_quota() -> None:
+    actions = [
+        PlannedAction(1, "relike", "a1"),
+        PlannedAction(2, "relike", "a2"),
+        PlannedAction(3, "repoint", "a3", "b3"),
+    ]
+
+    s = summarize(actions, [])
+
+    assert "\n  relike: 2" in s
+    assert "310 units" in s  # 2 × 103 + 104
+
+
+def test_summarize_notes_like_order_only_when_relikes_are_planned() -> None:
+    assert "like order" not in summarize([PlannedAction(1, "repoint", "a", "b")], [])
+    assert "top of Liked videos" in summarize([PlannedAction(1, "relike", "a")], [])

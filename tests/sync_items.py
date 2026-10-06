@@ -7,7 +7,7 @@ from itertools import count
 
 from sqlalchemy.orm import Session
 
-from likesurgeon.diagnosis import ISSUE_RELINKED
+from likesurgeon.diagnosis import ISSUE_RELINKED, ISSUE_UNRENDERED_MUSIC
 from likesurgeon.models import Diagnosis, DiagnosisItem, Track
 from likesurgeon.sync import PlannedAction
 
@@ -62,9 +62,31 @@ def pair(
     return item
 
 
+def unrendered(
+    session: Session, diag: Diagnosis, *, a: str | None = "A", status: str = "open"
+) -> DiagnosisItem:
+    """A liked YouTube video ``a`` that YT Music doesn't show (no related track)."""
+    item = DiagnosisItem(
+        diagnosis_id=diag.id,
+        issue_type=ISSUE_UNRENDERED_MUSIC,
+        confidence=1.0,
+        reason="diagnosis-time evidence",
+        source_track_id=_make_track(session, a).id,
+        related_track_id=None,
+        status=status,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
 def repoint(item: DiagnosisItem, a: str = "A", b: str = "B") -> PlannedAction:
     return PlannedAction(item.id, "repoint", a_video_id=a, b_video_id=b)
 
 
 def unlike_shadow(item: DiagnosisItem, a: str = "A", b: str = "B") -> PlannedAction:
     return PlannedAction(item.id, "unlike_shadow", a_video_id=a, b_video_id=b)
+
+
+def relike(item: DiagnosisItem, a: str = "A") -> PlannedAction:
+    return PlannedAction(item.id, "relike", a_video_id=a, b_video_id=None)
