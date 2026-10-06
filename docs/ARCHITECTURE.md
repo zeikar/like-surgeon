@@ -34,10 +34,10 @@ Two providers feed into one local SQLite database. Every snapshot is point-in-ti
 ## Data flow
 
 1. **Auth** — `auth ytmusic` writes `browser.json` from a logged-in browser cookie store. `auth youtube` runs the OAuth Desktop-app consent flow and persists `youtube-token.json`.
-2. **Scan** — `scan ytmusic` / `scan youtube-likes` fetch the user's likes, translate provider dicts via per-source translators in [src/likesurgeon/snapshot.py](../src/likesurgeon/snapshot.py), upsert `Track` rows (deduplicated by `(source, dedupe_key)`), and write a fresh `Snapshot` plus N `SnapshotItem` rows. Each snapshot is independent — old ones are never mutated.
+2. **Scan** — `scan ytmusic` / `scan youtube-likes` fetch the user's likes, translate provider dicts via per-source translators in [src/likesurgeon/snapshot.py](../src/likesurgeon/snapshot.py), upsert `Track` rows (deduplicated by `(source, dedupe_key)`), and write a fresh `Snapshot` plus N `SnapshotItem` rows. Each snapshot is independent — old ones are never mutated. `scan youtube-likes` then calls `YouTubeClient.fetch_likes_item_count()` (2 quota units) and warns when the playlist's `itemCount` exceeds the items scanned ([notes/hidden-likes.md](notes/hidden-likes.md)); a failed lookup only warns.
 3. **Compare** — `compare-likes` loads the latest snapshot from each source, aligns them ([`align.py`](../src/likesurgeon/align.py): LIS anchors on LM entries whose `videoId` is in LL, then in-order pairing of the gaps), fetches `videos.list` metadata for the pairs for the same-recording check, and persists the run as a `Diagnosis` plus per-finding `DiagnosisItem` rows ([`pipeline.py`](../src/likesurgeon/pipeline.py)). It also warns when one of our own `sync` attempts ran after the older scan, and carries `'skipped'` statuses forward.
 4. **Inspect** — `issues`, `doctor`, `diff`, and `export` all read from local DB only. No outbound network.
-5. **Sync** — `sync` refuses if a sync attempt happened after the older scan, plans actions from the latest diagnosis (pure `sync.plan`; read-only `sync_preflight` checks), then `sync_dispatch.execute` writes to YouTube (repoint / unlike_shadow), reads the whole LM after each unlike, restores A on a mismatch, and records one `SyncAttempt` per call/check, committed immediately.
+5. **Sync** — `sync` refuses if a sync attempt happened after the older scan, plans actions from the latest diagnosis (pure `sync.plan`; read-only `sync_preflight` checks), then `sync_dispatch.execute` writes to YouTube (repoint / unlike_shadow, and with `--relike-unrendered` `relike`: unlike and re-like an unrendered A, oldest first), reads the whole LM after each unlike, restores A on a mismatch (a relike instead stops the run), and records one `SyncAttempt` per call/check, committed immediately.
 
 ## Modules
 
@@ -48,18 +48,18 @@ Two providers feed into one local SQLite database. Every snapshot is point-in-ti
 | [`db.py`](../src/likesurgeon/db.py) | SQLAlchemy engine, session factory, schema init | `init_db` creates tables on first run; `_migrate_in_place` adds new nullable columns idempotently on every engine build |
 | [`models.py`](../src/likesurgeon/models.py) | ORM tables: `Track`, `Snapshot`, `SnapshotItem`, `Diagnosis`, `DiagnosisItem` | See "Database schema" below |
 | [`ytmusic_client.py`](../src/likesurgeon/ytmusic_client.py) | Browser-header auth + ytmusicapi wrapper | Cookie extraction via [browser-cookie3](https://pypi.org/project/browser-cookie3/) |
-| [`youtube_client.py`](../src/likesurgeon/youtube_client.py) | OAuth + YouTube Data API v3 wrapper | `_videos_list` fetches `part=status,contentDetails` for ghost detection |
+| [`youtube_client.py`](../src/likesurgeon/youtube_client.py) | OAuth + YouTube Data API v3 wrapper | `_videos_list` fetches `part=status,contentDetails` for ghost detection; `fetch_likes_item_count` reads the likes playlist's `itemCount` (channels.list + playlists.list) |
 | [`snapshot.py`](../src/likesurgeon/snapshot.py) | Translator dispatch + `Track`/`Snapshot`/`SnapshotItem` writer | Only writer of `Track` rows |
-| [`classify.py`](../src/likesurgeon/classify.py) | Music-candidate heuristic for YouTube videos | Pure-functional |
+| [`classify.py`](../src/likesurgeon/classify.py) | Music-candidate heuristic for YouTube videos (covers, soundtracks, remasters, remixes, … since 0.12) | Pure-functional; result stored per `SnapshotItem` at scan time |
 | [`normalize.py`](../src/likesurgeon/normalize.py) | Canonical-key generation (lowercase, strip decorations) | Pure-functional |
 | [`align.py`](../src/likesurgeon/align.py) | LL → LM order alignment → backing map (`AlignmentResult`), same-recording check | Pure-functional |
 | [`pipeline.py`](../src/likesurgeon/pipeline.py) | `compare-likes` orchestration: align, fetch pair metadata, persist, drift, carry-over | Returns warnings; prints nothing |
 | [`compare.py`](../src/likesurgeon/compare.py) | Shared helpers: `dedupe_by_video_id`, `CanonicalMetadata` | Used by drift, doctor, `align`, `youtube_client` |
 | [`drift.py`](../src/likesurgeon/drift.py) | Snapshot-pair metadata-drift detector | Same-source, two snapshots |
 | [`diagnosis.py`](../src/likesurgeon/diagnosis.py) | `AlignmentResult` → `Diagnosis` + `DiagnosisItem` rows (findings, write eligibility) | Carries `'skipped'` forward from earlier diagnoses |
-| [`sync.py`](../src/likesurgeon/sync.py) | `sync` planner (pure): findings → `repoint` / `unlike_shadow`, skips, quota estimate | `--include-playable` gate |
-| [`sync_dispatch.py`](../src/likesurgeon/sync_dispatch.py) | `execute`: write calls, `getRating` confirms, full-LM check, restore, `SyncAttempt` audit | Continue-on-error; per-write commits; stops on quota exhaustion or unreadable LM |
-| [`sync_preflight.py`](../src/likesurgeon/sync_preflight.py) | Read-only DB checks: stale-scan warnings, sync-attempts-since-older-scan (refusal), stranded videos | |
+| [`sync.py`](../src/likesurgeon/sync.py) | `sync` planner (pure): findings → `repoint` / `unlike_shadow` / `relike`, skips, quota estimate | `--include-playable` and `--relike-unrendered` gates; relikes ordered oldest first |
+| [`sync_dispatch.py`](../src/likesurgeon/sync_dispatch.py) | `execute`: write calls, `getRating` confirms, full-LM check, restore, relike flow (`_SyncRun.relike`), `SyncAttempt` audit | Continue-on-error; per-write commits; stops on quota exhaustion or unreadable LM |
+| [`sync_preflight.py`](../src/likesurgeon/sync_preflight.py) | Read-only DB checks: stale-scan warnings, sync-attempts-since-older-scan (refusal), stranded videos (relike rows included) | |
 | [`fileio.py`](../src/likesurgeon/fileio.py) | Atomic `0o600` credential-file writes (`browser.json`, `youtube-token.json`) | |
 | [`diff.py`](../src/likesurgeon/diff.py) | Two-snapshot membership diff (added / removed / shared) | Identity = `track_id` |
 | [`export.py`](../src/likesurgeon/export.py) | Snapshot → JSON (other formats are future plug-ins) | |
@@ -99,7 +99,7 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 
 **Why `align.py` is pure-functional.** Alignment is the most complex logic in the codebase. Keeping it I/O-free means it is unit-testable with small synthetic lists (`tests/test_align.py`); `pipeline.py` does the `videos.list` fetch and degraded-mode handling (no auth → every pair report-only).
 
-**Why every unlike is followed by an LM check.** Unliking a wrongly paired A would remove an unrelated song, and in testing a write occasionally returned 2xx without taking effect. `sync_dispatch` therefore confirms each write with `getRating`, reads the full LM after each unlike (repoint: unchanged; unlike_shadow: one B fewer), re-reads once after 15 s on a mismatch, and otherwise re-likes A. Rows are committed per write so a kill leaves a trace (`interrupted`, stranded list), and `sync` refuses when its own writes post-date the older scan.
+**Why every unlike is followed by an LM check.** Unliking a wrongly paired A would remove an unrelated song, and in testing a write occasionally returned 2xx without taking effect. `sync_dispatch` therefore confirms each write with `getRating`, reads the full LM after each unlike (repoint: unchanged; unlike_shadow: one B fewer), re-reads once after 15 s on a mismatch, and otherwise re-likes A. A relike (opt-in) is the exception: it unlikes and re-likes on purpose, so its check accepts nothing removed and at most one entry added, never restores, and stops the run when anything is removed, more than one entry is added, or its unlike or re-like can't be confirmed. Rows are committed per write so a kill leaves a trace (`interrupted`, stranded list), and `sync` refuses when its own writes post-date the older scan.
 
 **Why playable originals need `--include-playable`.** For an MV or fan upload shown as its audio track, repointing/unliking removes a like the user made on purpose, so it is opt-in per run and individually suppressible with `skip`.
 
@@ -122,4 +122,5 @@ The regex is intentionally shape-only; "ZZ" or other unassigned-but-shape-valid 
 - **0.9**: `fuzzy_threshold` config key (`~/.like-surgeon/config.json`, default `85`, range `[0, 100]`) exposes the RapidFuzz cross-source match cutoff. Motivated by `f9DzbpmWbMo`, which scored 81.7 against its likely YT Music match — just below the 85 default. Lowering raises `possible_pointer_drift` false-positive risk; drift sync is fail-safe (like-then-unlike) but can still mis-match on lowered thresholds. (removed in the alignment redesign)
 - **0.10**: `ytmusic_only` sync — `yt_like` (one `videos.rate("like")` + `videos.getRating` verify; verify-miss → terminal `'skipped'`). Known self-revert with `ytm_dedupe` on the dup it spawns. (removed in the alignment redesign)
 - **0.11**: LL→LM alignment redesign — `compare-likes` aligns by order and `sync` is reduced to `repoint` / `unlike_shadow` with an LM check and restore; the matcher stages, `yt_like`, `ytm_dedupe`, `ytm_like`, scan `--limit` and `fuzzy_threshold` are removed.
+- **0.12**: opt-in `relike` action (`sync --relike-unrendered`) for `unrendered_music`; the music heuristic covers covers, 歌ってみた, soundtracks, remasters, remixes and more (re-scan `youtube-likes` after upgrading); `scan youtube-likes` warns when YouTube's likes `itemCount` exceeds the items scanned.
 - **1.0**: local web UI / Electron app

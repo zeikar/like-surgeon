@@ -6,7 +6,7 @@ Status: **implemented in 0.11.0** — spec r3 (2026-10-05). r1 was the proposal;
 
 - **YouTube Liked videos (LL) is the only store of likes. YouTube Music Liked songs (LM) is a rendering of LL**: same order, filtered to what YT Music shows, each entry displayed as its playable track. A relinked song is not a like that moved from A to B — it is A's YouTube like *shown as* B.
 - Because the order is preserved, **aligning the two lists by position recovers which YouTube like backs each LM entry** — no library-wide title matching.
-- Inconsistencies reduce to a few cases on one data structure (the backing map), fixed by **two write actions** — *re-point* (like B → confirm → unlike A) and *unlike a shadow* — each followed by **one LM-wide check that re-likes A if LM doesn't look as expected**.
+- Inconsistencies reduce to a few cases on one data structure (the backing map), fixed by **write actions** — *re-point* (like B → confirm → unlike A), *unlike a shadow* and, opt-in, `relike` of an unrendered like — each followed by **one LM-wide check that re-likes A if LM doesn't look as expected** (a `relike` never restores; it only stops the run).
 - Replaces the matcher stages (fuzzy / canonical / Stage 4), `yt_like`, `ytm_dedupe`, the `ytm_like` toggle, and the gates/guards added to contain them.
 
 ## 1. Why the current model fails
@@ -57,7 +57,7 @@ For an LL video A rendered as B (availability from scan time):
 | `rendered_as_other` | A ≠ B, A playable, B not liked | report; re-point with `--include-playable` |
 | `shadow_duplicate` | A ≠ B, B also liked (LM shows B twice) | **unlike shadow** if A unavailable; playable A only with `--include-playable` |
 | `dead_unrendered` | A unavailable, not rendered | report (hold — a restriction can lift) |
-| `unrendered_music` | A playable, looks like music, not rendered | report |
+| `unrendered_music` | A playable, looks like music, not rendered | report; **`relike`** with `--relike-unrendered` |
 | `unbacked_lm_entry` | LM entry with no backing / not write-eligible | report, never act |
 | `metadata_drift` | unchanged | — |
 
@@ -73,7 +73,15 @@ For an LL video A rendered as B (availability from scan time):
 **unlike shadow (A behind B)** — 53 units
 1. `getRating(B)` must be `like`, `getRating(A)` must be `like` and LM must currently show B at least twice; `videos.rate(A, none)`; wait 5 s; `getRating(A)` must be `none`.
 
-**Post-action LM check (both actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1. If LM doesn't match (re-read once after 15 s), **re-like A** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting). A re-point that leaves A liked after B's like may have landed (restore, quota-rejected unlike, B's like erroring) also unlikes B (`rate(B, none)` + `getRating`, failure reported as `left_liked`). Any action needing a restore, successful or not, stops the run: the mismatch means an order-derived pair was wrong, so later pairs may be too — re-scan and re-run `compare-likes`.
+**`relike` (A)** — 103 units (`--relike-unrendered`; `unrendered_music` only)
+0. `getRating(A)` must be `like` (else skip, no writes).
+1. `videos.rate(A, none)`; `getRating(A)` must be `none`.
+2. `videos.rate(A, like)`; `getRating(A)` must be `like`, tried twice if unconfirmed.
+3. LM check (below). If the unlike wasn't confirmed, a `relike_unlike_pending` row is committed before the check and A gets one recovery re-like after it, because a late unlike would otherwise go unnoticed (an unrendered A gives the check nothing to catch).
+
+Expected LM: nothing removed, at most one entry added. +1 → applied; no change (one 15 s re-read first) → skipped, terminal, when every call was clean; anything removed or more than one entry added, or an unconfirmed unlike or re-like, stops the run with A liked (or reported stranded); an unlike call that errored but landed just ends `failed`. Oldest first, because re-liking moves the video to the top of both lists.
+
+**Post-action LM check (all actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1; `relike` → nothing removed, at most one entry added (it never counts as a restore: a failed check stops the run with A liked). If LM doesn't match (re-read once after 15 s), **re-like A (restore)** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting). A re-point that leaves A liked after B's like may have landed (restore, quota-rejected unlike, B's like erroring) also unlikes B (`rate(B, none)` + `getRating`, failure reported as `left_liked`). Any action needing a restore, successful or not, stops the run: the mismatch means an order-derived pair was wrong, so later pairs may be too — re-scan and re-run `compare-likes`.
 
 **Never** call `rate_song(INDIFFERENT)` or `rate_song(LIKE)` on YT Music. (Outside `sync`, `rate_song(INDIFFERENT)` is the only way to unlike a *deleted* LL video — `videos.rate` 404s on it; verified 2026-10-06. Deleted means unrendered, so there is no LM entry to revert.)
 
@@ -102,7 +110,7 @@ Old diagnoses stay readable; old issue types exist only on old rows. No schema c
 
 1. Does the LL API stop at 5000 likes? If so, alignment must bound itself to the overlapping range.
 2. Do renders of unavailable videos flicker between reads? Seen twice, both right after nearby writes; the post-action check covers it if real.
-3. Does an un-like/re-like make YT Music render an `unrendered_music` video (the old `ytm_like` premise)? **Mostly yes** (2026-10-06): all 26 unrendered LL videos were un-liked and re-liked on YouTube, oldest first, each step confirmed by `getRating`; LM lost nothing and gained 18 — 13 rendered as themselves, 5 as an official track (another `videoId`). The 8 still unrendered: 6 memes / general videos and 2 game-BGM uploads. Two caveats: the music heuristic had classified all 26 as non-music (covers, 歌ってみた, OST arrangements), so none had been an `unrendered_music` finding; and the 5 official-track renders came back as 2 `rendered_as_other` (same-recording check failed: other channel, title in another script) plus 3 `unbacked_lm_entry`, because re-liked videos that stayed unrendered sit in the same gaps (*k* ≠ *m*).
+3. Does an un-like/re-like make YT Music render an `unrendered_music` video (the old `ytm_like` premise)? **Mostly yes** (2026-10-06): all 26 unrendered LL videos were un-liked and re-liked on YouTube, oldest first, each step confirmed by `getRating`; LM lost nothing and gained 18 — 13 rendered as themselves, 5 as an official track (another `videoId`). The 8 still unrendered: 6 memes / general videos and 2 game-BGM uploads. Two caveats: the music heuristic had classified all 26 as non-music (covers, 歌ってみた, OST arrangements), so none had been an `unrendered_music` finding; and the 5 official-track renders came back as 2 `rendered_as_other` (same-recording check failed: other channel, title in another script) plus 3 `unbacked_lm_entry`, because re-liked videos that stayed unrendered sit in the same gaps (*k* ≠ *m*). 0.12 ships this as `sync --relike-unrendered`, and the music heuristic now covers the families that were missed (covers, 歌ってみた, soundtracks, remasters, remixes and more).
 4. Ordering on other accounts (one J-pop/anime-heavy account so far).
 
 ## 8. Rollout

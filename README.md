@@ -63,7 +63,7 @@ Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — n
 | `rendered_as_other` | A isn't known to be unavailable (usually a playable MV or fan upload) but YT Music shows B | repoint with `--include-playable`, if A is known to play |
 | `shadow_duplicate` | A is shown as B while B is also liked, so B appears twice | **unlike A**; a playable A only with `--include-playable` |
 | `dead_unrendered` | A is unavailable and not shown in YT Music at all | report only — [clean up by hand](https://github.com/zeikar/like-surgeon#dead-likes) |
-| `unrendered_music` | A plays fine and looks like music, but isn't shown in YT Music | report only |
+| `unrendered_music` | A plays fine and looks like music, but isn't shown in YT Music | **`relike`** with `--relike-unrendered` (off by default) |
 | `unbacked_lm_entry` | a YT Music entry with no like that can be pinned behind it | report only |
 | `metadata_drift` | a title or artist changed between two scans | report only |
 
@@ -128,7 +128,7 @@ likesurgeon scan ytmusic          # YT Music Liked songs
 likesurgeon scan youtube-likes    # YouTube Liked videos
 ```
 
-Scans always fetch the full list; aligning a truncated list would be meaningless. Each scan is stored as a snapshot with the metadata of that moment, so a later rename doesn't rewrite history.
+Scans always fetch the full list; aligning a truncated list would be meaningless. Each scan is stored as a snapshot with the metadata of that moment, so a later rename doesn't rewrite history. After `scan youtube-likes` stores the snapshot it asks YouTube for the likes playlist's `itemCount` (2 quota units) and warns if that is higher than the videos scanned — see [YouTube's count can be a few higher](https://github.com/zeikar/like-surgeon#caveats) below; a failed lookup only warns.
 
 > **Cookie staleness.** YT Music cookies extracted from Chrome can go stale within about an hour. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
 
@@ -170,6 +170,7 @@ likesurgeon sync                        # apply, with confirmation prompt
 likesurgeon sync --yes                  # apply, no prompt
 likesurgeon sync --limit 20 --yes       # apply the first 20 actions only
 likesurgeon sync --include-playable     # also act on MV / fan-upload originals
+likesurgeon sync --relike-unrendered    # also re-like music YT Music doesn't show
 likesurgeon skip 812 813                # keep sync off findings #812 and #813 (unskip to undo)
 ```
 
@@ -177,21 +178,24 @@ likesurgeon skip 812 813                # keep sync off findings #812 and #813 (
 |---|---|---|---|
 | repoint | `relinked`; `rendered_as_other` with `--include-playable` | confirm A still liked and B not yet liked, like B, confirm, unlike A, confirm, full Liked songs check | 104 units |
 | unlike_shadow | `shadow_duplicate` (A unavailable, or playable with `--include-playable`) | confirm B liked and shown ≥2×, confirm A still liked, unlike A, confirm, full Liked songs check | 53 units |
+| relike | `unrendered_music`, with `--relike-unrendered` | confirm A liked, unlike A, confirm, like A, confirm, full Liked songs check | 103 units |
 
-**Check and restore.** After each unlike `sync` reads the whole Liked songs list again: a repoint expects it unchanged, an unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed, because unliking a wrongly paired A would otherwise silently drop an unrelated song. For a repoint, the B like it added is undone whenever A stays liked after B's like may have landed (after a restore, when the quota rejects A's unlike, or when B's like errors but landed). A restore (~51 units) and a B undo (~51 units) aren't in the plan's estimate. The default daily YouTube quota is 10,000 units; the plan warns above that, and `--limit` slices a run.
+**Check and restore.** After each unlike `sync` reads the whole Liked songs list again: a repoint expects it unchanged, an unlike_shadow expects one B fewer (B still shown). On a mismatch it re-reads once after 15 s; if it still differs, A is re-liked and confirmed, because unliking a wrongly paired A would otherwise silently drop an unrelated song. A `relike` expects nothing removed and at most one entry added (one 15 s re-read if nothing was added): one added is `applied`, none is `skipped`; it never restores, and "Sync stops early when" below lists what stops the run. For a repoint, the B like it added is undone whenever A stays liked after B's like may have landed (after a restore, when the quota rejects A's unlike, or when B's like errors but landed). A restore (~51 units) and a B undo (~51 units) aren't in the plan's estimate. The default daily YouTube quota is 10,000 units; the plan warns above that, and `--limit` slices a run.
 
 `--include-playable` is off by default: it removes a real like you made (an official MV, a fan upload) so that YT Music shows only the audio track. Keep individual findings out with `skip`.
+
+`--relike-unrendered` is off by default too: re-liking moves a video to the top of both Liked videos and Liked songs, so it runs oldest first, which keeps the re-liked videos in their original relative order. If YT Music still doesn't show the video afterwards, the finding is `skipped` (`unskip` to retry). Whether a video counts as music is decided when `scan youtube-likes` runs, so re-scan it after upgrading before expecting `unrendered_music` to change.
 
 #### If something goes wrong
 
 - **Restored** — A was re-liked and the finding marked `skipped`, because A's unlike didn't take or the Liked songs check didn't match. The run stops; re-scan both sources and run `compare-likes` before syncing again. If undoing a repoint's B like fails or can't be confirmed, `sync` names the video and stops: B may still be liked, so unlike it on YouTube by hand if you don't want it (no song is lost).
 - **Stale finding** — A is no longer liked (you unliked it after the scan), or B is already liked, so the finding is `skipped` without any write.
-- **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike: the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
+- **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike (a `relike` whose unlike wasn't confirmed counts until a later re-like is): the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
 - **Aborted or quota stop** — remaining actions stay `open`. Re-scan both sources, run `compare-likes`, then `sync` again.
 
 #### State model
 
-- `skipped` is terminal until you run `likesurgeon unskip <id>`: a finding becomes `skipped` when B's like didn't land, a precheck failed, A was restored, or you ran `skip`.
+- `skipped` is terminal until you run `likesurgeon unskip <id>`: a finding becomes `skipped` when B's like didn't land, a precheck failed, A was restored, a video re-liked by `relike` still isn't shown in YT Music, or you ran `skip`.
 - `skipped` carries over to later diagnoses: each `compare-likes` copies it onto the matching new finding.
 
 #### When sync refuses or stops
@@ -203,10 +207,11 @@ Sync refuses (exit 1) when:
 
 Sync stops early when:
 - YT Music Liked songs can't be read (no baseline to check against),
-- an action had to be restored, or a repoint's B like couldn't be confirmed undone (the diagnosis' pairs can't be trusted), or
+- an action had to be restored, or a repoint's B like couldn't be confirmed undone (the diagnosis' pairs can't be trusted),
+- a `relike` went wrong: Liked songs lost an entry or gained more than one, or its unlike or re-like couldn't be confirmed (A is re-liked if possible), or
 - YouTube's daily quota runs out.
 
-The run exits non-zero if any action failed or it stopped early on an unreadable Liked songs list, after a restore, or after an unconfirmed B undo.
+The run exits non-zero if any action failed or it stopped early on an unreadable Liked songs list, after a restore, after an unconfirmed B undo, or after a `relike` went wrong.
 
 ## Caveats
 
@@ -215,7 +220,7 @@ The run exits non-zero if any action failed or it stopped early on an unreadable
 - **YouTube's count can be a few higher than a scan's.** An old like can stay in Liked videos (the app and the playlist's `itemCount` count it) while the API reports the video as not liked and leaves it out of `playlistItems`, so scans never see it. It has been seen mostly with videos marked made for kids; they still show in the web list, with no "show unavailable videos" option. Un-liking and re-liking such a video on YouTube fixes it: the API lists it again, and YT Music may pick it up too. `scan youtube-likes` warns with the difference; [how to find them](https://github.com/zeikar/like-surgeon/blob/main/docs/notes/hidden-likes.md).
 - **Google sign-in may expire weekly.** While your OAuth consent screen is in *Testing* (the setup `auth youtube` prints), Google expires its refresh tokens after 7 days; if YouTube calls start failing with an auth error, run `likesurgeon auth youtube` again.
 - **YouTube Data API quota.** A scan of 5000 likes costs about 200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list` calls for availability and region checks); the default daily quota is 10,000. Re-scanning a few times a day is fine.
-- **Music classification is heuristic.** `unrendered_music` relies on title and channel heuristics, so edge cases will misclassify (e.g. covers labelled "tutorial"). Findings are a starting point for review — only `sync` writes, and only write-eligible findings.
+- **Music classification is heuristic.** `unrendered_music` relies on title and channel heuristics, so edge cases will misclassify (e.g. covers labelled "tutorial"). It recognises covers, 歌ってみた (sung covers), soundtracks, remasters, remixes and similar; classification is stored at scan time, so re-scan `youtube-likes` after an upgrade. Findings are a starting point for review — only `sync` writes, and only write-eligible findings.
 
 ## Local layout
 

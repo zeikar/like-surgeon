@@ -49,7 +49,7 @@ Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<modul
 Three recurring patterns:
 
 - **In-memory DB** — every test that touches SQL uses `session` fixture (clean schema per test). The fixture creates a fresh `:memory:` engine, calls `init_db`, and yields a session.
-- **`tests/fake_account.py`** — `FakeAccount` is one fake account seen through both sync clients (the YouTube and YT Music surfaces `sync_dispatch` uses). It holds LL ratings (newest first) plus a render map; LM is derived from LL on every read (each liked video shows as `renders.get(video, video)`, or not at all for `None`), so a write changes LM the way the rendering model says. That is what `test_sync_dispatch.py` and the `sync` tests in `test_cli.py` rely on to exercise the post-unlike LM check and restore. Knobs simulate a like that doesn't land, an unlike that lands late, write/read errors, quota exhaustion and stale or failing LM reads.
+- **`tests/fake_account.py`** — `FakeAccount` is one fake account seen through both sync clients (the YouTube and YT Music surfaces `sync_dispatch` uses). It holds LL ratings (newest first) plus a render map; LM is derived from LL on every read (each liked video shows as `renders.get(video, video)`, or not at all for `None`), so a write changes LM the way the rendering model says. That is what `test_sync_dispatch.py` and the `sync` tests in `test_cli.py` rely on to exercise the post-unlike LM check and restore. Knobs simulate a like that doesn't land, an unlike that lands late, a re-liked video that renders (`relike_renders`: video → what LM shows once a like on it lands, `None` for not shown), write/read errors, quota exhaustion and stale or failing LM reads.
 - **`LIKE_SURGEON_HOME` override** — CLI tests set the env var to `tmp_path` so `Config.load()` reads a test-controlled directory:
   ```python
   @pytest.fixture
@@ -106,6 +106,7 @@ The refresh token rotates silently after that. If you delete `youtube-token.json
 YouTube Data API default daily quota is **10,000 units**. A single full scan of 5,000 likes costs ~200 units:
 - ~100 units for `playlistItems.list` (50 items per page, 1 unit/call)
 - ~100 units for `videos.list?part=status,contentDetails` (50 video ids per call, 1 unit/call regardless of `part` selection)
+- 2 units for the likes `itemCount` lookup (`channels.list` + `playlists.list`) that `scan youtube-likes` runs afterwards
 
 So you can comfortably re-scan dozens of times per day. If you hit the quota, the YouTube client surfaces a clean `quota_exceeded` reason rather than a traceback.
 
