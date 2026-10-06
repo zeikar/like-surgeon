@@ -23,10 +23,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from functools import cache
 
-# Each entry is (regex, weight, label). Regexes are compiled IGNORECASE.
-_POSITIVE_SIGNALS: tuple[tuple[str, int, str], ...] = (
+# Each entry is (regex, weight, label). Compiled below with IGNORECASE | ASCII.
+_POSITIVE_PATTERNS: tuple[tuple[str, int, str], ...] = (
     (r"\bofficial\s+music\s+video\b", 3, "official music video"),
     (r"\bofficial\s+mv\b", 3, "official mv"),
     (r"\bofficial\s+audio\b", 3, "official audio"),
@@ -76,7 +75,7 @@ _ARTIST_DASH_TITLE_RE = re.compile(r"^[^-\n]{2,}\s+-\s+[^-\n]{2,}$")
 _DESCRIPTION_PROVIDED_RE = re.compile(r"provided to youtube by", re.IGNORECASE)
 
 # Strong negative signals that override most positive signals.
-_NEGATIVE_SIGNALS: tuple[tuple[str, int, str], ...] = (
+_NEGATIVE_PATTERNS: tuple[tuple[str, int, str], ...] = (
     (r"\bvlog\b", 3, "vlog"),
     (r"\btutorial\b", 3, "tutorial"),
     (r"\bhow(?:\s+|-)to\b", 2, "how-to"),
@@ -101,6 +100,20 @@ _NEGATIVE_SIGNALS: tuple[tuple[str, int, str], ...] = (
 _POSITIVE_THRESHOLD = 2
 
 
+def _compile(
+    patterns: tuple[tuple[str, int, str], ...],
+) -> tuple[tuple[re.Pattern[str], int, str], ...]:
+    # ASCII: Hangul/kana/kanji aren't word characters, so ``\\b`` still fires
+    # next to a glued Latin token ("로그인bgm", "夜明けcover").
+    return tuple(
+        (re.compile(rx, re.IGNORECASE | re.ASCII), weight, label) for rx, weight, label in patterns
+    )
+
+
+_POSITIVE_SIGNALS = _compile(_POSITIVE_PATTERNS)
+_NEGATIVE_SIGNALS = _compile(_NEGATIVE_PATTERNS)
+
+
 @dataclass(frozen=True)
 class Classification:
     is_music_candidate: bool
@@ -108,24 +121,14 @@ class Classification:
     reason: str
 
 
-@cache
-def _ascii_bounds(pattern: str) -> str:
-    """Swap ``\\b`` for ASCII-only lookarounds.
-
-    Hangul/kana/kanji count as word characters, so ``\\b`` never fires between
-    them and a glued Latin token ("로그인bgm"). A ``\\b`` before a letter or ``(``
-    opens a token; any other ``\\b`` closes one.
-    """
-    pattern = re.sub(r"\\b(?=[a-z(])", "(?<![a-z0-9])", pattern)
-    return pattern.replace("\\b", "(?![a-z0-9])")
-
-
-def _scan(text: str, signals: tuple[tuple[str, int, str], ...]) -> tuple[int, list[str]]:
+def _scan(
+    text: str, signals: tuple[tuple[re.Pattern[str], int, str], ...]
+) -> tuple[int, list[str]]:
     """Return (total_weight, matched_labels) for ``signals`` against ``text``."""
     total = 0
     labels: list[str] = []
     for pattern, weight, label in signals:
-        if re.search(_ascii_bounds(pattern), text, flags=re.IGNORECASE):
+        if pattern.search(text):
             total += weight
             labels.append(label)
     return total, labels

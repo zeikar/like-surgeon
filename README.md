@@ -128,7 +128,7 @@ likesurgeon scan ytmusic          # YT Music Liked songs
 likesurgeon scan youtube-likes    # YouTube Liked videos
 ```
 
-Scans always fetch the full list; aligning a truncated list would be meaningless. Each scan is stored as a snapshot with the metadata of that moment, so a later rename doesn't rewrite history. After `scan youtube-likes` stores the snapshot it asks YouTube for the likes playlist's `itemCount` (2 quota units) and warns if that is higher than the videos scanned — see [YouTube's count can be a few higher](https://github.com/zeikar/like-surgeon#caveats) below; a failed lookup only warns.
+Scans always fetch the full list; aligning a truncated list would be meaningless. Each scan is stored as a snapshot with the metadata of that moment, so a later rename doesn't rewrite history. After `scan youtube-likes` stores the snapshot it asks YouTube for the likes playlist's `itemCount` (1 quota unit) and warns if that is higher than the videos scanned — see [YouTube's count can be a few higher](https://github.com/zeikar/like-surgeon#caveats) below; a failed lookup only warns.
 
 > **Cookie staleness.** YT Music cookies extracted from Chrome can go stale within about an hour. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
 

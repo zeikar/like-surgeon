@@ -156,6 +156,13 @@ def test_fetch_likes_item_count_queries_resolved_playlist_id():
     assert c._fake_playlists.calls == [{"part": "contentDetails", "id": "LL_real_id"}]
 
 
+def test_a_scan_resolves_the_likes_playlist_id_once():
+    c = _FakeClient([{"items": []}], likes_item_count=3)
+    c.fetch_liked_videos()
+    c.fetch_likes_item_count()
+    assert len(c._fake_channels.calls) == 1
+
+
 @pytest.mark.parametrize(
     "response",
     [{"items": []}, {"items": [{"contentDetails": {}}]}],

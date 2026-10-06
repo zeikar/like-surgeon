@@ -106,7 +106,7 @@ The refresh token rotates silently after that. If you delete `youtube-token.json
 YouTube Data API default daily quota is **10,000 units**. A single full scan of 5,000 likes costs ~200 units:
 - ~100 units for `playlistItems.list` (50 items per page, 1 unit/call)
 - ~100 units for `videos.list?part=status,contentDetails` (50 video ids per call, 1 unit/call regardless of `part` selection)
-- 2 units for the likes `itemCount` lookup (`channels.list` + `playlists.list`) that `scan youtube-likes` runs afterwards
+- 1 unit for the likes `itemCount` lookup (`playlists.list`; the likes playlist id was already resolved by the fetch) that `scan youtube-likes` runs afterwards
 
 So you can comfortably re-scan dozens of times per day. If you hit the quota, the YouTube client surfaces a clean `quota_exceeded` reason rather than a traceback.
 

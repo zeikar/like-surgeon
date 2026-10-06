@@ -77,6 +77,7 @@ _LM = Counter[str | None]
 
 _VERIFY_WAIT_SECONDS = 5
 _LM_RECHECK_WAIT_SECONDS = 15
+_RECHECKED = f"also after a {_LM_RECHECK_WAIT_SECONDS}s re-read"
 _LM_DIFF_SHOWN = 6
 
 # Starts the reason of a ``videos.rate`` row the daily quota rejected, i.e.
@@ -354,9 +355,6 @@ class _SyncRun:
         read A's rating (nothing was written)."""
         item_id, a = action.item_id, action.a_video_id
 
-        def relike_a() -> bool:
-            return self._relike(item_id, a, like_kind="relike_like", verify_kind="relike_verify")
-
         a_liked = self._has_rating(
             item_id, "relike_precheck", a, "like", miss="skipped", wait=False
         )
@@ -368,7 +366,10 @@ class _SyncRun:
                 return "failed"  # nothing was sent
             unliked = self._has_rating(item_id, "relike_unlike_verify", a, "none", miss="failed")
             # Once more if unconfirmed: the unlike may have landed after the first like.
-            liked = relike_a() or relike_a()
+            liked = any(
+                self._relike(item_id, a, like_kind="relike_like", verify_kind="relike_verify")
+                for _ in range(2)
+            )
 
             after = self._lm_after(
                 item_id,
@@ -376,41 +377,38 @@ class _SyncRun:
                 kind="relike_lm_check",
             )
             mismatch = after is not None and (bool(before - after) or (after - before).total() > 1)
+            # A or LM may not be as planned (unconfirmed unlike or re-like, wrong LM): re-scan.
+            stop = not liked or unliked is not True or mismatch
+            outcome: _DispatchOutcome
+            if stop or after is None or rated != "ok":  # an errored unlike that landed: no stop
+                outcome = "failed"
+            else:
+                outcome = "applied" if after != before else "skipped"
+
             if after is not None:
-                rechecked = f"also after a {_LM_RECHECK_WAIT_SECONDS}s re-read"
                 if mismatch:
                     status, reason = (
                         "failed",
                         "expected nothing removed and at most one entry added, got "
-                        f"{_lm_diff(before, after)} ({rechecked})",
+                        f"{_lm_diff(before, after)} ({_RECHECKED})",
                     )
                 elif after != before:
                     status, reason = "applied", f"as expected: {_lm_diff(before, after)}"
-                elif liked and unliked and rated == "ok":  # the outcome is ``skipped``
+                elif outcome == "skipped":
                     status, reason = (
                         "skipped",
-                        f"re-liked; YT Music still doesn't show it (no change, {rechecked})",
+                        f"re-liked; YT Music still doesn't show it (no change, {_RECHECKED})",
                     )
                 else:
-                    status, reason = "applied", f"no change ({rechecked})"
+                    status, reason = "applied", f"no change ({_RECHECKED})"
                 self._record(item_id, "relike_lm_check", status, reason)
-
+                if not stop:
+                    self.lm = after
             if not liked:
                 self.left_unliked.append(a)
+            if stop:
                 self.aborted = self.aborted or RELIKE_STOP
-                return "failed"
-            if unliked is not True:
-                self.aborted = self.aborted or RELIKE_STOP  # state unclear: re-scan
-                return "failed"
-            if after is None:
-                return "failed"
-            if mismatch:
-                self.aborted = self.aborted or RELIKE_STOP
-                return "failed"
-            self.lm = after
-            if rated != "ok":
-                return "failed"  # the unlike errored yet landed: A and LM are as planned
-            return "applied" if after != before else "skipped"
+            return outcome
 
     def _unlike_and_check(
         self,
@@ -543,8 +541,7 @@ class _SyncRun:
             item_id,
             "lm_check",
             "failed",
-            f"expected {_lm_diff(before, expected)}, got {_lm_diff(before, after)} "
-            f"(also after a {_LM_RECHECK_WAIT_SECONDS}s re-read)",
+            f"expected {_lm_diff(before, expected)}, got {_lm_diff(before, after)} ({_RECHECKED})",
         )
         return False
 

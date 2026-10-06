@@ -272,6 +272,7 @@ class YouTubeClient:
     ) -> None:
         self._client_secrets_path = client_secrets_path
         self._token_path = token_path
+        self._likes_playlist_id: str | None = None
 
     def authorize(self) -> None:
         """Run the InstalledApp flow once, persist the resulting token JSON.
@@ -389,14 +390,19 @@ class YouTubeClient:
         1 quota unit (negligible vs. the 100 a full like-list scan uses).
 
         Falls back to ``"LL"`` if the channel resource doesn't expose the
-        id (e.g. brand-account edge cases).
+        id (e.g. brand-account edge cases). Memoized, so the fetch and the
+        ``itemCount`` check of one scan resolve it once.
         """
+        if self._likes_playlist_id:
+            return self._likes_playlist_id
         resp = service.channels().list(part="contentDetails", mine=True).execute()
         for item in resp.get("items") or []:
             likes = (item.get("contentDetails") or {}).get("relatedPlaylists", {}).get("likes")
             if likes:
+                self._likes_playlist_id = likes
                 return likes
-        return LIKED_VIDEOS_FALLBACK_PLAYLIST_ID
+        self._likes_playlist_id = LIKED_VIDEOS_FALLBACK_PLAYLIST_ID
+        return self._likes_playlist_id
 
     def fetch_liked_videos(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Fetch up to ``limit`` items (``None``: all) from the user's Liked videos playlist.
@@ -426,7 +432,8 @@ class YouTubeClient:
         return items[:limit]
 
     def fetch_likes_item_count(self) -> int:
-        """Return the likes playlist's ``itemCount`` (2 quota units).
+        """Return the likes playlist's ``itemCount`` (1 quota unit once the
+        playlist id is resolved, else 2).
 
         This is the number the YouTube app shows, which includes likes that
         ``playlistItems.list`` hides (spec section 7 Q3, README caveat). A
