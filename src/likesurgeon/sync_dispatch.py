@@ -21,23 +21,41 @@ restore, successful or not, or whose B undo fails stops the run: a mismatch
 means an order-derived pair was wrong, and later pairs of the same diagnosis
 may be too.
 
+A ``relike`` (an ``unrendered_music`` finding: a like YT Music doesn't show)
+unlikes A and likes it again so YT Music re-evaluates it, trying the like
+twice if it isn't confirmed. Once the unlike was sent, the LM check always
+runs; it accepts LM unchanged (A still not shown) or one entry added, and
+anything else — an entry gone, or more than one added — stops the run. An
+unlike that wasn't confirmed may land after the re-like, and an unrendered A
+gives the check nothing to catch: a ``relike_unlike_pending`` row marks A
+possibly unliked, A gets one recovery re-like after the check, and the run
+stops. An A whose re-like (or recovery) can't be confirmed is reported in
+``left_unliked`` and stops the run too. ``restored`` is untouched — nothing
+is undone. ``relike_like`` and ``relike_lm_check`` are not settling rows for
+``stranded_unliked_video_ids``: only a ``relike_verify`` proves the like
+landed, and LM can't show an unrendered A either way.
+
 Invariants:
   * ``DiagnosisItem.reason`` is never modified — that field is the
     diagnosis-time evidence. Sync-side detail lives on ``SyncAttempt.reason``.
   * One ``SyncAttempt`` per HTTP call, per LM check and per skip decision,
     plus an ``interrupted`` row when anything stops an action once A's
-    unlike call has started.
+    unlike call has started, and a ``relike_unlike_pending`` row when a
+    relike's unlike isn't confirmed.
   * ``DiagnosisItem.status`` flips to ``"applied"`` only when every call for
-    the action succeeded and the LM check passed. ``"skipped"`` is terminal:
-    B's like didn't land, a precheck didn't hold, or A's like was restored
-    (the unlike didn't take, or the LM check failed) — a retry would repeat
-    it (``likesurgeon unskip`` re-opens one). Anything else stays
-    ``"open"``. A *planner-level* skip only writes an audit row; the item
-    stays ``"open"``.
-  * Commit cadence: per action, plus right after every write call, so a
-    crash or kill at any later point still leaves that row on disk — the
-    next ``sync`` refuses until a re-scan, and an A whose unlike was sent
-    shows in ``stranded_unliked_video_ids``.
+    the action succeeded and the LM check passed — for a relike, a re-like
+    that is retried and then confirmed still counts. ``"skipped"`` is terminal:
+    B's like didn't land, a precheck didn't hold, A's like was restored
+    (the unlike didn't take, or the LM check failed), or a re-liked video
+    YT Music still doesn't show — a retry would repeat it
+    (``likesurgeon unskip`` re-opens one). Anything else stays ``"open"``.
+    A *planner-level* skip only writes an audit row; the item stays
+    ``"open"``.
+  * Commit cadence: per action, plus right after every write call and every
+    ``relike_unlike_pending`` row, so a crash or kill at any later point
+    still leaves that row on disk — the next ``sync`` refuses until a
+    re-scan, and an A whose unlike was sent shows in
+    ``stranded_unliked_video_ids``.
 """
 
 from __future__ import annotations
@@ -48,7 +66,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, assert_never
 
 from sqlalchemy.orm import Session
 
@@ -81,6 +99,13 @@ RESTORED_STOP = (
     "re-scan both sources and re-run compare-likes"
 )
 
+# ``ExecResult.aborted`` after a relike that didn't end in a known state.
+RELIKE_STOP = (
+    "a relike didn't go as planned — its unlike didn't take, its re-like couldn't be "
+    "confirmed, or YT Music liked songs changed in another way — so the lists may differ "
+    "from the diagnosis; re-scan both sources and re-run compare-likes"
+)
+
 
 @dataclass(frozen=True)
 class ExecResult:
@@ -95,11 +120,13 @@ class ExecResult:
     # Actions left 'open' without any API call because the run stopped early
     # (quota, or ``aborted``).
     unattempted: int = 0
-    # Videos unliked on YouTube whose restoring re-like failed or couldn't be
-    # confirmed — possibly liked nowhere now; the user re-likes them by hand.
+    # Videos unliked on YouTube whose restoring re-like, or a relike's re-like,
+    # failed or couldn't be confirmed — possibly liked nowhere now; the user
+    # re-likes them by hand.
     left_unliked: tuple[str, ...] = ()
-    # Why the run stopped early: YT Music liked songs couldn't be read, or an
-    # action was restored (the diagnosis' pairs can't be trusted any more).
+    # Why the run stopped early: YT Music liked songs couldn't be read, an
+    # action was restored (the diagnosis' pairs can't be trusted any more), or
+    # a relike didn't go as planned (``RELIKE_STOP``).
     aborted: str | None = None
     # Videos a repoint of this run liked on YouTube (B) that stayed liked or
     # may have: the undo failed or couldn't be confirmed (A restored, A's unlike
@@ -157,8 +184,12 @@ def execute(
             break
         if action.kind == "repoint":
             outcome = run.repoint(action, before)
-        else:
+        elif action.kind == "unlike_shadow":
             outcome = run.unlike_shadow(action, before)
+        elif action.kind == "relike":
+            outcome = run.relike(action, before)
+        else:
+            assert_never(action.kind)
         outcomes[outcome] += 1
         if (run.restored, len(run.left_unliked)) != restored_before and run.aborted is None:
             run.aborted = RESTORED_STOP
@@ -317,6 +348,91 @@ class _SyncRun:
             expected=expected,
             still_liked=before,
         )
+
+    def relike(self, action: PlannedAction, before: _LM) -> _DispatchOutcome:
+        """Unlike A and like it again, so YT Music re-evaluates a like it
+        doesn't show: ``applied`` once LM gained one entry, ``skipped`` if LM
+        didn't change, else ``failed``. A ``failed`` relike stops the run when
+        A or LM may not have ended as planned — not when only the unlike call
+        errored yet landed (A and LM are as planned) or the precheck couldn't
+        read A's rating (nothing was written)."""
+        item_id, a = action.item_id, action.a_video_id
+
+        def relike_a() -> bool:
+            return self._relike(item_id, a, like_kind="relike_like", verify_kind="relike_verify")
+
+        a_liked = self._has_rating(
+            item_id, "relike_precheck", a, "like", miss="skipped", wait=False
+        )
+        if not a_liked:
+            return _unconfirmed(a_liked)
+        with self._interrupt_marks_a(item_id, a):
+            rated = self._rate(item_id, "relike_unlike", a, "none")
+            if rated == "quota":
+                return "failed"  # nothing was sent
+            unliked = self._has_rating(item_id, "relike_unlike_verify", a, "none", miss="failed")
+            # Once more if unconfirmed: the unlike may have landed after the first like.
+            liked = relike_a() or relike_a()
+            if unliked is not True:
+                self._record(
+                    item_id,
+                    "relike_unlike_pending",
+                    "failed",
+                    "unlike not confirmed before the re-like, so it may still land — A counts "
+                    "as possibly unliked until a recovery re-like is confirmed",
+                )
+                # On disk before the LM check's wait, as a write's row is: from here
+                # only a later confirmed re-like settles A, even after a hard kill.
+                self.session.commit()
+
+            after = self._lm_after(
+                item_id,
+                lambda lm: not before - lm and (lm - before).total() == 1,
+                kind="relike_lm_check",
+            )
+            mismatch = after is not None and (bool(before - after) or (after - before).total() > 1)
+            if after is not None:
+                rechecked = f"also after a {_LM_RECHECK_WAIT_SECONDS}s re-read"
+                if mismatch:
+                    status, reason = (
+                        "failed",
+                        "expected nothing removed and at most one entry added, got "
+                        f"{_lm_diff(before, after)} ({rechecked})",
+                    )
+                elif after != before:
+                    status, reason = "applied", f"as expected: {_lm_diff(before, after)}"
+                elif liked and unliked and rated == "ok":  # the outcome is ``skipped``
+                    status, reason = (
+                        "skipped",
+                        f"re-liked; YT Music still doesn't show it (no change, {rechecked})",
+                    )
+                else:
+                    status, reason = "applied", f"no change ({rechecked})"
+                self._record(item_id, "relike_lm_check", status, reason)
+
+            if not liked:
+                self.left_unliked.append(a)
+                self.aborted = self.aborted or RELIKE_STOP
+                return "failed"
+            if unliked is not True:
+                # The unlike may land after the re-like, and an unrendered A gives
+                # LM nothing to catch: only this re-like's confirmed verify clears
+                # the pending row. An unlike landing even after this verify goes
+                # undetected — no fixed number of re-likes closes that gap, and
+                # ``_settle``'s restore has the same kind.
+                if not relike_a():
+                    self.left_unliked.append(a)
+                self.aborted = self.aborted or RELIKE_STOP
+                return "failed"
+            if after is None:
+                return "failed"
+            if mismatch:
+                self.aborted = self.aborted or RELIKE_STOP
+                return "failed"
+            self.lm = after
+            if rated != "ok":
+                return "failed"  # the unlike errored yet landed: A and LM are as planned
+            return "applied" if after != before else "skipped"
 
     def _unlike_and_check(
         self,

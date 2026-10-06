@@ -31,6 +31,7 @@ class FakeAccount:
         self.quota_after: int | None = None  # YouTube calls beyond this many hit the quota
         self.lm_read_errors: dict[int, BaseException] = {}  # 1-based LM read number -> raised
         self.lm_stale_reads: set[int] = set()  # 1-based LM reads that repeat the previous one
+        self.relike_renders: dict[str, str | None] = {}  # renders[v] once a like on unliked v lands
         # Recordings.
         self.rate_calls: list[tuple[str, str]] = []
         self.rating_reads: list[str] = []
@@ -62,6 +63,8 @@ class FakeAccount:
                 self.liked.remove(video_id)
         elif video_id not in self.liked and video_id not in self.like_does_not_land:
             self.liked.insert(0, video_id)
+            if video_id in self.relike_renders:
+                self.renders[video_id] = self.relike_renders[video_id]
         if (video_id, rating) in self.rate_errors_after_landing:
             raise YouTubeWriteError(video_id, rating, "timed out")
 

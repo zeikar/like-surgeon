@@ -7,6 +7,8 @@ says (docs/design/ll-lm-alignment.md §2).
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,16 +19,18 @@ from likesurgeon.models import DiagnosisItem, SyncAttempt
 from likesurgeon.sync import PlannedAction, SkipRecord
 from likesurgeon.sync_dispatch import (
     QUOTA_REJECTED,
+    RELIKE_STOP,
     RESTORED_STOP,
     ROLLBACK_STOP,
     ExecResult,
     execute,
 )
 from likesurgeon.sync_preflight import stranded_unliked_video_ids
+from likesurgeon.youtube_client import YouTubeWriteError
 from likesurgeon.ytmusic_client import UnexpectedResponseError
 
 from .fake_account import FakeAccount
-from .sync_items import make_diagnosis, pair, repoint, unlike_shadow
+from .sync_items import make_diagnosis, pair, relike, repoint, unlike_shadow, unrendered
 
 
 @pytest.fixture(autouse=True)
@@ -907,3 +911,369 @@ def test_a_stale_lm_read_is_settled_by_the_re_read(session: Session, sleeps: lis
     assert 15 in sleeps
     assert acct.lm_reads == 3
     assert _steps(session, item.id)[-1] == ("lm_check", "applied")
+
+
+# ---------------------------------------------------------------------------
+# execute — relike
+# ---------------------------------------------------------------------------
+
+_RELIKED = [
+    ("relike_precheck", "applied"),
+    ("relike_unlike", "applied"),
+    ("relike_unlike_verify", "applied"),
+    ("relike_like", "applied"),
+    ("relike_verify", "applied"),
+]
+# The unlike still reads 'like', then lands right after the re-like's verify.
+_LATE_UNLIKE = [
+    *_RELIKED[:2],
+    ("relike_unlike_verify", "failed"),
+    ("relike_like", "applied"),
+    ("relike_verify", "applied"),
+    ("relike_unlike_pending", "failed"),
+    ("relike_lm_check", "applied"),
+]
+
+
+def _unrendered_a(
+    session: Session,
+    shown_as: str | None = "A",
+    account: type[FakeAccount] = FakeAccount,
+) -> tuple[DiagnosisItem, FakeAccount]:
+    """LL ``x A y`` with A liked but not shown in YT Music; once re-liked, A
+    shows as ``shown_as``."""
+    item = unrendered(session, make_diagnosis(session))
+    session.commit()
+    acct = account(["x", "A", "y"], renders={"A": None})
+    acct.relike_renders = {"A": shown_as}
+    return item, acct
+
+
+@pytest.mark.parametrize(("shown_as", "diff"), [("A", "+A"), ("T", "+T")])
+def test_relike_makes_yt_music_show_a(
+    session: Session, sleeps: list[float], shown_as: str, diff: str
+) -> None:
+    item, acct = _unrendered_a(session, shown_as)
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("A", "none"), ("A", "like")]
+    assert acct.liked[0] == "A"  # the re-like moved it to the top
+    session.refresh(item)
+    assert item.status == "applied"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_RELIKED, ("relike_lm_check", "applied")]
+    assert rows[-1].reason == f"as expected: {diff}"
+    assert sleeps == [5, 5]  # no LM re-read
+    assert acct.lm_reads == 2  # baseline, check
+
+
+def test_a_relike_yt_music_still_does_not_show_is_skipped(
+    session: Session, sleeps: list[float]
+) -> None:
+    item, acct = _unrendered_a(session, None)
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert "A" in acct.liked
+    session.refresh(item)
+    assert item.status == "skipped"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_RELIKED, ("relike_lm_check", "skipped")]
+    assert "still doesn't show" in rows[-1].reason
+    assert sleeps == [5, 5, 15]
+    assert acct.lm_reads == 3
+
+
+def test_a_relike_whose_a_is_no_longer_liked_is_skipped_without_writes(session: Session) -> None:
+    item = unrendered(session, make_diagnosis(session))
+    session.commit()
+    acct = FakeAccount(["x", "y"])
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    assert _steps(session, item.id) == [("relike_precheck", "skipped")]
+
+
+def test_a_relike_whose_like_does_not_land_leaves_a_unliked(session: Session) -> None:
+    """Both re-like attempts read back unliked. The LM check still runs — an
+    unrendered A leaves it unchanged — then A is reported and the run stops."""
+    item, acct = _unrendered_a(session)
+    acct.like_does_not_land = {"A"}
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0, failed=1, skipped=0, left_unliked=("A",), aborted=RELIKE_STOP
+    )
+    assert "A" not in acct.liked
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        *_RELIKED[:3],
+        ("relike_like", "applied"),
+        ("relike_verify", "failed"),
+        ("relike_like", "applied"),
+        ("relike_verify", "failed"),
+        ("relike_lm_check", "applied"),
+    ]
+    assert rows[-1].reason.startswith("no change")
+    assert stranded_unliked_video_ids(session) == {"A"}
+
+
+def test_a_relike_whose_first_like_errors_is_retried(session: Session) -> None:
+    class FirstLikeErrors(FakeAccount):
+        def rate_video(self, video_id: str, rating: str) -> None:
+            if (video_id, rating) == ("A", "like") and (video_id, rating) not in self.rate_calls:
+                self.rate_calls.append((video_id, rating))
+                raise YouTubeWriteError(video_id, rating, "boom")
+            super().rate_video(video_id, rating)
+
+    item, acct = _unrendered_a(session, account=FirstLikeErrors)
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("A", "none"), ("A", "like"), ("A", "like")]
+    assert _steps(session, item.id) == [
+        *_RELIKED[:3],
+        ("relike_like", "failed"),
+        *_RELIKED[3:],
+        ("relike_lm_check", "applied"),
+    ]
+
+
+@pytest.mark.parametrize("lands_after", [2, 99])
+def test_an_unconfirmed_relike_unlike_gets_a_recovery_relike(
+    session: Session, lands_after: int
+) -> None:
+    """getRating(A) still reads 'like' after the unlike, which may land late —
+    with 2, right after the re-like's verify, so A is liked nowhere and an
+    unrendered A gives the LM check nothing to catch. A is re-liked once more
+    after the check; the run stops either way."""
+    item, acct = _unrendered_a(session)
+    acct.unlike_lands_late = {"A": lands_after}
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0, aborted=RELIKE_STOP)
+    assert acct.rate_calls == [("A", "none"), ("A", "like"), ("A", "like")]
+    assert "A" in acct.liked
+    session.refresh(item)
+    assert item.status == "open"
+    assert _steps(session, item.id) == [
+        *_LATE_UNLIKE,
+        ("relike_like", "applied"),
+        ("relike_verify", "applied"),
+    ]
+    assert stranded_unliked_video_ids(session) == frozenset()
+
+
+@pytest.mark.parametrize("recovery_breaks", ["like_does_not_land", "quota"])
+def test_a_failed_recovery_relike_leaves_a_unliked(session: Session, recovery_breaks: str) -> None:
+    item, acct = _unrendered_a(session)
+    acct.unlike_lands_late = {"A": 2}
+    if recovery_breaks == "like_does_not_land":
+        acct.like_does_not_land = {"A"}
+        tail = [("relike_like", "applied"), ("relike_verify", "failed")]
+    else:
+        # Rejected outright, so no verify follows: the pending row, not the
+        # earlier confirmed verify, is A's newest settling row.
+        acct.quota_after = 5  # precheck, unlike, its verify, re-like, its verify
+        tail = [("relike_like", "failed")]
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        quota_exhausted=recovery_breaks == "quota",
+        left_unliked=("A",),
+        aborted=RELIKE_STOP,
+    )
+    assert "A" not in acct.liked
+    assert _steps(session, item.id) == [*_LATE_UNLIKE, *tail]
+    assert stranded_unliked_video_ids(session) == {"A"}
+
+
+def test_a_pending_relike_unlike_is_on_disk_at_every_later_wait(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hard kill can't be caught: until the recovery re-like is confirmed,
+    each wait must find A stranded on disk — even after the first re-like's
+    confirmed verify, since the unlike may land after it."""
+    factory = make_session_factory(session.bind)
+    item, acct = _unrendered_a(session)
+    acct.unlike_lands_late = {"A": 2}
+    at_waits: list[tuple[float, tuple[str, str], frozenset[str]]] = []
+
+    def sleep(seconds: float) -> None:
+        fresh = factory()
+        try:
+            at_waits.append(
+                (seconds, _steps(fresh, item.id)[-1], stranded_unliked_video_ids(fresh))
+            )
+        finally:
+            fresh.close()
+
+    monkeypatch.setattr("likesurgeon.sync_dispatch.time.sleep", sleep)
+
+    execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    # The unlike's verify, the re-like's verify, the LM re-read, the recovery's verify.
+    assert at_waits == [
+        (5, ("relike_unlike", "applied"), {"A"}),
+        (5, ("relike_like", "applied"), {"A"}),
+        (15, ("relike_unlike_pending", "failed"), {"A"}),
+        (5, ("relike_like", "applied"), {"A"}),
+    ]
+    assert stranded_unliked_video_ids(session) == frozenset()
+
+
+@pytest.mark.parametrize(("change", "diff"), [("drop_y", "-y +A"), ("add_z", "+A +z")])
+def test_a_relike_that_changes_lm_otherwise_stops_the_run(
+    session: Session, change: str, diff: str
+) -> None:
+    """Re-liking A may add its own entry, nothing else: an entry gone, or a
+    second one added, means LM changed in a way the diagnosis doesn't explain.
+    A stays liked."""
+
+    class OtherChange(FakeAccount):
+        def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+            songs = super().fetch_liked_songs(limit)
+            if self.lm_reads == 1:
+                return songs
+            if change == "drop_y":
+                return [s for s in songs if s["videoId"] != "y"]
+            return [*songs, {"videoId": "z"}]
+
+    item, acct = _unrendered_a(session, account=OtherChange)
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0, aborted=RELIKE_STOP)
+    assert "A" in acct.liked
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_RELIKED, ("relike_lm_check", "failed")]
+    assert rows[-1].reason.startswith(
+        f"expected nothing removed and at most one entry added, got {diff}"
+    )
+
+
+def test_lm_read_failure_after_a_relike_stops_the_run(session: Session) -> None:
+    item, acct = _unrendered_a(session)
+    acct.lm_read_errors = {2: UnexpectedResponseError("network down")}
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert (res.applied, res.failed, res.skipped) == (0, 1, 0)
+    assert res.aborted is not None and "network down" in res.aborted
+    assert "A" in acct.liked
+    assert _steps(session, item.id) == [*_RELIKED, ("relike_lm_check", "failed")]
+
+
+def test_quota_on_the_relike_unlike_sends_nothing(session: Session) -> None:
+    item, acct = _unrendered_a(session)
+    acct.quota_after = 1  # the precheck passes
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0, quota_exhausted=True)
+    assert acct.rate_calls == [("A", "none")]
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == _RELIKED[:1] + [("relike_unlike", "failed")]
+    assert rows[-1].reason.startswith(QUOTA_REJECTED)
+    assert stranded_unliked_video_ids(session) == frozenset()
+
+
+def test_quota_on_the_relike_likes_still_runs_the_lm_check(session: Session) -> None:
+    item, acct = _unrendered_a(session)
+    acct.quota_after = 3  # precheck, unlike, its verify
+
+    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        quota_exhausted=True,
+        left_unliked=("A",),
+        aborted=RELIKE_STOP,
+    )
+    assert _steps(session, item.id) == [
+        *_RELIKED[:3],
+        ("relike_like", "failed"),
+        ("relike_like", "failed"),
+        ("relike_lm_check", "applied"),
+    ]
+    assert stranded_unliked_video_ids(session) == {"A"}  # newest settling row: the unlike
+
+
+def test_an_interrupt_during_a_relikes_lm_check_strands_a(session: Session) -> None:
+    factory = make_session_factory(session.bind)
+    item, acct = _unrendered_a(session)
+    acct.lm_read_errors = {2: KeyboardInterrupt()}
+
+    with pytest.raises(KeyboardInterrupt):
+        execute(session, [relike(item)], [], ytm=acct, yt=acct)
+
+    fresh = factory()
+    try:
+        assert _steps(fresh, item.id) == [*_RELIKED, ("interrupted", "failed")]
+        assert stranded_unliked_video_ids(fresh) == {"A"}
+    finally:
+        fresh.close()
+
+
+def test_two_relikes_check_lm_once_each(session: Session) -> None:
+    diag = make_diagnosis(session)
+    older = unrendered(session, diag, a="A2")
+    newer = unrendered(session, diag, a="A1")
+    session.commit()
+    acct = FakeAccount(["A1", "x", "A2"], renders={"A1": None, "A2": None})
+    acct.relike_renders = {"A1": "A1", "A2": "A2"}
+
+    res = execute(session, [relike(older, "A2"), relike(newer, "A1")], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=2, failed=0, skipped=0)
+    assert acct.rate_calls == [("A2", "none"), ("A2", "like"), ("A1", "none"), ("A1", "like")]
+    assert acct.lm == ["A1", "A2", "x"]
+    assert acct.lm_reads == 3  # baseline + one check per action
+
+
+def test_a_relike_unlike_that_errors_but_lands_fails_without_stopping(session: Session) -> None:
+    """The unlike errors yet lands, and the rest goes as planned: ``failed``
+    for the errored call, but A and LM are as expected, so the next relike runs
+    against this check's read."""
+    diag = make_diagnosis(session)
+    older = unrendered(session, diag, a="A2")
+    newer = unrendered(session, diag, a="A1")
+    session.commit()
+    acct = FakeAccount(["A1", "x", "A2"], renders={"A1": None, "A2": None})
+    acct.relike_renders = {"A1": "A1", "A2": "A2"}
+    acct.rate_errors_after_landing = {("A2", "none")}
+
+    res = execute(session, [relike(older, "A2"), relike(newer, "A1")], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=1, skipped=0)
+    assert acct.rate_calls == [("A2", "none"), ("A2", "like"), ("A1", "none"), ("A1", "like")]
+    session.refresh(older)
+    session.refresh(newer)
+    assert (older.status, newer.status) == ("open", "applied")
+    assert _steps(session, older.id) == [
+        _RELIKED[0],
+        ("relike_unlike", "failed"),
+        *_RELIKED[2:],
+        ("relike_lm_check", "applied"),
+    ]
+    assert acct.lm_reads == 3  # baseline + one check per action
