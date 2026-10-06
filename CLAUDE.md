@@ -19,7 +19,7 @@ Full spec: [docs/design/ll-lm-alignment.md](docs/design/ll-lm-alignment.md). Int
 - LM exposes no backing id, so **order is the only signal**: `align.py` anchors LM entries whose `videoId` is itself in LL (LIS), then pairs the gaps in order. Only gaps with equal counts (*k* = *m*) are paired. Pairs are write-eligible (confidence 1.0) when A's availability is known and — except `shadow_duplicate` — they pass the same-recording check (`videos.list` duration within ±3 s and same channel or overlapping titles). Shadows skip that check because they are different uploads by nature; `unlike_shadow` proves the pair at run time (B shown ≥2× before, exactly one B fewer after, else restore). Everything else is report-only.
 - Two write actions, both on YouTube only: **repoint** (like B, confirm, unlike A) and **unlike_shadow** (B liked and shown ≥2×: unlike A). Each is followed by one LM-wide check; a mismatch re-likes A (restore). Unliking a wrong A would remove an unrelated LM entry, which is why the check exists.
 
-**Rules.** Never call YT Music `rate_song` (same rating as YouTube's; it only duplicates or reverts). Never match by title/fuzzy. Never re-add `yt_like` / `ytm_dedupe` — removed; see the spec. Safety invariants: see 'Never / always' under Sync state model — read them before touching `sync*.py`.
+**Rules.** Never call YT Music `rate_song` (same rating as YouTube's; it only duplicates or reverts) — sole exception: unliking a *deleted* video by hand, which `videos.rate` 404s on (README, Compare across sources). Never match by title/fuzzy. Never re-add `yt_like` / `ytm_dedupe` — removed; see the spec. Safety invariants: see 'Never / always' under Sync state model — read them before touching `sync*.py`.
 
 ## Releases
 

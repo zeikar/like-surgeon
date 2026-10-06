@@ -150,6 +150,8 @@ uv run likesurgeon issues --min-confidence 1.0 --format json
 
 A pair (A shown as B) is **write-eligible** only at confidence 1.0: A's availability is known and — except for `shadow_duplicate` — it passed the same-recording check (duration within ±3 s, and same channel or overlapping titles). A shadow is usually a different upload (MV, fan or making-of video), so instead `sync` proves it while acting: B must show twice before, and exactly one B must disappear after, or A is re-liked. Everything else is report-only. LL videos in gaps whose LM and LL counts differ get no finding.
 
+`dead_unrendered` is yours to clean up by hand. A region block can lift, so unlike a blocked video only once you have liked a replacement. A **deleted** video can't be unliked through the YouTube Data API (`videos.rate` returns 404), but YT Music's rating call still removes the like — ytmusicapi `rate_song(videoId, "INDIFFERENT")`; check with `videos.getRating`, which still reads deleted videos. The video isn't shown in YT Music, so no other entry depends on it.
+
 ### 6. Sync (write actions)
 
 `sync` applies the latest diagnosis's write-eligible findings, on YouTube only (it never calls YT Music `rate_song`). Default is **actually write** after a y/N prompt — use `--dry-run` to see the plan without writing, `--yes` to skip the prompt, `--limit N` to ramp, `--include-playable` to also act on playable originals. Before the prompt it prints the plan, warns if the diagnosis looks stale (a newer scan exists than the one it used, or a scan it used is over an hour old), and names any video an earlier run may have left unliked.

@@ -75,7 +75,7 @@ For an LL video A rendered as B (availability from scan time):
 
 **Post-action LM check (both actions).** Read the full LM before and after the action (the "after" read doubles as the next action's "before"). Expected: re-point → LM unchanged; unlike shadow → one fewer B, B still ≥ 1. If LM doesn't match (re-read once after 15 s), **re-like A** and confirm with `getRating`; if the restore can't run (quota, auth), record it as stranded (existing `stranded_unliked_video_ids` reporting). A re-point that leaves A liked after B's like may have landed (restore, quota-rejected unlike, B's like erroring) also unlikes B (`rate(B, none)` + `getRating`, failure reported as `left_liked`). Any action needing a restore, successful or not, stops the run: the mismatch means an order-derived pair was wrong, so later pairs may be too — re-scan and re-run `compare-likes`.
 
-**Never** call `rate_song(INDIFFERENT)` or `rate_song(LIKE)` on YT Music.
+**Never** call `rate_song(INDIFFERENT)` or `rate_song(LIKE)` on YT Music. (Outside `sync`, `rate_song(INDIFFERENT)` is the only way to unlike a *deleted* LL video — `videos.rate` 404s on it; verified 2026-10-06. Deleted means unrendered, so there is no LM entry to revert.)
 
 ## 5. Operational rules
 
