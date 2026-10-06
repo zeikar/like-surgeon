@@ -55,6 +55,9 @@ class _FakeYouTubeClient:
     last_user_region: Any = "<unset-sentinel>"
     fetch_called: bool = False
     fetch_limit: Any = "<unset-sentinel>"
+    # Defaults to the one item fetch_liked_videos returns, i.e. nothing hidden.
+    likes_item_count: int = 1
+    likes_item_count_error: Exception | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         # Accept and ignore client_secrets_path / token_path / etc.
@@ -68,6 +71,11 @@ class _FakeYouTubeClient:
                 "contentDetails": {"videoId": "v1"},
             }
         ]
+
+    def fetch_likes_item_count(self) -> int:
+        if type(self).likes_item_count_error is not None:
+            raise type(self).likes_item_count_error
+        return type(self).likes_item_count
 
     def fetch_video_statuses(
         self, video_ids: list[str], *, user_region: str | None = None
@@ -83,6 +91,8 @@ def _reset_fake_client() -> Iterable[None]:
     _FakeYouTubeClient.last_user_region = "<unset-sentinel>"
     _FakeYouTubeClient.fetch_called = False
     _FakeYouTubeClient.fetch_limit = "<unset-sentinel>"
+    _FakeYouTubeClient.likes_item_count = 1
+    _FakeYouTubeClient.likes_item_count_error = None
     yield
 
 
@@ -147,6 +157,48 @@ def test_scan_youtube_likes_warns_once_when_region_unset(
     assert patch_youtube_client.last_user_region is None
     # Warning text must be present, exactly once.
     assert result.output.count("No region configured") == 1
+
+
+def test_scan_youtube_likes_silent_when_playlist_count_matches(
+    fake_home: Path,
+    patch_youtube_client: type[_FakeYouTubeClient],
+) -> None:
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["scan", "youtube-likes"])
+
+    assert result.exit_code == 0, result.output
+    assert "hidden" not in result.output
+
+
+def test_scan_youtube_likes_warns_when_playlist_count_exceeds_items(
+    fake_home: Path,
+    patch_youtube_client: type[_FakeYouTubeClient],
+) -> None:
+    from likesurgeon.cli import app
+
+    patch_youtube_client.likes_item_count = 4
+    result = CliRunner().invoke(app, ["scan", "youtube-likes"])
+
+    assert result.exit_code == 0, result.output
+    # Rich wraps at the terminal width, which COLUMNS can't override after import.
+    flat = "".join(result.output.split())
+    assert "3like(s)arehidden" in flat
+    assert "docs/notes/hidden-likes.md" in flat
+
+
+def test_scan_youtube_likes_survives_playlist_count_failure(
+    fake_home: Path,
+    patch_youtube_client: type[_FakeYouTubeClient],
+) -> None:
+    from likesurgeon.cli import app
+
+    patch_youtube_client.likes_item_count_error = RuntimeError("boom")
+    result = CliRunner().invoke(app, ["scan", "youtube-likes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Snapshot #" in result.output
+    assert "couldnotreadthelikesplaylistcount" in "".join(result.output.split())
 
 
 def test_scan_youtube_likes_rejects_invalid_region_flag(

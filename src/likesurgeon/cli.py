@@ -292,6 +292,8 @@ def scan_youtube_likes(
     `unavailable_reason` so `compare-likes` can surface ghost videos.
     Region-aware detection runs when ``region`` is provided either via
     ``--region`` or ``config.json``.
+    Afterwards the playlist's ``itemCount`` is compared with the fetched items and a
+    shortfall is only warned about: hidden likes can't be fetched, so it can't fail the scan.
     """
     from googleapiclient.errors import HttpError
 
@@ -342,6 +344,23 @@ def scan_youtube_likes(
             f"[green]✓[/green] Snapshot [bold]#{snap.id}[/bold] stored "
             f"({len(items)} videos, [bold]{music_like}[/bold] music-like, "
             f"[bold]{unavailable}[/bold] unavailable)."
+        )
+
+    try:
+        playlist_count = client.fetch_likes_item_count()
+    except Exception as e:  # noqa: BLE001 — the check is advisory; never fail a stored scan
+        console.print(
+            "[yellow]⚠[/yellow] could not read the likes playlist count "
+            f"({type(e).__name__}: {escape(str(e))}); hidden-likes check skipped"
+        )
+        return
+    if playlist_count > len(items):
+        console.print(
+            f"[yellow]⚠[/yellow] YouTube counts {playlist_count} liked videos but the API "
+            f"returned {len(items)}: {playlist_count - len(items)} like(s) are hidden from "
+            "the Data API and from this scan. See "
+            "https://github.com/zeikar/like-surgeon/blob/main/docs/notes/hidden-likes.md "
+            "to find and re-like them."
         )
 
 
