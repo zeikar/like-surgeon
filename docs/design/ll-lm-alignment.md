@@ -108,7 +108,7 @@ Old diagnoses stay readable; old issue types exist only on old rows. No schema c
 ## 8. Rollout
 
 1. Implement (§6) in one pass with the implement loop; synthetic tests for `align.py`.
-2. Dogfood on the live account: the two remaining LM duplicates (トゥインクル☆スター ← `IKTlJwxnu4o`, 好き、泣いちゃいそうだ (Acoustic) ← `LPEE4MMDieo`; both playable → `--include-playable`). Remaining default paths (`relinked`) get exercised as new relinks appear.
+2. Dogfood on a real account: the two LM duplicates left there (both playable → `--include-playable`). Remaining default paths (`relinked`) get exercised as new relinks appear.
 3. Release as a minor version (tag + GitHub release per `CLAUDE.md`).
 
 ## Appendix: artifacts

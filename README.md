@@ -117,7 +117,7 @@ The first run prints a 6-step walkthrough: create a free Google Cloud project, e
 
 ```json
 {
-  "region": "KR"
+  "region": "US"
 }
 ```
 
@@ -212,7 +212,7 @@ The run exits non-zero if any action failed or it stopped early on an unreadable
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
 - **Order alignment has limits.** YT Music exposes no backing id, so pairing relies on order. Gaps where the two counts differ stay report-only, and the YouTube API may stop at 5000 likes (unverified) — if your library is that large, compare the counts in `doctor` with what you see on YouTube.
-- **YouTube's count can be a few higher than a scan's.** An old like can stay in Liked videos (the app and the playlist's `itemCount` count it) while the API reports the video as not liked and leaves it out of `playlistItems`, so scans never see it. On the maintainer's account these were 4 videos, 3 of them marked made for kids; they still showed in the web list, with no "show unavailable videos" option. Un-liking and re-liking each one on YouTube fixed it: the API listed all 4 again, and 3 also appeared in YT Music.
+- **YouTube's count can be a few higher than a scan's.** An old like can stay in Liked videos (the app and the playlist's `itemCount` count it) while the API reports the video as not liked and leaves it out of `playlistItems`, so scans never see it. It has been seen mostly with videos marked made for kids; they still show in the web list, with no "show unavailable videos" option. Un-liking and re-liking such a video on YouTube fixes it: the API lists it again, and YT Music may pick it up too.
 - **Google sign-in may expire weekly.** While your OAuth consent screen is in *Testing* (the setup `auth youtube` prints), Google expires its refresh tokens after 7 days; if YouTube calls start failing with an auth error, run `likesurgeon auth youtube` again.
 - **YouTube Data API quota.** A scan of 5000 likes costs about 200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list` calls for availability and region checks); the default daily quota is 10,000. Re-scanning a few times a day is fine.
 - **Music classification is heuristic.** `unrendered_music` relies on title and channel heuristics, so edge cases will misclassify (e.g. covers labelled "tutorial"). Findings are a starting point for review — only `sync` writes, and only write-eligible findings.
@@ -225,7 +225,7 @@ The run exits non-zero if any action failed or it stopped early on an unreadable
 ├── browser.json               # ytmusicapi browser-header auth
 ├── youtube-oauth-client.json  # your Google OAuth client (Desktop app)
 ├── youtube-token.json         # refresh token (created on first auth)
-└── config.json                # optional settings, e.g. {"region": "KR"}
+└── config.json                # optional settings, e.g. {"region": "US"}
 ```
 
 ## Roadmap
