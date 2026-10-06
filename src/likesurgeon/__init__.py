@@ -1,3 +1,3 @@
-"""like-surgeon: sync, backup, and repair your YouTube Music liked songs."""
+"""like-surgeon: back up and repair your YouTube Music liked songs."""
 
 __version__ = "0.11.0"

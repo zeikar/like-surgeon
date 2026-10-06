@@ -60,7 +60,10 @@ from .ytmusic_client import (
 # pattern.
 
 app = typer.Typer(
-    help="Sync, backup, and repair your YouTube Music liked songs.",
+    help=(
+        "Back up your YouTube Music liked songs, find relinked, duplicate and dead likes, "
+        "and fix the ones it can prove."
+    ),
     no_args_is_help=True,
     add_completion=False,
 )
@@ -190,14 +193,14 @@ def auth_ytmusic(
         console.print(
             f"[green]✓[/green] browser.json written to [cyan]{target}[/cyan].\n"
             "[dim]Verify with: [/dim]"
-            "[cyan]uv run likesurgeon scan ytmusic[/cyan]"
+            "[cyan]likesurgeon scan ytmusic[/cyan]"
         )
         return
 
     console.print("[bold]YouTube Music browser-header setup[/bold]")
     console.print(
         "Tip: skip the manual paste with "
-        "[cyan]uv run likesurgeon auth ytmusic --from-browser chrome[/cyan] "
+        "[cyan]likesurgeon auth ytmusic --from-browser chrome[/cyan] "
         "(or firefox / edge / etc.) if you're logged into music.youtube.com "
         "in that browser.\n\n"
         "Manual flow:\n"
@@ -205,7 +208,9 @@ def auth_ytmusic(
         "2. Open DevTools → Network → find an authenticated POST request to "
         "[cyan]/youtubei/v1/browse[/cyan] and copy its raw request headers.\n"
         "   (See [cyan]https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html[/cyan])\n"
-        "3. Run [cyan]uv run ytmusicapi browser[/cyan] and paste the headers when prompted.\n"
+        # A `uv tool` / pipx install doesn't put ytmusicapi's own CLI on PATH.
+        "3. Run [cyan]uvx --from ytmusicapi ytmusicapi browser[/cyan] and paste the "
+        "headers when prompted.\n"
         f"4. Move the generated [cyan]browser.json[/cyan] to [cyan]{target}[/cyan]."
     )
 
@@ -229,7 +234,7 @@ def auth_youtube() -> None:
             "4. Credentials → Create credentials → OAuth client ID → "
             "[bold]Desktop app[/bold] → download the JSON.\n"
             f"5. Save it as [cyan]{secrets_path}[/cyan].\n"
-            "6. Re-run [cyan]uv run likesurgeon auth youtube[/cyan]."
+            "6. Re-run [cyan]likesurgeon auth youtube[/cyan]."
         )
         return
 

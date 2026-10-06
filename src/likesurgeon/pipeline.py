@@ -81,7 +81,7 @@ def _fetch_pair_metadata(
             reason = f"{type(exc).__name__}: {exc}"
     warnings.append(
         f"[yellow]⚠[/yellow] videos.list metadata unavailable ({escape(reason)}); "
-        "every aligned pair is report-only."
+        "relinked and rendered_as_other pairs are report-only."
     )
     return {}
 
@@ -93,7 +93,8 @@ def compare_and_persist(session: Session, cfg: Config | None = None) -> Pipeline
       1. ``align`` the raw snapshot rows (spec §3). Not deduped: an LM video
          shown twice is how a shadow like behind it shows up.
       2. Fetch ``videos.list`` metadata for both sides of every rendered pair;
-         without it (``cfg`` is None, or the fetch fails) pairs are report-only.
+         without it (``cfg`` is None, or the fetch fails) every pair but a
+         ``shadow_duplicate`` is report-only.
       3. Persist the alignment findings; warn when one of our own ``sync``
          attempts ran after the older scan (spec §5.1): the lists may then
          misalign or no longer be current. Then metadata-drift findings per
