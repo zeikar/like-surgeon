@@ -924,13 +924,12 @@ _RELIKED = [
     ("relike_like", "applied"),
     ("relike_verify", "applied"),
 ]
-# The unlike still reads 'like', then lands right after the re-like's verify.
+# The unlike still reads 'like' (it lands late, or not at all).
 _LATE_UNLIKE = [
     *_RELIKED[:2],
     ("relike_unlike_verify", "failed"),
     ("relike_like", "applied"),
     ("relike_verify", "applied"),
-    ("relike_unlike_pending", "failed"),
     ("relike_lm_check", "applied"),
 ]
 
@@ -1050,94 +1049,19 @@ def test_a_relike_whose_first_like_errors_is_retried(session: Session) -> None:
     ]
 
 
-@pytest.mark.parametrize(("lands_after", "a_liked"), [(2, True), (3, False), (99, True)])
-def test_an_unconfirmed_relike_unlike_gets_a_recovery_relike(
-    session: Session, lands_after: int, a_liked: bool
-) -> None:
-    """getRating(A) still reads 'like' after the unlike, which may land late —
-    with 2, right after the re-like's verify, so A is liked nowhere and an
-    unrendered A gives the LM check nothing to catch. A is re-liked once more
-    after the check; the run stops either way. With 3 the unlike lands even
-    after the recovery's verify: A ends unliked with every read having said
-    'liked', so A must stay reported stranded until a scan contains it."""
+def test_an_unconfirmed_relike_unlike_fails_and_stops_the_run(session: Session) -> None:
+    """getRating(A) still reads 'like' after the unlike, so the state is unclear:
+    the re-like and LM check still run, then the run stops for a re-scan."""
     item, acct = _unrendered_a(session)
-    acct.unlike_lands_late = {"A": lands_after}
+    acct.unlike_lands_late = {"A": 2}
 
     res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
 
     assert res == ExecResult(applied=0, failed=1, skipped=0, aborted=RELIKE_STOP)
-    assert acct.rate_calls == [("A", "none"), ("A", "like"), ("A", "like")]
-    assert ("A" in acct.liked) is a_liked
+    assert acct.rate_calls == [("A", "none"), ("A", "like")]
     session.refresh(item)
     assert item.status == "open"
-    assert _steps(session, item.id) == [
-        *_LATE_UNLIKE,
-        ("relike_recover_like", "applied"),
-        ("relike_recover_verify", "applied"),
-    ]
-    assert stranded_unliked_video_ids(session) == {"A"}
-
-
-@pytest.mark.parametrize("recovery_breaks", ["like_does_not_land", "quota"])
-def test_a_failed_recovery_relike_leaves_a_unliked(session: Session, recovery_breaks: str) -> None:
-    item, acct = _unrendered_a(session)
-    acct.unlike_lands_late = {"A": 2}
-    if recovery_breaks == "like_does_not_land":
-        acct.like_does_not_land = {"A"}
-        tail = [("relike_recover_like", "applied"), ("relike_recover_verify", "failed")]
-    else:
-        # Rejected outright, so no verify follows: the pending row, not the
-        # earlier confirmed verify, is A's newest settling row.
-        acct.quota_after = 5  # precheck, unlike, its verify, re-like, its verify
-        tail = [("relike_recover_like", "failed")]
-
-    res = execute(session, [relike(item)], [], ytm=acct, yt=acct)
-
-    assert res == ExecResult(
-        applied=0,
-        failed=1,
-        skipped=0,
-        quota_exhausted=recovery_breaks == "quota",
-        left_unliked=("A",),
-        aborted=RELIKE_STOP,
-    )
-    assert "A" not in acct.liked
-    assert _steps(session, item.id) == [*_LATE_UNLIKE, *tail]
-    assert stranded_unliked_video_ids(session) == {"A"}
-
-
-def test_a_pending_relike_unlike_is_on_disk_at_every_later_wait(
-    session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A hard kill can't be caught: until a later YouTube scan contains A,
-    each wait must find A stranded on disk — even after the first re-like's
-    confirmed verify, since the unlike may land after it."""
-    factory = make_session_factory(session.bind)
-    item, acct = _unrendered_a(session)
-    acct.unlike_lands_late = {"A": 2}
-    at_waits: list[tuple[float, tuple[str, str], frozenset[str]]] = []
-
-    def sleep(seconds: float) -> None:
-        fresh = factory()
-        try:
-            at_waits.append(
-                (seconds, _steps(fresh, item.id)[-1], stranded_unliked_video_ids(fresh))
-            )
-        finally:
-            fresh.close()
-
-    monkeypatch.setattr("likesurgeon.sync_dispatch.time.sleep", sleep)
-
-    execute(session, [relike(item)], [], ytm=acct, yt=acct)
-
-    # The unlike's verify, the re-like's verify, the LM re-read, the recovery's verify.
-    assert at_waits == [
-        (5, ("relike_unlike", "applied"), {"A"}),
-        (5, ("relike_like", "applied"), {"A"}),
-        (15, ("relike_unlike_pending", "failed"), {"A"}),
-        (5, ("relike_recover_like", "applied"), {"A"}),
-    ]
-    assert stranded_unliked_video_ids(session) == {"A"}
+    assert _steps(session, item.id) == _LATE_UNLIKE
 
 
 @pytest.mark.parametrize(("change", "diff"), [("drop_y", "-y +A"), ("add_z", "+A +z")])

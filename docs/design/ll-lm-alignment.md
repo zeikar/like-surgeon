@@ -77,7 +77,7 @@ For an LL video A rendered as B (availability from scan time):
 0. `getRating(A)` must be `like` (else skip, no writes).
 1. `videos.rate(A, none)`; `getRating(A)` must be `none`.
 2. `videos.rate(A, like)`; `getRating(A)` must be `like`, tried twice if unconfirmed.
-3. LM check (below). If the unlike wasn't confirmed, a `relike_unlike_pending` row is committed before the check and A gets one recovery re-like after it, because a late unlike would otherwise go unnoticed (an unrendered A gives the check nothing to catch). The recovery rows (`relike_recover_like` / `relike_recover_verify`) don't settle the pending row: A stays in the stranded report until a later YouTube scan contains it, since the unlike may land after the recovery's verify.
+3. LM check (below). An unconfirmed unlike still gets the re-like and the check, then ends `failed` and stops the run (state unclear: re-scan). Known limit: an unlike that lands even after the confirmed re-like isn't detected.
 
 Expected LM: nothing removed, at most one entry added. +1 → applied; no change (one 15 s re-read first) → skipped, terminal, when every call was clean; anything removed or more than one entry added, or an unconfirmed unlike or re-like, stops the run with A liked (or reported stranded); an unlike call that errored but landed just ends `failed`. Oldest first, because re-liking moves the video to the top of both lists.
 

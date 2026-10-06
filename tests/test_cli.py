@@ -872,26 +872,6 @@ def test_sync_relike_that_stays_unrendered_is_skipped(
     assert _sync_rows(fake_home)[0] == {item_id: "skipped"}
 
 
-def test_sync_names_a_relike_video_whose_unlike_may_have_landed_late(
-    fake_home: Path,
-    patch_sync_clients: FakeAccount,
-) -> None:
-    from likesurgeon.cli import app
-
-    _seed_unrendered(fake_home, 1)
-    acct = patch_sync_clients
-    acct.liked, acct.renders = ["A0"], {"A0": None}
-    acct.unlike_lands_late = {"A0": 3}
-
-    result = CliRunner().invoke(app, ["sync", "--yes", "--relike-unrendered"])
-
-    assert result.exit_code == 1, result.output
-    assert "A0" not in acct.liked
-    out = _out(result)
-    assert "their re-like was confirmed" in out
-    assert "nowhere: A0" in out.replace("\n", " ")
-
-
 def test_sync_relike_limit_takes_the_oldest(
     fake_home: Path,
     patch_sync_clients: FakeAccount,

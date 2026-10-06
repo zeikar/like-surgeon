@@ -25,26 +25,20 @@ A ``relike`` (an ``unrendered_music`` finding: a like YT Music doesn't show)
 unlikes A and likes it again so YT Music re-evaluates it, trying the like
 twice if it isn't confirmed. Once the unlike was sent, the LM check always
 runs; it accepts LM unchanged (A still not shown) or one entry added, and
-anything else — an entry gone, or more than one added — stops the run. An
-unlike that wasn't confirmed may land after the re-like, and an unrendered A
-gives the check nothing to catch: a ``relike_unlike_pending`` row marks A
-possibly unliked, A gets one recovery re-like after the check
-(``relike_recover_like`` / ``relike_recover_verify``), and the run stops. The
-pending row is only cleared by a later YouTube scan containing A, because the
-unlike may land even after the recovery's verify. An A whose re-like (or
-recovery) can't be confirmed is also reported in ``left_unliked`` and stops the
-run too. ``restored`` is untouched — nothing is undone. ``relike_like`` and
-``relike_lm_check`` are not settling rows for ``stranded_unliked_video_ids``:
-only a ``relike_verify`` proves the like landed, and LM can't show an
-unrendered A either way.
+anything else — an entry gone, or more than one added — stops the run, as does
+an unlike that wasn't confirmed (state unclear: re-scan). An A whose re-like
+can't be confirmed is also reported in ``left_unliked``. ``restored`` is
+untouched — nothing is undone. Known limit: an unlike that lands even after
+the confirmed re-like goes undetected. ``relike_like`` and ``relike_lm_check``
+are not settling rows for ``stranded_unliked_video_ids``: only a
+``relike_verify`` proves the like landed.
 
 Invariants:
   * ``DiagnosisItem.reason`` is never modified — that field is the
     diagnosis-time evidence. Sync-side detail lives on ``SyncAttempt.reason``.
   * One ``SyncAttempt`` per HTTP call, per LM check and per skip decision,
     plus an ``interrupted`` row when anything stops an action once A's
-    unlike call has started, and a ``relike_unlike_pending`` row when a
-    relike's unlike isn't confirmed.
+    unlike call has started.
   * ``DiagnosisItem.status`` flips to ``"applied"`` only when every call for
     the action succeeded and the LM check passed — for a relike, a re-like
     that is retried and then confirmed still counts. ``"skipped"`` is terminal:
@@ -54,10 +48,9 @@ Invariants:
     (``likesurgeon unskip`` re-opens one). Anything else stays ``"open"``.
     A *planner-level* skip only writes an audit row; the item stays
     ``"open"``.
-  * Commit cadence: per action, plus right after every write call and every
-    ``relike_unlike_pending`` row, so a crash or kill at any later point
-    still leaves that row on disk — the next ``sync`` refuses until a
-    re-scan, and an A whose unlike was sent shows in
+  * Commit cadence: per action, plus right after every write call, so a crash
+    or kill at any later point still leaves that row on disk — the next
+    ``sync`` refuses until a re-scan, and an A whose unlike was sent shows in
     ``stranded_unliked_video_ids``.
 """
 
@@ -376,17 +369,6 @@ class _SyncRun:
             unliked = self._has_rating(item_id, "relike_unlike_verify", a, "none", miss="failed")
             # Once more if unconfirmed: the unlike may have landed after the first like.
             liked = relike_a() or relike_a()
-            if unliked is not True:
-                self._record(
-                    item_id,
-                    "relike_unlike_pending",
-                    "failed",
-                    "unlike not confirmed before the re-like, so it may still land — A counts "
-                    "as possibly unliked until a later YouTube scan contains it",
-                )
-                # On disk before the LM check's wait, as a write's row is: from here
-                # only a later YouTube scan containing A clears it, even after a hard kill.
-                self.session.commit()
 
             after = self._lm_after(
                 item_id,
@@ -418,16 +400,7 @@ class _SyncRun:
                 self.aborted = self.aborted or RELIKE_STOP
                 return "failed"
             if unliked is not True:
-                # The unlike may land after the re-like, and an unrendered A gives
-                # LM nothing to catch. The recovery's rows aren't settling, so even a
-                # confirmed verify leaves A reported stranded until a later YouTube
-                # scan contains it: an unlike landing after that verify is
-                # undetectable, and no fixed number of re-likes closes the gap.
-                if not self._relike(
-                    item_id, a, like_kind="relike_recover_like", verify_kind="relike_recover_verify"
-                ):
-                    self.left_unliked.append(a)
-                self.aborted = self.aborted or RELIKE_STOP
+                self.aborted = self.aborted or RELIKE_STOP  # state unclear: re-scan
                 return "failed"
             if after is None:
                 return "failed"

@@ -190,7 +190,7 @@ likesurgeon skip 812 813                # keep sync off findings #812 and #813 (
 
 - **Restored** — A was re-liked and the finding marked `skipped`, because A's unlike didn't take or the Liked songs check didn't match. The run stops; re-scan both sources and run `compare-likes` before syncing again. If undoing a repoint's B like fails or can't be confirmed, `sync` names the video and stops: B may still be liked, so unlike it on YouTube by hand if you don't want it (no song is lost).
 - **Stale finding** — A is no longer liked (you unliked it after the scan), or B is already liked, so the finding is `skipped` without any write.
-- **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike (a `relike` whose unlike wasn't confirmed counts even after its recovery re-like, because the unlike may still land): the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
+- **Stranded** — A was unliked and re-liking it failed or couldn't be confirmed, or the run was interrupted after the unlike: the song may now be liked nowhere. `sync` lists stranded videos on every run until a later YouTube scan contains them again. Check YT Music Liked songs; if the song is missing, re-like the original on YouTube, then re-scan.
 - **Aborted or quota stop** — remaining actions stay `open`. Re-scan both sources, run `compare-likes`, then `sync` again.
 
 #### State model

@@ -29,14 +29,10 @@ def _as_utc(dt: datetime) -> datetime:
 _UNLIKE_KINDS = ("repoint_unlike", "unlike_shadow_unlike", "relike_unlike")
 # ``relike_like`` is left out: only its verify proves the like landed, so a kill
 # before that verify keeps ``relike_unlike`` the newest settling row.
-# ``relike_unlike_pending`` is always 'failed' and marks A unresolved after an
-# unconfirmed unlike until a later YouTube scan contains A: the recovery re-like
-# (``relike_recover_like`` / ``relike_recover_verify``) and ``relike_lm_check``
-# are left out, since an unlike may still land after either.
+# ``relike_lm_check`` is left out too: A is confirmed liked before it.
 _SETTLING_KINDS = (
     *_UNLIKE_KINDS,
     "relike_verify",
-    "relike_unlike_pending",
     "interrupted",
     "lm_check",
     "restore_like",
@@ -55,7 +51,6 @@ _WRITE_KINDS = (
     "repoint_rollback",
     "relike_unlike",
     "relike_like",
-    "relike_recover_like",
     "interrupted",
     # Writes recorded by versions before the LL -> LM alignment; their rows stay
     # in existing databases. (``ytm_like`` / ``yt_relike`` / ``yt_like`` alone were
@@ -76,8 +71,7 @@ def _may_be_unliked(kind: str, status: str, reason: str) -> bool:
         # Nothing recorded after the unlike: the process died before its check.
         # A quota-rejected unlike sent nothing.
         return not reason.startswith(QUOTA_REJECTED)
-    # ``interrupted`` and ``relike_unlike_pending`` rows are always 'failed'
-    # (the latter: an unlike that wasn't confirmed). Otherwise the LM check or a
+    # ``interrupted`` rows are always 'failed'. Otherwise the LM check or a
     # re-like step came last: a failed re-like left A unliked, and a failed
     # check that comes last never got its restore.
     return status == "failed"

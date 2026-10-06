@@ -843,11 +843,6 @@ def sync(
                 console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {e}")
                 raise typer.Exit(1) from e
         result = execute(session, actions, skips, ytm=ytm, yt=yt)
-        # A relike's unlike may land after every read said "liked": its pending row
-        # keeps A stranded without a ``left_unliked`` entry, so say so now.
-        newly_stranded = sorted(
-            stranded_unliked_video_ids(session) - set(stranded) - set(result.left_unliked)
-        )
 
     console.print(
         f"[bold]Sync result:[/bold] "
@@ -886,15 +881,6 @@ def sync(
             "they may be liked nowhere right now:[/bold red] "
             + ", ".join(result.left_unliked)
             + "\nRe-like them on YouTube by hand."
-        )
-    if newly_stranded:
-        console.print(
-            "[bold red]These videos were unliked on YouTube and their re-like was confirmed, "
-            "but the unlike may still have landed afterwards, so they may be liked "
-            "nowhere:[/bold red] "
-            + ", ".join(newly_stranded)
-            + "\nCheck whether the song is in your YT Music Liked songs; if it isn't, re-like "
-            "that original YouTube video by hand. Re-scan YouTube likes to clear this warning."
         )
     if result.left_liked:
         console.print(
