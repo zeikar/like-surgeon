@@ -1,0 +1,60 @@
+name: Release
+
+# Publishing a GitHub release (tag v<X.Y.Z>) builds and uploads to PyPI via
+# trusted publishing; there is no API token in the repo.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Check tag matches both version strings
+        # pyproject.toml and __init__.py must move in lockstep (v0.8.0 shipped
+        # with a stale __init__.py).
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project=$(uv version --short)
+          module=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/likesurgeon/__init__.py)
+          echo "tag=$tag pyproject=$project __init__=$module"
+          test "$tag" = "$project" && test "$tag" = "$module"
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata and README rendering
+        run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: pypi
+      url: https://pypi.org/project/likesurgeon/
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

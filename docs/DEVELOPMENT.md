@@ -191,8 +191,13 @@ CI is GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml))
 
 1. Bump version in `pyproject.toml` and `src/likesurgeon/__init__.py` (must match).
 2. Run `uv sync --extra dev` to refresh `uv.lock`.
-3. Update `README.md` status line + roadmap row + relevant caveats.
+3. Update `README.md` roadmap + relevant caveats.
 4. Update [ARCHITECTURE.md](ARCHITECTURE.md) roadmap section if scope-relevant.
 5. Tag the merge commit on main: `git tag v<X.Y.Z> && git push --tags`.
+6. `gh release create v<X.Y.Z> ...`. Publishing the release runs [`.github/workflows/release.yml`](../.github/workflows/release.yml): it fails unless the tag matches both version strings, builds with `uv build`, runs `twine check --strict`, and uploads to [PyPI](https://pypi.org/project/likesurgeon/) through trusted publishing (no token; the publisher is registered on PyPI for workflow `release.yml`, environment `pypi`).
 
-No PyPI release yet — the project is git-clone-only during 0.x.
+To check the package locally first: `uv build && uvx twine check --strict dist/*`, then `uvx --from dist/likesurgeon-<X.Y.Z>-py3-none-any.whl likesurgeon --version`.
+
+### README images
+
+The README loads its images from `raw.githubusercontent.com` (absolute URLs, so they also show on PyPI). Sources are the HTML files in [`docs/assets/src/`](assets/src/); edit one, then run `docs/assets/src/render.sh` (Google Chrome + uv) to regenerate the PNGs next to it.

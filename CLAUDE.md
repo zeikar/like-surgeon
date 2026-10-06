@@ -31,7 +31,7 @@ Procedure on `main`, after the feature PR is merged:
 2. Commit `chore: bump version to <X.Y.Z>`.
 3. Tag the commit `v<X.Y.Z>` (with the `v` prefix).
 4. `git push && git push --tags`.
-5. `gh release create v<X.Y.Z> --title "v<X.Y.Z> — <slug>" --notes "..."` — notes summarize what shipped (cribbing from the PR description is fine), include the action-mapping or quota table when behavior changed.
+5. `gh release create v<X.Y.Z> --title "v<X.Y.Z> — <slug>" --notes "..."` — notes summarize what shipped (cribbing from the PR description is fine), include the action-mapping or quota table when behavior changed. Publishing the release uploads to PyPI (`.github/workflows/release.yml`, trusted publishing); the workflow fails if the tag doesn't match both version strings. A PyPI version can't be re-uploaded, so a broken release means a new patch version.
 
 Don't retro-edit a published tag/release for follow-up fixes — cut a fresh patch tag instead.
 

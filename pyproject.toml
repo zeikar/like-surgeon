@@ -1,11 +1,35 @@
 [project]
 name = "likesurgeon"
 version = "0.11.0"
-description = "Sync, backup, and repair your YouTube Music liked songs."
+description = "Back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "zeikar" }]
+keywords = [
+  "youtube-music",
+  "ytmusic",
+  "youtube",
+  "liked-songs",
+  "likes",
+  "backup",
+  "ytmusicapi",
+  "music-library",
+  "cli",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio",
+  "Topic :: Utilities",
+]
 dependencies = [
   "ytmusicapi>=1.7",
   "typer>=0.12",
@@ -18,6 +42,12 @@ dependencies = [
   "browser-cookie3>=0.20.1",
 ]
 
+[project.urls]
+Homepage = "https://zeikar.dev/projects/like-surgeon/"
+Source = "https://github.com/zeikar/like-surgeon"
+Issues = "https://github.com/zeikar/like-surgeon/issues"
+Changelog = "https://github.com/zeikar/like-surgeon/releases"
+
 [project.scripts]
 likesurgeon = "likesurgeon.cli:app"
 
@@ -28,11 +58,15 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/likesurgeon"]
+
+# Keep README images and maintainer docs out of the sdist.
+[tool.hatch.build.targets.sdist]
+include = ["src/likesurgeon", "tests", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100
