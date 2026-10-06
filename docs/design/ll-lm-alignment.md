@@ -102,7 +102,7 @@ Old diagnoses stay readable; old issue types exist only on old rows. No schema c
 
 1. Does the LL API stop at 5000 likes? If so, alignment must bound itself to the overlapping range.
 2. Do renders of unavailable videos flicker between reads? Seen twice, both right after nearby writes; the post-action check covers it if real.
-3. Does an un-like/re-like make YT Music render an `unrendered_music` video (the old `ytm_like` premise)?
+3. Does an un-like/re-like make YT Music render an `unrendered_music` video (the old `ytm_like` premise)? **Mostly yes** (2026-10-06): all 26 unrendered LL videos were un-liked and re-liked on YouTube, oldest first, each step confirmed by `getRating`; LM lost nothing and gained 18 — 13 rendered as themselves, 5 as an official track (another `videoId`). The 8 still unrendered: 6 memes / general videos and 2 game-BGM uploads. Two caveats: the music heuristic had classified all 26 as non-music (covers, 歌ってみた, OST arrangements), so none had been an `unrendered_music` finding; and the 5 official-track renders came back as 2 `rendered_as_other` (same-recording check failed: other channel, title in another script) plus 3 `unbacked_lm_entry`, because re-liked videos that stayed unrendered sit in the same gaps (*k* ≠ *m*).
 4. Ordering on other accounts (one J-pop/anime-heavy account so far).
 
 ## 8. Rollout
