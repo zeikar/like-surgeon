@@ -733,6 +733,19 @@ def sync(
             ),
         ),
     ] = False,
+    relike_unrendered: Annotated[
+        bool,
+        typer.Option(
+            "--relike-unrendered/--no-relike-unrendered",
+            help=(
+                "Also un-like and re-like each unrendered_music video on YouTube so YT Music "
+                "picks it up (103 units each). Off by default: every re-like moves that video "
+                "to the top of your Liked videos (and of Liked songs, if it then shows). "
+                "Oldest first; a video YT Music still doesn't show afterwards is marked "
+                "skipped (`likesurgeon unskip` to retry)."
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int | None,
         typer.Option(
@@ -759,7 +772,7 @@ def sync(
             raise typer.Exit(1)
         items = diagnosis_items(session, diag.id)
         # Whether each A was playable at scan time decides if its shadow is
-        # unliked by default.
+        # unliked by default; its position orders the relikes.
         ll = (
             get_snapshot_items(session, diag.youtube_snapshot_id)
             if diag.youtube_snapshot_id
@@ -770,6 +783,8 @@ def sync(
             resolve_video_ids(session, items),
             {it.track_id: it.is_available for it in ll},
             include_playable=include_playable,
+            relike_unrendered=relike_unrendered,
+            ll_index={it.track_id: it.position for it in ll},
         )
         if limit is not None and limit < len(actions):
             console.print(

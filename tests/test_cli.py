@@ -523,10 +523,12 @@ def _open_db(home: Path) -> Session:
     return make_session_factory(engine)()
 
 
-def _seed_pairs(home: Path, pairs: list[tuple[str, str, str, bool | None]]) -> list[int]:
+def _seed_pairs(home: Path, pairs: list[tuple[str, str, str | None, bool | None]]) -> list[int]:
     """Real LL / LM scans and a diagnosis built from them, with one write-eligible
     pair finding per ``(issue_type, A, B, A's availability)``. LL holds the A's
-    (availability as scanned; None = unknown), LM the B's. Returns item ids."""
+    (availability as scanned; None = unknown), LM the B's. A ``B`` of None means
+    no LM entry and no related track (an ``unrendered_music`` finding). Returns
+    item ids."""
     from sqlalchemy import select
 
     from likesurgeon.models import Diagnosis, DiagnosisItem, Track
@@ -545,7 +547,9 @@ def _seed_pairs(home: Path, pairs: list[tuple[str, str, str, bool | None]]) -> l
             ll_raw.append(raw)
         ll = create_snapshot(s, "youtube_liked_videos", ll_raw)
         lm = create_snapshot(
-            s, "ytmusic_liked_songs", [_ytm_raw(b, f"Song {b}", ["X"]) for _, _, b, _ in pairs]
+            s,
+            "ytmusic_liked_songs",
+            [_ytm_raw(b, f"Song {b}", ["X"]) for _, _, b, _ in pairs if b is not None],
         )
         diag = Diagnosis(youtube_snapshot_id=ll.id, ytmusic_snapshot_id=lm.id)
         s.add(diag)
@@ -558,7 +562,7 @@ def _seed_pairs(home: Path, pairs: list[tuple[str, str, str, bool | None]]) -> l
                 confidence=1.0,
                 reason="diagnosis-time evidence",
                 source_track_id=track["youtube_liked_videos", a],
-                related_track_id=track["ytmusic_liked_songs", b],
+                related_track_id=track["ytmusic_liked_songs", b] if b is not None else None,
                 status="open",
             )
             for issue_type, a, b, _ in pairs
@@ -801,6 +805,103 @@ def test_sync_include_playable_repoints_rendered_as_other(
     assert result.exit_code == 0, result.output
     assert acct.rate_calls == [("T", "like"), ("MV", "none")]
     assert _sync_rows(fake_home)[0] == {item_id: "applied"}
+
+
+def _seed_unrendered(home: Path, n: int = 2) -> list[int]:
+    from likesurgeon.diagnosis import ISSUE_UNRENDERED_MUSIC
+
+    return _seed_pairs(home, [(ISSUE_UNRENDERED_MUSIC, f"A{i}", None, None) for i in range(n)])
+
+
+def test_sync_dry_run_counts_relikes_only_with_the_flag(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_unrendered(fake_home)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["sync", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "\n  relike: 0" in result.output
+
+    result = runner.invoke(app, ["sync", "--dry-run", "--relike-unrendered"])
+    assert result.exit_code == 0, result.output
+    assert "\n  relike: 2" in result.output
+    assert "206 units" in result.output
+    assert "tothetopofLikedvideos" in "".join(result.output.split())
+    assert _FakeYouTubeWrite.instances == []
+    assert _FakeYTMusicWrite.instances == []
+
+
+def test_sync_relikes_unrendered_oldest_first(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    ids = _seed_unrendered(fake_home)
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A0", "A1"], {"A0": None, "A1": None}
+    acct.relike_renders = {"A0": "A0", "A1": "T"}
+
+    result = CliRunner().invoke(app, ["sync", "--yes", "--relike-unrendered"])
+
+    assert result.exit_code == 0, result.output
+    assert "applied=2" in _out(result)
+    assert acct.rate_calls == [("A1", "none"), ("A1", "like"), ("A0", "none"), ("A0", "like")]
+    assert _sync_rows(fake_home)[0] == {ids[0]: "applied", ids[1]: "applied"}
+
+
+def test_sync_relike_that_stays_unrendered_is_skipped(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    [item_id] = _seed_unrendered(fake_home, 1)
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A0"], {"A0": None}
+    acct.relike_renders = {"A0": None}
+
+    result = CliRunner().invoke(app, ["sync", "--yes", "--relike-unrendered"])
+
+    assert result.exit_code == 0, result.output
+    assert "skipped=1" in _out(result)
+    assert _sync_rows(fake_home)[0] == {item_id: "skipped"}
+
+
+def test_sync_relike_limit_takes_the_oldest(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_unrendered(fake_home)
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A0", "A1"], {"A0": None, "A1": None}
+    acct.relike_renders = {"A0": "A0", "A1": "A1"}
+
+    result = CliRunner().invoke(app, ["sync", "--yes", "--relike-unrendered", "--limit", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert acct.rate_calls == [("A1", "none"), ("A1", "like")]
+
+
+def test_sync_without_the_flag_leaves_unrendered_untouched(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    ids = _seed_unrendered(fake_home)
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert patch_sync_clients.rate_calls == []
+    assert _sync_rows(fake_home) == ({ids[0]: "open", ids[1]: "open"}, [])
 
 
 def test_sync_unlikes_shadows_by_the_scanned_availability_of_a(
