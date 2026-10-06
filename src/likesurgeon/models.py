@@ -154,7 +154,8 @@ class DiagnosisItem(Base):
         (``source_track_id`` = A, ``related_track_id`` = B). Only these can
         be write-eligible (``confidence == 1.0``).
       - ``dead_unrendered`` — a dead YouTube like with no YT Music entry.
-      - ``unrendered_music`` — a playable music like with no YT Music entry.
+      - ``unrendered_music`` — a playable music like with no YT Music entry;
+        ``sync --relike-unrendered`` acts on it.
       - ``unbacked_lm_entry`` — a YT Music entry with no YouTube like behind it.
       - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
         of one source with meaningfully different title or artists.
@@ -197,9 +198,11 @@ class SyncAttempt(Base):
     ``unlike_shadow_precheck_a``, ``unlike_shadow_unlike``,
     ``unlike_shadow_verify``; ``lm_check``; ``restore_like``,
     ``restore_verify``; ``repoint_rollback``,
-    ``repoint_rollback_verify``; or the action kind (``repoint`` /
-    ``unlike_shadow``) for a plan-time skip, and ``interrupted`` when an action
-    stopped after A's unlike call started. See ``sync_dispatch.py`` for the
+    ``repoint_rollback_verify``; ``relike_precheck``, ``relike_unlike``,
+    ``relike_unlike_verify``, ``relike_like``, ``relike_verify``,
+    ``relike_unlike_pending``, ``relike_lm_check``; or the action kind
+    (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
+    action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
     authoritative list. Rows written before the LL → LM alignment redesign may
     carry legacy kinds (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``,
     ``yt_relike_*``, ``ytm_dedupe``). ``status`` is one of ``applied``,

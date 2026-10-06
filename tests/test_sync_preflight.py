@@ -182,6 +182,63 @@ def test_stranded_covers_unlikes_that_never_settled(session: Session) -> None:
     }
 
 
+def test_stranded_covers_relike_histories(session: Session) -> None:
+    """``relike_like`` and ``relike_lm_check`` never settle A: a 2xx like can land
+    nothing, and A is confirmed liked before the LM check. Only ``relike_verify``
+    and the always-failed ``relike_unlike_pending`` note do."""
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    stranded = {
+        "unlike_last": [("relike_unlike", "applied")],
+        "like_killed_before_verify": [("relike_unlike", "applied"), ("relike_like", "applied")],
+        "like_failed": [("relike_unlike", "applied"), ("relike_like", "failed")],
+        "verify_failed": [
+            ("relike_unlike", "applied"),
+            ("relike_like", "applied"),
+            ("relike_verify", "failed"),
+        ],
+        "interrupted": [("relike_unlike", "applied"), ("interrupted", "failed")],
+        "pending_last": [
+            ("relike_unlike", "applied"),
+            ("relike_verify", "applied"),
+            ("relike_unlike_pending", "failed"),
+        ],
+        "recovery_like_rejected": [
+            ("relike_unlike_pending", "failed"),
+            ("relike_lm_check", "applied"),
+            ("relike_like", "failed"),
+        ],
+        "recovery_verify_failed": [
+            ("relike_unlike_pending", "failed"),
+            ("relike_like", "applied"),
+            ("relike_verify", "failed"),
+        ],
+    }
+    fine = {
+        "quota_rejected": [("relike_unlike", "failed", f"{QUOTA_REJECTED}: quotaExceeded")],
+        "verified": [
+            ("relike_unlike", "applied"),
+            ("relike_like", "applied"),
+            ("relike_verify", "applied"),
+        ],
+        "lm_check_failed_after_verify": [
+            ("relike_unlike", "applied"),
+            ("relike_verify", "applied"),
+            ("relike_lm_check", "failed"),
+        ],
+        "recovered": [
+            ("relike_unlike_pending", "failed"),
+            ("relike_like", "applied"),
+            ("relike_verify", "applied"),
+        ],
+    }
+    for vid, rows in {**stranded, **fine}.items():
+        track = _ytm_track(session, vid)
+        for kind, status, *reason in rows:
+            _relike_attempt(session, track, status, kind=kind, at=t, reason="".join(reason))
+
+    assert stranded_unliked_video_ids(session) == set(stranded)
+
+
 def test_stranded_clears_once_a_later_youtube_scan_shows_the_video_liked(
     session: Session,
 ) -> None:
@@ -287,6 +344,30 @@ def test_sync_attempts_since_older_scan_counts_from_the_older_of_the_two_scans(
     assert sync_attempts_since_older_scan(session, diag) == 2
     _write_at(session, t + timedelta(hours=3), status="failed", kind="repoint_rollback")
     assert sync_attempts_since_older_scan(session, diag) == 3
+
+
+def test_relike_writes_count_but_its_reads_and_notes_do_not(session: Session) -> None:
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    ll = create_snapshot(session, "youtube_liked_videos", [])
+    lm = create_snapshot(session, "ytmusic_liked_songs", [])
+    lm.created_at = ll.created_at = t
+    diag = Diagnosis(youtube_snapshot_id=ll.id, ytmusic_snapshot_id=lm.id)
+    session.add(diag)
+    session.flush()
+
+    for kind in (
+        "relike_precheck",
+        "relike_unlike_verify",
+        "relike_verify",
+        "relike_unlike_pending",
+        "relike_lm_check",
+    ):
+        _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
+    _write_at(session, t + timedelta(hours=1), status="skipped", kind="relike")
+    assert sync_attempts_since_older_scan(session, diag) == 0
+    for kind in ("relike_unlike", "relike_like"):
+        _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
+    assert sync_attempts_since_older_scan(session, diag) == 2
 
 
 @pytest.mark.parametrize(
