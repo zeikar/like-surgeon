@@ -61,6 +61,7 @@
   .tag.ok { color: var(--teal); background: rgba(95,212,198,.1); }
   .tag.fix { color: var(--coral); background: rgba(255,111,97,.12); }
   .tag.dup { color: var(--amber); background: rgba(242,180,90,.12); }
+  .tag.re { color: #a99cff; background: rgba(169,156,255,.12); }
   .tag.rep { color: #aab3bc; background: rgba(255,255,255,.06); }
   .note b { color: var(--text); font-weight: 600; }
   .note code { font: 500 12.5px "JetBrains Mono", ui-monospace, monospace; color: #c9ced3; white-space: nowrap; }
@@ -75,7 +76,7 @@
 <div class="card" id="card">
   <div class="eyebrow">How it works</div>
   <h1>Your YT Music likes are a view of your YouTube likes</h1>
-  <p class="lede">YouTube <b>Liked videos</b> is where every like is stored. YT Music <b>Liked songs</b> shows the same list, in the same order, but each entry may play a different video than the like behind it. like-surgeon lines the two lists up by position to find out which like is behind each song.</p>
+  <p class="lede">YouTube <b>Liked videos</b> is where every like is stored. YT Music <b>Liked songs</b> shows the songs from that list, in the same order, but each entry may play a different video than the like behind it. like-surgeon lines the two lists up by position to find out which like is behind each song.</p>
 
   <div class="grid">
     <div class="colhead">YouTube · Liked videos<span>where the likes live</span></div>
@@ -102,7 +103,12 @@
     <div class="wire"></div>
     <div class="item"><i class="dot"></i><div class="t">Song 3 · audio</div></div>
 
-    <div class="item dead"><i class="dot dead"></i><div><div class="t">Song 4</div><small>deleted video</small></div></div>
+    <div class="item"><i class="dot"></i><div class="t">Song 4 · cover<small>plays fine</small></div></div>
+    <div class="wire none"></div>
+    <div class="empty">not shown</div>
+    <div class="note"><span class="tag re">unrendered music → relike</span><br><b>Unlike and re-like it on YouTube</b> so YT Music may list it — opt-in (<code>--relike-unrendered</code>).</div>
+
+    <div class="item dead"><i class="dot dead"></i><div><div class="t">Song 5</div><small>deleted video</small></div></div>
     <div class="wire none"></div>
     <div class="empty">not shown</div>
     <div class="note"><span class="tag rep">dead → report only</span><br>Listed for you to clean up by hand.</div>

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/hero.jpg" alt="like-surgeon: back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove" width="100%">
+  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/hero.jpg" alt="like-surgeon: fix the mismatches between your YouTube Music liked songs and YouTube likes, only the ones it can prove" width="100%">
 </p>
 
 <p align="center">
@@ -11,26 +11,19 @@
 
 # like-surgeon
 
-**Back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove.**
+**Fix the mismatches between your YouTube Music liked songs and YouTube likes — only the ones it can prove.**
 
-like-surgeon is a local-first command-line tool. It snapshots your YouTube Music *Liked songs* and your YouTube *Liked videos* into a SQLite file on your machine, works out which YouTube like is behind every song, and repairs the cases it can prove — with a check after every change. No server, no account of ours: your data and credentials stay on your computer.
+YouTube Music keeps no likes of its own: *Liked songs* is a view of your YouTube *Liked videos*, and over the years the two drift apart. A song gets swapped for another release while your like stays on the dead upload, the same song shows up twice, music you liked never appears, or a like is left on a deleted video. like-surgeon lines the two lists up, works out which YouTube like is behind every song, and fixes the mismatches it can prove — on YouTube, with a check after every change.
 
-## Why
-
-Use YouTube Music for a few years and your Liked songs drifts:
-
-- **Songs YT Music swapped behind your back.** The upload you liked was pulled or blocked in your region, so YT Music now plays a different release of the song — but your YouTube likes still hold the old, dead video.
-- **The same song twice.** You liked the official music video *and* the audio track; YT Music shows both as the same track.
-- **Songs that are just gone.** A deleted or region-blocked video stays in your likes, invisible in YT Music.
-- **No backup.** YouTube Music has no in-app export for your likes, and titles change over time.
+It's a command-line tool that runs on your machine. Each scan of both lists is kept as a snapshot in a local SQLite file, which doubles as the backup YouTube Music doesn't offer. No server, no account of ours: your data and credentials stay on your computer.
 
 ## How it works
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/how-it-works.png" alt="Diagram: YouTube Liked videos on the left, YT Music Liked songs on the right, lined up by position. A dead upload shown as a new release is re-pointed, a music video shown as a duplicate audio track can be unliked (opt-in while it still plays), and a deleted video is reported." width="100%">
+  <img src="https://raw.githubusercontent.com/zeikar/like-surgeon/main/docs/assets/how-it-works.png" alt="Diagram: YouTube Liked videos on the left, YT Music Liked songs on the right, lined up by position. A dead upload shown as a new release is re-pointed, a music video shown as a duplicate audio track can be unliked (opt-in while it still plays), a cover YT Music doesn't show can be re-liked (opt-in), and a deleted video is reported." width="100%">
 </p>
 
-Your YouTube **Liked videos** list is the only place likes are stored. YT Music **Liked songs** is a view of it — same order, filtered to what YT Music shows, and each entry may play a different video than the like behind it. YT Music never says which like backs which song, so like-surgeon lines the two lists up by position (no fuzzy title matching) and repairs the mismatches it can prove, on YouTube. The full model and the evidence for it: [docs/design/ll-lm-alignment.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/ll-lm-alignment.md). (The docs call the two lists **LL** and **LM**, after their playlist ids.)
+Liked songs keeps the order of Liked videos, filtered to what YT Music shows, and each entry may play a different video than the like behind it. YT Music never says which like backs which song, so like-surgeon lines the two lists up by position (no fuzzy title matching) and repairs the mismatches it can prove, on YouTube. The full model and the evidence for it: [docs/design/ll-lm-alignment.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/ll-lm-alignment.md). (The docs call the two lists **LL** and **LM**, after their playlist ids.)
 
 ## Quick start
 
@@ -70,7 +63,7 @@ Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — n
 ## Safety
 
 - **Read-only until you say so.** Only `sync` writes, after showing the plan and a y/N prompt; `--dry-run` writes nothing, `--limit N` ramps up, `skip <id>` keeps a finding out for good.
-- **Only proven pairs.** A pair is acted on only when its gap in the alignment is one-to-one and A's availability is known; repoints also need the same recording (duration within ±3 s and same channel or overlapping titles).
+- **Only proven pairs.** A pair is acted on only when its gap in the alignment is one-to-one and A's availability is known; repoints also need the same recording (duration within ±3 s and same channel or overlapping titles). The one exception is opt-in: `--relike-unrendered` re-likes a single video that looks like music but isn't shown in YT Music, then checks that Liked songs gained at most that one entry.
 - **Every unlike is checked.** After each change `sync` confirms the rating and re-reads your whole Liked songs list. If anything else moved, A is re-liked and the run stops.
 - **Writes only on YouTube.** YT Music's own like button is never pressed: it shares the same rating, and pressing it duplicates or reverts entries.
 - **Local credentials.** Cookies and OAuth tokens stay in `~/.like-surgeon/`; the files the tool writes are owner-only (`0600`) on macOS and Linux.
@@ -132,18 +125,7 @@ Scans always fetch the full list; aligning a truncated list would be meaningless
 
 > **Cookie staleness.** YT Music cookies extracted from Chrome can go stale within about an hour. If `scan ytmusic` reports a logged-out response, re-run `auth ytmusic --from-browser chrome` and scan again right away.
 
-### 4. Inspect and back up
-
-```bash
-likesurgeon snapshots
-likesurgeon diff <old_snapshot_id> <new_snapshot_id>
-likesurgeon export <snapshot_id> --format json --output likes.json
-likesurgeon doctor
-```
-
-`doctor` summarizes both sources: counts, the latest diagnosis, and how many YT Music songs are traced to the like behind them.
-
-### 5. Compare
+### 4. Compare
 
 ```bash
 likesurgeon compare-likes
@@ -160,7 +142,7 @@ A pair (A shown as B) is **write-eligible** only at confidence 1.0: A's availabi
 
 `dead_unrendered` findings are yours to clean up by hand. A region block can lift, so unlike a blocked video only once you have liked a replacement. A **deleted** video can't be unliked through the YouTube Data API (`videos.rate` returns 404), but YT Music's rating call still removes the like — ytmusicapi `rate_song(videoId, "INDIFFERENT")`; check with `videos.getRating`, which still reads deleted videos. The video isn't shown in YT Music, so no other entry depends on it.
 
-### 6. Sync (write actions)
+### 5. Sync (write actions)
 
 `sync` applies the latest diagnosis's write-eligible findings, on YouTube only. It prints the plan and a quota estimate, warns if the diagnosis looks stale (a newer scan exists, or a scan it used is over an hour old), names any video an earlier run may have left unliked, then asks before writing.
 
@@ -212,6 +194,17 @@ Sync stops early when:
 - YouTube's daily quota runs out.
 
 The run exits non-zero if any action failed or it stopped early on an unreadable Liked songs list, after a restore, after an unconfirmed B undo, or after a `relike` went wrong.
+
+### 6. Back up and inspect
+
+```bash
+likesurgeon snapshots
+likesurgeon diff <old_snapshot_id> <new_snapshot_id>
+likesurgeon export <snapshot_id> --format json --output likes.json
+likesurgeon doctor
+```
+
+`doctor` summarizes both sources: counts, the latest diagnosis, and how many YT Music songs are traced to the like behind them.
 
 ## Caveats
 

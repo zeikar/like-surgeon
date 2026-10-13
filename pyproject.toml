@@ -1,7 +1,7 @@
 [project]
 name = "likesurgeon"
 version = "0.12.0"
-description = "Back up your YouTube Music liked songs, find relinked, duplicate and dead likes, and fix the ones it can prove."
+description = "Fix the mismatches between your YouTube Music liked songs and YouTube likes — swapped, duplicated, missing and dead songs. A local CLI that fixes only what it can prove."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -12,9 +12,11 @@ keywords = [
   "ytmusic",
   "youtube",
   "liked-songs",
+  "liked-videos",
   "likes",
   "backup",
   "ytmusicapi",
+  "youtube-data-api",
   "music-library",
   "cli",
 ]
