@@ -57,7 +57,7 @@ CI runs all three. `ruff format --check` is the easy miss — `ruff check` alone
 
 ## Workflow
 
-Feature work goes through a PR (squash merge to main, see PR #7 for the template). One-line patches, chore commits (version bumps), README fixes, and lint corrections can go straight to main — solo-maintained, CI runs on every push.
+Feature work goes through a PR (see PR #7 for the template). One-line patches, chore commits (version bumps), README fixes, and lint corrections can go straight to main — solo-maintained, CI runs on every push.
 
 ## Sync state model (when touching sync*.py / models)
 
