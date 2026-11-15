@@ -7,7 +7,14 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from sqlalchemy.orm import Session
 
-from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt, Track
+from likesurgeon.models import (
+    Diagnosis,
+    DiagnosisItem,
+    Snapshot,
+    SnapshotItem,
+    SyncAttempt,
+    Track,
+)
 from likesurgeon.snapshot import create_snapshot
 from likesurgeon.sync_dispatch import QUOTA_REJECTED
 from likesurgeon.sync_preflight import (
@@ -15,6 +22,7 @@ from likesurgeon.sync_preflight import (
     stranded_unliked_video_ids,
     sync_attempts_since,
     sync_attempts_since_older_scan,
+    unsettled_playlist_actions,
 )
 
 
@@ -532,3 +540,186 @@ def test_sync_attempts_since_older_scan_without_scans_uses_the_diagnosis_time(
     assert sync_attempts_since_older_scan(session, diag) == 0
     _write_at(session, t + timedelta(minutes=1))
     assert sync_attempts_since_older_scan(session, diag) == 1
+
+
+# --- unsettled playlist actions -------------------------------------------------
+
+T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def _pl_snapshot(
+    session: Session, source: str, playlist_id: str, at: datetime, *, title: str = "Mix"
+) -> Snapshot:
+    snap = Snapshot(
+        source=source, raw_count=0, playlist_id=playlist_id, playlist_title=title, created_at=at
+    )
+    session.add(snap)
+    session.flush()
+    return snap
+
+
+def _pl_item(session: Session, *, playlist_id: str = "PL1", position: int = 2) -> DiagnosisItem:
+    """A playlist finding: A on the YouTube side at ``position`` (0-based), B on YT Music."""
+    track = _ytm_track(session, f"a-{playlist_id}-{position}", source="youtube_playlist")
+    rows = []
+    for source, vid in (("youtube_playlist", "A"), ("ytmusic_playlist", "B")):
+        snap = _pl_snapshot(session, source, playlist_id, T0 - timedelta(days=1))
+        row = SnapshotItem(
+            snapshot_id=snap.id,
+            track_id=track.id,
+            position=position,
+            video_id=vid,
+            title="t",
+            artists="[]",
+            canonical_key="k",
+        )
+        session.add(row)
+        rows.append(row)
+    session.flush()
+    diag = Diagnosis(kind="playlists")
+    session.add(diag)
+    session.flush()
+    item = DiagnosisItem(
+        diagnosis_id=diag.id,
+        issue_type="playlist_relinked",
+        confidence=1.0,
+        reason="r",
+        source_item_id=rows[0].id,
+        related_item_id=rows[1].id,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def _rows(session: Session, item: DiagnosisItem, *rows: tuple, start: datetime = T0) -> None:
+    """Add attempts in order: ``(kind, status)`` or ``(kind, status, reason)``."""
+    for n, (kind, status, *reason) in enumerate(rows):
+        session.add(
+            SyncAttempt(
+                diagnosis_item_id=item.id,
+                kind=kind,
+                status=status,
+                reason=reason[0] if reason else "",
+                created_at=start + timedelta(minutes=n),
+            )
+        )
+    session.flush()
+
+
+CLEAN = [
+    ("playlist_precheck", "applied"),
+    ("playlist_insert", "applied"),
+    ("playlist_insert_verify", "applied"),
+    ("playlist_ytm_verify", "applied"),
+    ("playlist_delete", "applied"),
+    ("playlist_delete_verify", "applied"),
+    ("playlist_check", "applied"),
+]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        CLEAN[:2],  # died right after the insert call
+        CLEAN[:3],
+        CLEAN[:4],
+        CLEAN[:5],  # died after the delete call
+        CLEAN[:6],
+        [*CLEAN[:5], ("playlist_interrupted", "failed")],
+        [*CLEAN[:5], ("playlist_delete_verify", "failed")],  # unconfirmed delete
+        [*CLEAN[:6], ("playlist_restore", "failed"), ("playlist_restore_verify", "failed")],
+        [*CLEAN[:3], ("playlist_rollback", "failed")],
+        [*CLEAN[:3], ("playlist_rollback", "failed", f"{QUOTA_REJECTED}: x")],
+        [("playlist_precheck", "applied"), ("playlist_insert", "failed", "boom")],
+        # B removed but never confirmed gone
+        [*CLEAN[:3], ("playlist_rollback", "applied"), ("playlist_rollback_verify", "failed")],
+    ],
+)
+def test_unsettled_playlist_action_is_listed(session: Session, rows: list) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *rows)
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        CLEAN,
+        [  # restored: A put back, B removed and confirmed
+            *CLEAN[:6],
+            ("playlist_restore", "applied"),
+            ("playlist_restore_verify", "applied"),
+            ("playlist_rollback", "applied"),
+            ("playlist_rollback_verify", "applied"),
+        ],
+        [*CLEAN[:3], ("playlist_rollback", "applied"), ("playlist_rollback_verify", "applied")],
+        [("playlist_precheck", "applied"), ("playlist_insert", "failed", f"{QUOTA_REJECTED}: x")],
+        [("playlist_precheck", "failed")],
+        # an errored delete that landed passes both checks: still settled
+        [*CLEAN[:4], ("playlist_delete", "failed", "boom"), *CLEAN[5:]],
+    ],
+)
+def test_settled_playlist_action_is_not_listed(session: Session, rows: list) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *rows)
+    assert unsettled_playlist_actions(session) == []
+
+
+def test_playlist_precheck_of_a_later_run_does_not_settle(session: Session) -> None:
+    item = _pl_item(session)
+    _rows(
+        session, item, *CLEAN[:5], ("playlist_precheck", "applied"), ("playlist_precheck", "failed")
+    )
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+def test_action_settled_then_unsettled_again_is_listed(session: Session) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *CLEAN, ("playlist_precheck", "applied"), ("playlist_insert", "applied"))
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+def test_unsettled_action_retired_by_scans_of_both_sides(session: Session) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *CLEAN[:5])  # last write at T0 + 4 min
+    after = T0 + timedelta(hours=1)
+    _pl_snapshot(session, "ytmusic_playlist", "PL1", after)
+    assert unsettled_playlist_actions(session) != []  # YT Music side alone
+    _pl_snapshot(session, "youtube_playlist", "PL1", after)
+    assert unsettled_playlist_actions(session) == []
+
+
+def test_unsettled_action_stays_after_scan_of_other_playlists(session: Session) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *CLEAN[:5])
+    after = T0 + timedelta(hours=1)
+    for source in ("ytmusic_playlist", "youtube_playlist"):
+        _pl_snapshot(session, source, "PL-other", after)
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+def test_unsettled_action_stays_when_scans_predate_its_last_write(session: Session) -> None:
+    item = _pl_item(session)
+    _rows(session, item, *CLEAN[:5])
+    before = T0 + timedelta(minutes=2)
+    for source in ("ytmusic_playlist", "youtube_playlist"):
+        _pl_snapshot(session, source, "PL1", before)
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+def test_playlist_rows_do_not_count_as_likes_state(session: Session) -> None:
+    """``playlist_*`` rows, interrupted and restore included, never strand a
+    liked video or count toward the sync refusal."""
+    item = _pl_item(session)
+    item.source_track_id = _ytm_track(session, "vidA").id
+    _rows(
+        session,
+        item,
+        *CLEAN[:5],
+        ("playlist_interrupted", "failed"),
+        ("playlist_restore", "failed"),
+        ("playlist_rollback", "failed"),
+    )
+    assert stranded_unliked_video_ids(session) == frozenset()
+    assert sync_attempts_since(session, T0 - timedelta(days=1)) == 0

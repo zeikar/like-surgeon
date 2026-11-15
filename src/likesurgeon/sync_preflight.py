@@ -12,7 +12,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt, Track
-from .snapshot import YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS, latest_snapshot
+from .snapshot import (
+    YOUTUBE_LIKED_VIDEOS,
+    YOUTUBE_PLAYLIST,
+    YTMUSIC_LIKED_SONGS,
+    YTMUSIC_PLAYLIST,
+    latest_snapshot,
+)
 from .sync_dispatch import QUOTA_REJECTED
 
 STALE_AFTER = timedelta(hours=1)
@@ -134,6 +140,75 @@ def stranded_unliked_video_ids(session: Session) -> frozenset[str]:
         for vid, at in stranded.items()
         if vid not in last_scanned_liked or _as_utc(last_scanned_liked[vid]) <= _as_utc(at)
     )
+
+
+# Only these playlist rows settle an action: B in and A out with both sides
+# confirmed, or B out again with A in place. Every other row of an action may
+# leave the playlist changed or half-changed.
+_PLAYLIST_SETTLING = (("playlist_check", "applied"), ("playlist_rollback_verify", "applied"))
+_PLAYLIST_WRITE_KINDS = (
+    "playlist_insert",
+    "playlist_delete",
+    "playlist_restore",
+    "playlist_rollback",
+    "playlist_interrupted",
+)
+
+
+def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, str]]:
+    """Playlist repoints an earlier run left possibly half-done.
+
+    Each is (playlist title, A's 1-based position, A, B).
+
+    Per item, in row order, only an applied ``playlist_check`` or
+    ``playlist_rollback_verify`` settles it. An item is listed when, after its
+    last settling row, a write row was sent (any ``_PLAYLIST_WRITE_KINDS`` row
+    but a quota-rejected one, ``playlist_interrupted`` included). Prechecks,
+    verifies and reads change nothing, so they never settle. An action is
+    dropped once a YT Music and a YouTube scan of the same playlist are both
+    newer than its last write row: the next report shows what the playlist holds.
+    """
+    last_write: dict[int, datetime | None] = {}
+    for item_id, kind, status, reason, at in session.execute(
+        select(
+            SyncAttempt.diagnosis_item_id,
+            SyncAttempt.kind,
+            SyncAttempt.status,
+            SyncAttempt.reason,
+            SyncAttempt.created_at,
+        )
+        .where(SyncAttempt.kind.startswith("playlist_", autoescape=True))
+        .order_by(SyncAttempt.id)
+    ):
+        if (kind, status) in _PLAYLIST_SETTLING:
+            last_write[item_id] = None
+        elif kind in _PLAYLIST_WRITE_KINDS and not (reason or "").startswith(QUOTA_REJECTED):
+            last_write[item_id] = at
+    listed: list[tuple[str, int, str, str]] = []
+    for item_id, at in last_write.items():
+        if at is None:
+            continue
+        item = session.get(DiagnosisItem, item_id)
+        a = session.get(SnapshotItem, item.source_item_id) if item.source_item_id else None
+        if a is None:
+            continue
+        b = session.get(SnapshotItem, item.related_item_id) if item.related_item_id else None
+        snap = session.get(Snapshot, a.snapshot_id)
+        rescanned = set(
+            session.scalars(
+                select(Snapshot.source).where(
+                    Snapshot.playlist_id == snap.playlist_id,
+                    Snapshot.source.in_((YTMUSIC_PLAYLIST, YOUTUBE_PLAYLIST)),
+                    Snapshot.created_at > _as_utc(at),
+                )
+            )
+        )
+        if len(rescanned) == 2:
+            continue
+        listed.append(
+            (snap.playlist_title or "", a.position + 1, a.video_id or "", b.video_id if b else "")
+        )
+    return sorted(listed)
 
 
 def diagnosis_staleness(session: Session, diag: Diagnosis, *, now: datetime) -> list[str]:
