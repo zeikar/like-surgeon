@@ -20,9 +20,10 @@ this action added, by its item id (found by reading the YouTube side when the
 insert call errored) — and confirms the YouTube side is the baseline again. A
 B that may be in the playlist but can't be identified, removed or confirmed
 gone is reported in ``left_inserted``; so is an accepted insert that still
-isn't listed, as it may land later. Only an errored insert that didn't land,
-or that landed at A's index and was cleanly removed, lets the run go on;
-everything else stops it.
+isn't listed, as it may land later. Only an errored insert that landed at A's
+index and was cleanly removed lets the run go on; everything else stops it
+(an errored insert not seen after the re-read may still land, so it is
+reported too).
 
 After A's delete is sent, B is never removed while A's item may still be
 listed: a delete the YouTube side can't confirm (A's item still listed after
@@ -436,8 +437,9 @@ class _PlaylistRun:
     def _settle_errored_insert(self, action: PlaylistAction, base: _Sides) -> _Outcome:
         """After an insert call that errored, so B's item id is unknown: B
         landed if the YouTube side is the baseline plus exactly one item of B,
-        which is then removed. The run goes on only if B didn't land or landed
-        at A's index and was cleanly removed."""
+        which is then removed. A timeout doesn't prove rejection, so B unseen after
+        the re-read may still land: it is reported and the run stops. The run
+        goes on only if B landed at A's index and was cleanly removed."""
         p, b = action.a_index, action.b_video_id
 
         def at_p(got: _YouTube) -> bool:
@@ -459,8 +461,9 @@ class _PlaylistRun:
                 action.item_id,
                 "playlist_insert_verify",
                 "failed",
-                f"B isn't listed ({_RECHECKED}) — the insert call errored and didn't land",
+                f"B isn't listed ({_RECHECKED}) — the insert call errored, so it may still land",
             )
+            self._report_inserted(action)
             return "failed"
         added = _added_item(base.youtube, youtube, b)
         if added is None:

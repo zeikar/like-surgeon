@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from .align import AlignmentResult, LMBacking, pair_passes_sanity
 from .compare import CanonicalMetadata
 from .drift import DriftFinding
-from .models import Diagnosis, DiagnosisItem, SnapshotItem
+from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem
 from .normalize import normalize_for_match
 
 ISSUE_METADATA_DRIFT = "metadata_drift"
@@ -284,11 +284,13 @@ def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
     ``'skipped'`` — set
     by ``sync`` on a cross-prop verify-miss, or by ``likesurgeon skip`` —
     would silently re-open on the next run and re-fire the same writes.
-    A finding matches on ``(issue_type, source_track_id, related_track_id)``,
-    and its status is taken from the most recent earlier diagnosis that
-    contains it — so a gap (e.g. a diagnosis that didn't contain it)
-    doesn't drop the skip, while flipping the item to ``'open'`` on the
-    latest diagnosis still un-skips it for good.
+    A finding matches on ``(issue_type, source_track_id, related_track_id)``
+    plus, for a playlist finding, the playlist A sits in (tracks are shared
+    across playlists; a skip must not cover the same pair elsewhere). Its
+    status is taken from the most recent earlier diagnosis that contains it, so
+    a gap (a diagnosis that didn't contain it) doesn't drop the skip, while
+    flipping the item to ``'open'`` on the latest diagnosis still un-skips it
+    for good.
     """
     rows = session.execute(
         select(
@@ -296,21 +298,27 @@ def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
             DiagnosisItem.source_track_id,
             DiagnosisItem.related_track_id,
             DiagnosisItem.status,
+            Snapshot.playlist_id,
         )
         .join(Diagnosis, DiagnosisItem.diagnosis_id == Diagnosis.id)
+        .outerjoin(SnapshotItem, DiagnosisItem.source_item_id == SnapshotItem.id)
+        .outerjoin(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
         .where(Diagnosis.id != diagnosis.id)
         .order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc())
     )
-    last_status: dict[tuple[str, int | None, int | None], str] = {}
-    for issue_type, source_id, related_id, status in rows:
-        last_status.setdefault((issue_type, source_id, related_id), status)
+    last_status: dict[tuple[str, int | None, int | None, str | None], str] = {}
+    for issue_type, source_id, related_id, status, playlist_id in rows:
+        last_status.setdefault((issue_type, source_id, related_id, playlist_id), status)
     carried = 0
-    for it in session.scalars(
-        select(DiagnosisItem).where(
-            DiagnosisItem.diagnosis_id == diagnosis.id, DiagnosisItem.status == "open"
-        )
-    ):
-        if last_status.get((it.issue_type, it.source_track_id, it.related_track_id)) == "skipped":
+    current = session.execute(
+        select(DiagnosisItem, Snapshot.playlist_id)
+        .outerjoin(SnapshotItem, DiagnosisItem.source_item_id == SnapshotItem.id)
+        .outerjoin(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
+        .where(DiagnosisItem.diagnosis_id == diagnosis.id, DiagnosisItem.status == "open")
+    )
+    for it, playlist_id in current:
+        key = (it.issue_type, it.source_track_id, it.related_track_id, playlist_id)
+        if last_status.get(key) == "skipped":
             it.status = "skipped"
             carried += 1
     return carried

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from likesurgeon.compare import CanonicalMetadata
 from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS, ISSUE_PLAYLIST_RELINKED
+from likesurgeon.models import SnapshotItem
 from likesurgeon.playlist_repoint import (
     PlaylistAction,
     PlaylistPair,
@@ -270,6 +271,25 @@ def test_persist_report_carries_over_a_skipped_pair(session: Session):
     _, _, (second, carried) = _reportable(session, read)
     assert carried == 1
     assert second.items[0].status == "skipped"
+
+
+def test_a_skip_carries_over_only_to_the_same_playlist(session: Session):
+    reads = (
+        _read("PLa", "Mix", _TRACKS, _YOUTUBE),
+        _read("PLb", "Other", _TRACKS, _YOUTUBE),
+    )
+    _, _, (first, _) = _reportable(session, *reads)
+    by_playlist = {
+        session.get(SnapshotItem, it.source_item_id).snapshot.playlist_id: it for it in first.items
+    }
+    by_playlist["PLb"].status = "skipped"
+    _, _, (second, carried) = _reportable(session, *reads)
+    assert carried == 1
+    status = {
+        session.get(SnapshotItem, it.source_item_id).snapshot.playlist_id: it.status
+        for it in second.items
+    }
+    assert status == {"PLa": "open", "PLb": "skipped"}
 
 
 def _linked(video_id: str, item_id: str, position: int, available: bool = True) -> dict:

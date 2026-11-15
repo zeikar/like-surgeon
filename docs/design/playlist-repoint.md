@@ -44,8 +44,8 @@ A repoint keeps the playlist's length and every other slot, so a later action's 
 | A was put back after the delete (restored) | `skipped` | stops |
 | Quota rejected the insert (nothing sent) | `open` | stops (quota) |
 | Quota rejected the delete; B removed again | `open` | stops (quota) |
-| Insert errored and didn't land, or landed at A's index and was removed | `open` | continues |
-| Insert errored and landed elsewhere | `open`, B in `left_inserted` or removed | stops |
+| Insert errored and landed at A's index; B removed | `open` | continues |
+| Insert errored and landed elsewhere, or isn't listed after the re-read (it may still land) | `open`, B in `left_inserted` or removed | stops |
 | 2xx insert not listed after the re-read | `open`, B in `left_inserted` | stops |
 | YouTube side after the insert isn't the expected list; B removed | `open` | stops |
 | Delete not confirmed | `open`, `delete_unconfirmed` | stops |
@@ -101,7 +101,7 @@ Out of scope: a playable A shown as another video (the user added that video on 
 ## Known limits
 
 - **A wrong B that renders as itself passes every check.** If YT Music shows B as B, the post-check can't tell a right pair from a wrong one. The same-recording check and the review before `--apply` are the guards; `skip` anything doubtful.
-- **Skips carry across playlists.** A skip carries over by (issue type, A, B), so it also covers the same pair in another playlist.
+- **Skips carry per playlist.** A skip carries over by (issue type, A, B, playlist), so the same pair in another playlist is a separate finding.
 - **Playable A's and delete-only duplicates are out of scope.** Report-only findings stay in the report and are never acted on.
 - **Coincidental equal-size gaps.** If YT Music shows an entry the Data API doesn't list, a gap can pair the wrong items while its two sides still have equal counts. Only the same-recording check and the both-sides-before-delete rule guard this.
 - **Stale reads.** A YT Music read served from before the insert would pass the post-check, as with the likes repoint's "LM unchanged" check.

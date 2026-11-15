@@ -404,7 +404,7 @@ def test_an_accepted_insert_that_is_not_listed_is_reported_and_stops_the_run(
     assert sleeps == [5, 15]
 
 
-def test_an_insert_that_errored_and_did_not_land_stays_open(
+def test_an_insert_that_errored_and_is_not_listed_is_reported_and_stops(
     session: Session, sleeps: list[float]
 ) -> None:
     acct, actions, states = _prepared(session)
@@ -412,8 +412,10 @@ def test_an_insert_that_errored_and_did_not_land_stays_open(
 
     res = execute(session, actions, states, ytm=acct, yt=acct)
 
-    assert res == PlaylistExecResult(applied=2, failed=1, skipped=0)
-    assert sleeps[:2] == [5, 15]  # "didn't land" only after the re-read
+    assert res.applied == 0 and res.failed == 1
+    assert res.left_inserted == (("T PL1", 2, "B1"),)  # a timeout isn't a rejection
+    assert res.aborted == PLAYLIST_STOP
+    assert sleeps[:2] == [5, 15]  # "unchanged" only after the re-read
     assert _steps(session, actions[0].item_id) == [
         ("playlist_precheck", "applied"),
         ("playlist_insert", "failed"),
@@ -596,7 +598,7 @@ def test_a_failed_insert_after_an_applied_repoint_does_not_make_the_playlist_sta
     actions = [_action(session, diag, acct, "PL1", i) for i in range(3)]
     states = _states(acct)
     session.commit()
-    acct.insert_errors = {"B2"}  # didn't land: the run goes on
+    acct.insert_errors_after_landing = {"B2"}  # lands at A's index, removed: the run goes on
 
     res = execute(session, actions, states, ytm=acct, yt=acct)
 
