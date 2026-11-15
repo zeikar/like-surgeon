@@ -1,7 +1,8 @@
 """Typer CLI for likesurgeon.
 
 Every command only reads the providers and writes the local DB, except
-``sync`` and ``canonicalize --apply``, which write likes on YouTube.
+``sync`` and ``canonicalize --apply``, which write likes on YouTube, and
+``repoint-playlists --apply``, which edits playlists on YouTube.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ from .sync_preflight import (
     diagnosis_staleness,
     stranded_unliked_video_ids,
     sync_attempts_since_older_scan,
+    unsettled_playlist_actions,
 )
 from .youtube_client import playlist_item_video_id
 from .ytmusic_client import (
@@ -1322,7 +1324,11 @@ def repoint_playlists_cmd(
     ] = False,
     limit: Annotated[
         int | None,
-        typer.Option("--limit", min=0, help="With --apply: act on at most N findings."),
+        typer.Option(
+            "--limit",
+            min=0,
+            help="With --apply: act on at most the first N findings (smallest playlists first).",
+        ),
     ] = None,
     yes: Annotated[
         bool,
@@ -1334,7 +1340,9 @@ def repoint_playlists_cmd(
     Reads the latest playlist scan and saves one playlist_relinked finding per
     dead item on a playlist's YouTube side that YT Music shows as another
     video in its place. videos.list metadata for both videos decides which are
-    write-eligible. Nothing is written to YouTube, except by --apply.
+    write-eligible. Nothing is written to YouTube, except by --apply, which
+    replaces each open write-eligible finding's dead item with the video YT
+    Music shows in its place, smallest playlists first.
     """
     from .playlist_repoint import find_pairs, persist_report
     from .playlists import load_scan
@@ -1342,7 +1350,8 @@ def repoint_playlists_cmd(
     if not apply and (limit is not None or yes):
         _fail("--limit and --yes only apply with --apply.", code=2)
     if apply:
-        _fail("--apply is not implemented yet.", code=2)
+        _repoint_playlists_apply(limit=limit, yes=yes)
+        return
 
     cfg, factory = _bootstrap()
     warnings: list[str] = []
@@ -1393,6 +1402,169 @@ def repoint_playlists_cmd(
         "Review them, keep any out with [cyan]likesurgeon skip <id>[/cyan], then run "
         "[cyan]likesurgeon repoint-playlists --apply[/cyan]."
     )
+
+
+def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
+    """``repoint-playlists --apply``: act on the latest playlists report, behind
+    the same gates as ``canonicalize --apply``. Every action re-reads both
+    sides of its playlist before writing, so a playlist that changed since the
+    scan only gets no writes."""
+    from sqlalchemy import select
+
+    from . import playlist_dispatch, playlist_repoint
+    from .models import PlaylistScan, SnapshotItem
+
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_PLAYLISTS)
+        if diag is None:
+            console.print(
+                "[yellow]No playlist repoint report yet.[/yellow] "
+                "Run [cyan]likesurgeon repoint-playlists[/cyan] first."
+            )
+            raise typer.Exit(1)
+        latest_scan = session.scalars(
+            select(PlaylistScan.id).order_by(PlaylistScan.created_at.desc(), PlaylistScan.id.desc())
+        ).first()
+        if latest_scan != diag.playlist_scan_id:
+            console.print(
+                f"[yellow]Playlist scan #{latest_scan} is newer than the scan "
+                f"(#{diag.playlist_scan_id}) report #{diag.id} was built on.[/yellow] "
+                "Re-run [cyan]likesurgeon repoint-playlists[/cyan] first."
+            )
+            raise typer.Exit(1)
+        actions, states = playlist_repoint.plan(session, diag)
+        if limit is not None and limit < len(actions):
+            console.print(
+                f"[yellow]--limit {limit}: applying the first {limit} of "
+                f"{len(actions)} actions.[/yellow]"
+            )
+            actions = actions[:limit]
+        if actions:
+            related = {it.id: it.related_item_id for it in diag.items}
+            table = Table(
+                title=f"Playlist repoint report #{diag.id} — plan, smallest playlists first"
+            )
+            for column in ("ID", "Playlist", "Position", "A", "B", "B's title"):
+                table.add_column(
+                    column, justify="right" if column in ("ID", "Position") else "left"
+                )
+            for a in actions:
+                b_title = session.get_one(SnapshotItem, related[a.item_id]).title
+                table.add_row(
+                    str(a.item_id),
+                    escape(a.playlist_title),
+                    str(a.a_index + 1),
+                    a.a_video_id,
+                    a.b_video_id,
+                    escape(b_title),
+                )
+            console.print(table)
+        console.print(playlist_repoint.summarize(actions, states))
+        if unsettled := unsettled_playlist_actions(session):
+            console.print(
+                f"[bold red]{len(unsettled)} playlist repoint(s) an earlier run left unsettled, "
+                "so B may sit next to A or A may be gone:[/bold red] "
+                + "; ".join(
+                    f"{escape(title)} position {pos}: {a} → {b}" for title, pos, a, b in unsettled
+                )
+                + ". Check those slots on YouTube; each drops off this list once "
+                "[cyan]scan playlists[/cyan] has read its playlist again."
+            )
+        if not actions:
+            console.print("Nothing to apply.")
+            return
+
+        if not yes and not typer.confirm("Proceed?", default=False):
+            raise typer.Abort()
+
+        # Function-local so tests can swap the class on the youtube_client module.
+        from .youtube_client import YouTubeClient
+
+        yt = YouTubeClient(
+            client_secrets_path=cfg.youtube_oauth_client_path,
+            token_path=cfg.youtube_token_path,
+        )
+        if not yt.has_write_scope():
+            console.print(
+                "[yellow]YouTube write scope not granted.[/yellow] "
+                "Run [cyan]likesurgeon auth youtube[/cyan] to re-grant it."
+            )
+            raise typer.Exit(1)
+
+        ytm = _ytmusic_client(cfg)
+        # Every write is checked against the playlist's YT Music side; browser
+        # cookies go stale fast, so fail here (after the one automatic refresh)
+        # rather than mid-run.
+        try:
+            ytm.fetch_liked_songs(limit=1)
+        except (AuthFileMissingError, UnexpectedResponseError) as e:
+            console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {escape(str(e))}")
+            raise typer.Exit(1) from e
+        result = playlist_dispatch.execute(session, actions, states, ytm=ytm, yt=yt)
+
+    console.print(
+        f"[bold]Playlist repoint result:[/bold] "
+        f"applied=[green]{result.applied}[/green] "
+        f"failed=[red]{result.failed}[/red] "
+        f"skipped=[yellow]{result.skipped}[/yellow] "
+        f"restored=[yellow]{result.restored}[/yellow]"
+    )
+    if result.skipped:
+        console.print(
+            f"[yellow]{result.skipped} action(s) were undone:[/yellow] YT Music didn't show "
+            "the playlist as expected, so the change was reverted and the finding marked "
+            f"'skipped'. See [cyan]likesurgeon issues --type {ISSUE_PLAYLIST_RELINKED}[/cyan]."
+        )
+    if result.stale_playlists:
+        title = {a.playlist_id: a.playlist_title for a in actions}
+        console.print(
+            "[yellow]These playlists changed since the scan, so they got no writes:[/yellow] "
+            + ", ".join(escape(title[pid]) for pid in result.stale_playlists)
+            + ". Re-scan with [cyan]likesurgeon scan playlists[/cyan]."
+        )
+    if result.quota_exhausted:
+        console.print(
+            f"[red]YouTube daily quota exhausted — stopped early; {result.unattempted} "
+            "action(s) not attempted.[/red] After it resets (midnight Pacific), re-scan and "
+            "apply again."
+        )
+    if result.aborted:
+        console.print(
+            f"[red]Stopped early: {escape(result.aborted)}; {result.unattempted} action(s) "
+            "not attempted.[/red]"
+        )
+    # Each independent of ``aborted``: a delete can go unconfirmed on a read error too.
+    if result.left_inserted:
+        console.print(
+            "[bold red]A repoint inserted B and it may still be in the playlist next to A; "
+            "remove it by hand:[/bold red] "
+            + "; ".join(f"{escape(t)} position {pos}: {b}" for t, pos, b in result.left_inserted)
+        )
+    if result.left_removed:
+        console.print(
+            "[bold red]A repoint deleted A and it may not be back (B stays in its slot); "
+            "add A back by hand at its position:[/bold red] "
+            + "; ".join(f"{escape(t)} position {pos}: {a}" for t, pos, a in result.left_removed)
+        )
+    if result.delete_unconfirmed:
+        console.print(
+            "[bold red]A's delete was sent but couldn't be confirmed, so nothing was undone "
+            "and B was kept at A's position:[/bold red] "
+            + "; ".join(
+                f"{escape(t)} position {pos}: {a} (kept {b})"
+                for t, pos, a, b in result.delete_unconfirmed
+            )
+            + ". Once the delete has had time to land, check by hand that A's item is gone "
+            "from the playlist, and remove it if not."
+        )
+    console.print(
+        "Before the next [cyan]repoint-playlists --apply[/cyan], run "
+        "[cyan]likesurgeon scan playlists[/cyan] and [cyan]likesurgeon repoint-playlists[/cyan] "
+        "again: the report no longer matches the playlists this run changed."
+    )
+    if result.failed or result.aborted or result.quota_exhausted or result.stale_playlists:
+        raise typer.Exit(1)
 
 
 def _set_findings_status(item_ids: list[int], *, to: str) -> None:

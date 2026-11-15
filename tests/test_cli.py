@@ -24,6 +24,7 @@ import likesurgeon.youtube_client as _yt_mod
 from likesurgeon.youtube_client import VideoStatus
 
 from .fake_account import FakeAccount
+from .fake_playlists import FakePlaylistAccount
 
 
 def test_resolve_region_prefers_cli_over_config() -> None:
@@ -3588,3 +3589,350 @@ def test_skip_without_any_report_names_every_report_command(fake_home: Path) -> 
 
     assert result.exit_code == 1, result.output
     assert "repoint-playlists" in _out(result)
+
+
+# ---------------------------------------------------------------------------
+# repoint-playlists --apply. The scan and report are seeded on the on-disk DB
+# from a ``FakePlaylistAccount``, which then backs both clients.
+# ---------------------------------------------------------------------------
+
+
+class _FakePlaylistYouTube:
+    """``YouTubeClient`` for `repoint-playlists --apply`, backed by ``account``."""
+
+    account: FakePlaylistAccount
+    has_write_scope_return: bool = True
+    constructed: int = 0
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).constructed += 1
+
+    def has_write_scope(self) -> bool:
+        return type(self).has_write_scope_return
+
+    def insert_playlist_item(self, playlist_id: str, video_id: str, position: int) -> str:
+        return type(self).account.insert_playlist_item(playlist_id, video_id, position)
+
+    def delete_playlist_item(self, item_id: str) -> None:
+        type(self).account.delete_playlist_item(item_id)
+
+    def read_playlist_items(self, playlist_id: str) -> list[tuple[str, str | None]]:
+        return type(self).account.read_playlist_items(playlist_id)
+
+
+class _FakePlaylistYTMusic:
+    """``YTMusicClient`` for `repoint-playlists --apply`: playlists come from
+    ``account``; ``probe_error`` fails the auth probe."""
+
+    account: FakePlaylistAccount
+    probe_error: Exception | None = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        if type(self).probe_error is not None:
+            raise type(self).probe_error
+        return []
+
+    def fetch_playlist(self, playlist_id: str) -> dict[str, Any]:
+        return type(self).account.fetch_playlist(playlist_id)
+
+
+@pytest.fixture
+def patch_playlist_apply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap both clients for the playlist fakes; no real waits in the dispatcher."""
+    import likesurgeon.cli as _cli_mod
+
+    monkeypatch.setattr("likesurgeon.playlist_dispatch.time.sleep", lambda _s: None)
+    _FakePlaylistYouTube.has_write_scope_return = True
+    _FakePlaylistYouTube.constructed = 0
+    _FakePlaylistYTMusic.probe_error = None
+    monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakePlaylistYouTube)
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", _FakePlaylistYTMusic)
+
+
+def _seed_playlist_repoint(
+    home: Path,
+    playlists: dict[str, list[tuple[str, bool]]],
+    renders: dict[str, str | None],
+) -> FakePlaylistAccount:
+    """An account holding ``playlists`` (id → YouTube side as (video, available)),
+    shown in YT Music per ``renders``, plus a playlist scan of it and the
+    report built on that scan, every pair write-eligible. Playlist ``X`` is
+    titled ``[Mix] X``. Wires the account into both client fakes."""
+    from likesurgeon.compare import CanonicalMetadata
+    from likesurgeon.playlist_repoint import find_pairs, persist_report
+    from likesurgeon.playlists import load_scan
+    from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
+
+    account = FakePlaylistAccount(
+        {pid: [(f"pi_{v}", v) for v, _ in items] for pid, items in playlists.items()},
+        renders=renders,
+    )
+    reads = [
+        PlaylistRead(
+            playlist_id=pid,
+            title=f"[Mix] {pid}",
+            ytmusic={
+                "id": pid,
+                "title": f"[Mix] {pid}",
+                "owned": True,
+                "tracks": [_ytm_track(v) for v in account.ytmusic(pid)],
+            },
+            youtube_items=[
+                _pl_yt(v, i, ok, None if ok else "region-blocked")
+                for i, (v, ok) in enumerate(items)
+            ],
+        )
+        for pid, items in playlists.items()
+    ]
+    s = _open_db(home)
+    try:
+        scan = create_playlist_scan(s, reads)
+        pairs = find_pairs(load_scan(s, scan.id)).pairs
+        metadata = {
+            v: CanonicalMetadata(video_id=v, title="Song", channel_id="UC1", duration_seconds=200)
+            for p in pairs
+            for v in (p.a.video_id, p.b.video_id)
+        }
+        persist_report(s, scan.id, pairs, metadata)
+        s.commit()
+    finally:
+        s.close()
+    _FakePlaylistYouTube.account = account
+    _FakePlaylistYTMusic.account = account
+    return account
+
+
+def _one_pair(home: Path) -> FakePlaylistAccount:
+    """``PLmix`` = [v1, A, v3] with region-blocked A shown as B."""
+    return _seed_playlist_repoint(
+        home, {"PLmix": [("v1", True), ("A", False), ("v3", True)]}, {"A": "B"}
+    )
+
+
+def _apply(*args: str, input: str | None = None) -> Any:
+    from likesurgeon.cli import app
+
+    return CliRunner().invoke(
+        app, ["repoint-playlists", "--apply", *args], input=input, env={"COLUMNS": "400"}
+    )
+
+
+def test_repoint_playlists_apply_without_a_report_exits_one(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert "No playlist repoint report yet" in _out(result)
+    assert "likesurgeon repoint-playlists" in _out(result)
+
+
+def test_repoint_playlists_apply_refuses_a_report_older_than_the_latest_scan(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.snapshot import create_playlist_scan
+
+    account = _one_pair(fake_home)
+    s = _open_db(fake_home)
+    try:
+        create_playlist_scan(s, [])
+        s.commit()
+    finally:
+        s.close()
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "Playlist scan #2 is newer than the scan" in out
+    assert "Re-run likesurgeon repoint-playlists first" in out
+    assert account.write_calls == []
+    assert _FakePlaylistYouTube.constructed == 0
+
+
+def test_repoint_playlists_apply_with_nothing_to_apply_builds_no_youtube_client(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.cli import app
+
+    _one_pair(fake_home)
+    [(_, item_id, _, _)] = _playlist_findings(fake_home)
+    assert CliRunner().invoke(app, ["skip", str(item_id)]).exit_code == 0
+
+    result = _apply()
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to apply" in _out(result)
+    assert _FakePlaylistYouTube.constructed == 0
+
+
+def test_repoint_playlists_apply_declined_prompt_writes_nothing(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _one_pair(fake_home)
+
+    result = _apply(input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "Proceed?" in result.output
+    assert account.write_calls == []
+    assert [st for *_, st in _playlist_findings(fake_home)] == ["open"]
+
+
+def test_repoint_playlists_apply_missing_write_scope_blocks_run(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _one_pair(fake_home)
+    _FakePlaylistYouTube.has_write_scope_return = False
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert "write scope not granted" in _out(result)
+    assert account.write_calls == []
+
+
+def test_repoint_playlists_apply_failing_ytmusic_auth_blocks_run(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    account = _one_pair(fake_home)
+    _FakePlaylistYTMusic.probe_error = UnexpectedResponseError("cookies expired")
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert "YouTube Music auth check failed: cookies expired" in _out(result)
+    assert account.write_calls == []
+
+
+def test_repoint_playlists_apply_replaces_a_with_b(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _one_pair(fake_home)
+    [(diag_id, item_id, _, _)] = _playlist_findings(fake_home)
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 0, result.output
+    assert [v for _, v in account.playlists["PLmix"]] == ["v1", "B", "v3"]
+    assert [st for *_, st in _playlist_findings(fake_home)] == ["applied"]
+    out = _cells(result)
+    assert f"Playlist repoint report #{diag_id} — plan" in out
+    # id, playlist (markup printed literally), A's position, A, B, B's title
+    assert f"{item_id} [Mix] PLmix 2 A B Track B" in out
+    assert "Playlist repoint plan: Actions: 1 Playlists: 1" in out
+    assert "quota" in out.lower()
+    assert "Playlist repoint result: applied=1 failed=0 skipped=0 restored=0" in out
+    assert "run likesurgeon scan playlists and likesurgeon repoint-playlists again" in out
+
+
+def test_repoint_playlists_apply_limit_takes_the_smallest_playlist_first(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_repoint(
+        fake_home,
+        {
+            "PLbig": [("v1", True), ("A1", False), ("v3", True), ("v4", True)],
+            "PLsmall": [("w1", True), ("A2", False)],
+        },
+        {"A1": "B1", "A2": "B2"},
+    )
+
+    result = _apply("--yes", "--limit", "1")
+
+    assert result.exit_code == 0, result.output
+    assert "--limit 1: applying the first 1 of 2 actions" in _out(result)
+    assert [v for _, v in account.playlists["PLsmall"]] == ["w1", "B2"]
+    assert [v for _, v in account.playlists["PLbig"]] == ["v1", "A1", "v3", "v4"]
+
+
+def test_repoint_playlists_apply_names_a_stale_playlist_and_exits_one(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _one_pair(fake_home)
+    account.playlists["PLmix"].append(("pi_new", "v9"))  # changed since the scan
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert account.write_calls == []
+    out = _out(result)
+    assert "changed since the scan" in out
+    assert "[Mix] PLmix" in out
+    assert "likesurgeon scan playlists" in out
+
+
+def _leave_inserted(account: FakePlaylistAccount) -> None:
+    account.quota_after = 2  # baseline read and insert; B's removal is refused too
+
+
+def _leave_removed(account: FakePlaylistAccount) -> None:
+    account.ytm_reads_returning = {3: ["v1", "v3"], 4: ["v1", "v3"]}  # YT Music off after delete
+    account.insert_errors = {"A"}  # and A can't be put back
+
+
+def _leave_delete_unconfirmed(account: FakePlaylistAccount) -> None:
+    account.delete_does_not_land = {"pi_A"}
+
+
+@pytest.mark.parametrize(
+    ("knob", "expected"),
+    [
+        (_leave_inserted, ["may still be in the playlist", "[Mix] PLmix position 2: B"]),
+        (_leave_removed, ["may not be back", "[Mix] PLmix position 2: A"]),
+        (
+            _leave_delete_unconfirmed,
+            [
+                "couldn't be confirmed",
+                "B was kept",
+                "has had time to land",
+                "[Mix] PLmix position 2: A (kept B)",
+            ],
+        ),
+    ],
+    ids=["left_inserted", "left_removed", "delete_unconfirmed"],
+)
+def test_repoint_playlists_apply_names_what_it_left_behind(
+    fake_home: Path, patch_playlist_apply: None, knob: Any, expected: list[str]
+) -> None:
+    account = _one_pair(fake_home)
+    knob(account)
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    for text in expected:
+        assert text in out
+    assert "run likesurgeon scan playlists and likesurgeon repoint-playlists again" in out
+
+
+def test_repoint_playlists_apply_lists_unsettled_actions_before_the_prompt(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.models import SyncAttempt
+
+    _one_pair(fake_home)
+    [(_, item_id, _, _)] = _playlist_findings(fake_home)
+    s = _open_db(fake_home)
+    try:
+        s.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id, kind="playlist_insert", status="applied", reason=""
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    result = _apply(input="n\n")
+
+    out = _out(result)
+    assert "an earlier run left unsettled" in out
+    assert "[Mix] PLmix position 2: A → B" in out
+    assert out.index("unsettled") < out.index("Proceed?")
