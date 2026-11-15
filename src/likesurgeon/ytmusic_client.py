@@ -42,10 +42,12 @@ class UnexpectedResponseError(RuntimeError):
 
 
 class StaleAuthError(UnexpectedResponseError):
-    """A Liked songs read failed the way stale cookies fail: a response
-    ytmusicapi couldn't parse (logged-out page) or a server error such as 401.
-    Transport errors stay plain ``UnexpectedResponseError``: new cookies
-    wouldn't fix them, so they never trigger a refresh."""
+    """A Liked songs or library playlists read failed the way stale cookies
+    fail: a response ytmusicapi couldn't parse (logged-out page), a server
+    error such as 401, or (library playlists only) an empty library whose
+    account menu can't be read. Transport errors stay plain
+    ``UnexpectedResponseError``: new cookies wouldn't fix them, so they never
+    trigger a refresh."""
 
 
 class CookieExtractionError(RuntimeError):
@@ -313,6 +315,41 @@ def _account_identity(client: YTMusic) -> str:
     return parse_account_menu(response)
 
 
+def _read(call: Callable[[], Any], what: str) -> Any:
+    """``call()``, one ytmusicapi read, with its failures wrapped as
+    ``UnexpectedResponseError`` (``StaleAuthError`` when stale cookies are the
+    likely cause). ``what`` names the response in the parse-failure message."""
+    try:
+        return call()
+    except (KeyError, IndexError) as exc:
+        # ytmusicapi's response parser (`ytmusicapi.navigation.nav`) re-raises
+        # whichever of KeyError / IndexError it caught — string keys vs. list
+        # indices in the navigation path. Both surface from the same failure
+        # mode (logged-out / shape-changed response), so we catch both rather
+        # than try to fingerprint the cause at this boundary. Recovery is
+        # identical for either.
+        raise StaleAuthError(
+            f"ytmusicapi failed to parse the {what} response. "
+            "This usually means your ytmusicapi auth file is stale "
+            "(browser-header cookies expired, or the YouTube session "
+            "was signed out elsewhere), but it could also mean ytmusicapi's "
+            "expected response shape has changed upstream. First try "
+            "`likesurgeon auth ytmusic` to refresh; if that doesn't fix "
+            "it, file an issue and include the original error."
+        ) from exc
+    except YTMusicServerError as exc:  # e.g. 401 on stale cookies
+        raise StaleAuthError(
+            f"ytmusicapi request failed ({type(exc).__name__}: {exc}). "
+            "If this persists, refresh auth with `likesurgeon auth ytmusic`."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — system-boundary catch
+        # Transport errors, malformed JSON bodies, ...
+        raise UnexpectedResponseError(
+            f"ytmusicapi request failed ({type(exc).__name__}: {exc}). "
+            "If this persists, refresh auth with `likesurgeon auth ytmusic`."
+        ) from exc
+
+
 class YTMusicClient:
     """Resolves the browser-header auth file and proxies calls.
 
@@ -320,6 +357,10 @@ class YTMusicClient:
       * tests can subclass and override ``_build`` to inject a fake YTMusic.
       * the CLI sees one clear exception when auth isn't set up yet, instead
         of leaking ytmusicapi internals.
+
+    Only the Liked songs and library playlists reads refresh stale cookies.
+    Per-item reads (artist pages, playlists) collect errors instead, so one
+    page ytmusicapi can't parse doesn't re-extract cookies.
     """
 
     def __init__(
@@ -329,11 +370,11 @@ class YTMusicClient:
         refresh_account: str | None = None,
         on_refresh: Callable[[str], None] | None = None,
     ) -> None:
-        """``refresh_browser`` / ``refresh_account``: when a Liked songs read
-        fails like stale cookies do (they go stale within the hour), re-extract
-        cookies from this browser once, provided it is still signed in to this
-        account (``account_identity``). Both are needed; ``on_refresh(browser)``
-        is told before the retry."""
+        """``refresh_browser`` / ``refresh_account``: when a Liked songs or
+        library playlists read fails like stale cookies do (they go stale
+        within the hour), re-extract cookies from this browser once, provided
+        it is still signed in to this account (``account_identity``). Both are
+        needed; ``on_refresh(browser)`` is told before the retry."""
         self._browser_path = browser_path
         self._refresh_browser = refresh_browser
         self._refresh_account = refresh_account
@@ -372,14 +413,7 @@ class YTMusicClient:
         once; if the refresh or the retry fails, that raises
         ``UnexpectedResponseError``.
         """
-        try:
-            result = self._request_liked_songs(limit)
-        except StaleAuthError as exc:
-            browser, account = self._refresh_browser, self._refresh_account
-            target = self._browser_path
-            if browser is None or account is None or target is None:
-                raise
-            result = self._refresh_and_request(browser, account, target, limit, exc)
+        result = self._read_refreshing(lambda: self._request_liked_songs(limit))
         if not isinstance(result, dict):
             raise UnexpectedResponseError(
                 f"ytmusicapi.get_liked_songs returned a {type(result).__name__}, "
@@ -400,41 +434,66 @@ class YTMusicClient:
         return list(tracks)
 
     def _request_liked_songs(self, limit: int | None) -> Any:
-        """One ``get_liked_songs`` call on a fresh client, its failures wrapped
-        as ``UnexpectedResponseError`` (``StaleAuthError`` when stale cookies
-        are the likely cause); the payload is returned unchecked."""
+        """One ``get_liked_songs`` call on a fresh client (see ``_read``); the
+        payload is returned unchecked."""
         client = self._build()
-        try:
-            # Typed ``int`` upstream, but forwarded as-is to ``get_playlist``,
-            # where ``None`` follows every continuation.
-            return client.get_liked_songs(limit=limit)  # type: ignore[arg-type]
-        except (KeyError, IndexError) as exc:
-            # ytmusicapi's response parser (`ytmusicapi.navigation.nav`) re-raises
-            # whichever of KeyError / IndexError it caught — string keys vs. list
-            # indices in the navigation path. Both surface from the same failure
-            # mode (logged-out / shape-changed response), so we catch both rather
-            # than try to fingerprint the cause at this boundary. Recovery is
-            # identical for either.
-            raise StaleAuthError(
-                "ytmusicapi failed to parse the liked-songs response. "
-                "This usually means your ytmusicapi auth file is stale "
-                "(browser-header cookies expired, or the YouTube session "
-                "was signed out elsewhere), but it could also mean ytmusicapi's "
-                "expected response shape has changed upstream. First try "
-                "`likesurgeon auth ytmusic` to refresh; if that doesn't fix "
-                "it, file an issue and include the original error."
-            ) from exc
-        except YTMusicServerError as exc:  # e.g. 401 on stale cookies
-            raise StaleAuthError(
-                f"ytmusicapi request failed ({type(exc).__name__}: {exc}). "
-                "If this persists, refresh auth with `likesurgeon auth ytmusic`."
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 — system-boundary catch
-            # Transport errors, malformed JSON bodies, ...
+        # Typed ``int`` upstream, but forwarded as-is to ``get_playlist``,
+        # where ``None`` follows every continuation.
+        return _read(lambda: client.get_liked_songs(limit=limit), "liked-songs")  # type: ignore[arg-type]
+
+    def fetch_library_playlists(self) -> list[dict[str, Any]]:
+        """Every playlist in the library (``get_library_playlists``), raw.
+
+        Refreshes cookies like ``fetch_liked_songs``. Raises
+        ``UnexpectedResponseError`` unless the result is a list of dicts each
+        with a non-empty string ``playlistId``.
+        """
+        result = self._read_refreshing(self._request_library_playlists)
+        if not isinstance(result, list):
             raise UnexpectedResponseError(
-                f"ytmusicapi request failed ({type(exc).__name__}: {exc}). "
-                "If this persists, refresh auth with `likesurgeon auth ytmusic`."
-            ) from exc
+                f"ytmusicapi.get_library_playlists returned a {type(result).__name__}, "
+                "expected a list. The library's response shape may have changed; "
+                "see https://github.com/sigma67/ytmusicapi/issues."
+            )
+        for entry in result:
+            playlist_id = entry.get("playlistId") if isinstance(entry, dict) else None
+            if not isinstance(playlist_id, str) or not playlist_id:
+                raise UnexpectedResponseError(
+                    "ytmusicapi.get_library_playlists returned an entry without a "
+                    f"playlistId: {entry!r}."
+                )
+        return list(result)
+
+    def _request_library_playlists(self) -> Any:
+        """One ``get_library_playlists`` call on a fresh client (see ``_read``);
+        the payload is returned unchecked."""
+        client = self._build()
+        result = _read(lambda: client.get_library_playlists(limit=None), "library-playlists")
+        if isinstance(result, list) and not result:
+            # ytmusicapi parses a logged-out library page as no playlists
+            # (where get_liked_songs would raise); only a signed-in session
+            # can read its account menu.
+            try:
+                _account_identity(client)
+            except UnexpectedResponseError as exc:
+                raise StaleAuthError(
+                    f"ytmusicapi returned no library playlists and {exc}. Your ytmusicapi "
+                    "auth file is probably stale; refresh it with `likesurgeon auth ytmusic`."
+                ) from exc
+        return result
+
+    def _read_refreshing(self, request: Callable[[], Any]) -> Any:
+        """``request()``, refreshed and retried once (``_refresh_and_request``)
+        on a ``StaleAuthError`` when a browser, an account and an auth file are
+        all set; otherwise its error propagates."""
+        try:
+            return request()
+        except StaleAuthError as exc:
+            browser, account = self._refresh_browser, self._refresh_account
+            target = self._browser_path
+            if browser is None or account is None or target is None:
+                raise
+            return self._refresh_and_request(browser, account, target, request, exc)
 
     def account_identity(self) -> str:
         """The signed-in account's channel handle, or ``<email sha256>|name``
@@ -444,7 +503,12 @@ class YTMusicClient:
         return _account_identity(self._build())
 
     def _refresh_and_request(
-        self, browser: str, account: str, target: Path, limit: int | None, failure: Exception
+        self,
+        browser: str,
+        account: str,
+        target: Path,
+        request: Callable[[], Any],
+        failure: Exception,
     ) -> Any:
         """Re-extract cookies from ``browser`` into the auth file ``target`` and
         repeat the request once.
@@ -490,7 +554,7 @@ class YTMusicClient:
             # dispatcher then restores and stops, which is always safe.
             if self._on_refresh is not None:
                 self._on_refresh(browser)
-            return self._request_liked_songs(limit)
+            return request()
         except Exception as retry_exc:  # noqa: BLE001 — incl. AuthFileMissingError on the new file
             raise UnexpectedResponseError(
                 f"{retry_exc} (Retried once after refreshing cookies from {browser}.)"
@@ -540,6 +604,34 @@ class YTMusicClient:
                 errors[channel_id] = f"{type(exc).__name__}: {exc}"
             if on_progress is not None:
                 on_progress(done, len(ids))
+            if done < len(ids):
+                time.sleep(0.2)
+        return results, errors
+
+    def fetch_playlists(
+        self, playlist_ids: Iterable[str]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        """Read each playlist with all its tracks; returns ``(results, errors)``
+        by playlist id. ``results[id]`` is the raw ``get_playlist`` dict, with a
+        list under ``tracks``. A failing playlist lands in ``errors`` with its
+        message and the rest continue; only a missing auth file stops the run.
+        Never refreshes cookies (see the class docstring).
+        """
+        ids = list(playlist_ids)
+        client = self._build()
+        results: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        for done, playlist_id in enumerate(ids, start=1):
+            try:
+                playlist = client.get_playlist(playlist_id, limit=None)  # type: ignore[arg-type]
+                if not isinstance(playlist, dict) or not isinstance(playlist.get("tracks"), list):
+                    raise UnexpectedResponseError(
+                        "ytmusicapi.get_playlist returned no list of tracks "
+                        f"(got a {type(playlist).__name__})."
+                    )
+                results[playlist_id] = playlist
+            except Exception as exc:  # noqa: BLE001 — per-playlist boundary: one bad playlist mustn't abort the run
+                errors[playlist_id] = f"{type(exc).__name__}: {exc}"
             if done < len(ids):
                 time.sleep(0.2)
         return results, errors
