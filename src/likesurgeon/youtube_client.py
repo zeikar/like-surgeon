@@ -414,6 +414,17 @@ class YouTubeClient:
         """
         service = self._service()
         playlist_id = self._resolve_likes_playlist_id(service)
+        return self.fetch_playlist_items(playlist_id, limit, service=service)
+
+    def fetch_playlist_items(
+        self, playlist_id: str, limit: int | None = None, *, service: Any = None
+    ) -> list[dict[str, Any]]:
+        """Paginate ``playlistItems.list`` for one playlist (up to ``limit`` items).
+
+        ``service`` lets a caller reading many playlists build it once.
+        """
+        if service is None:
+            service = self._service()
         items: list[dict[str, Any]] = []
         page_token: str | None = None
         while limit is None or len(items) < limit:
@@ -430,6 +441,41 @@ class YouTubeClient:
             if not page_token:
                 break
         return items[:limit]
+
+    def fetch_playlists(
+        self, playlist_ids: list[str]
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+        """Read each playlist's items by id; returns ``(results, errors)``.
+
+        The account may have no YouTube channel (``playlists.list(mine=true)``
+        404s), so there is no listing or visibility lookup: a playlist the Data
+        API can't read (e.g. a YT Music-only one) fails on its own read and
+        lands in ``errors`` without affecting the others. Quota exhaustion
+        fails that playlist and every remaining one without further calls.
+        Only a missing client secret / authorization escapes.
+        """
+        from googleapiclient.errors import HttpError
+
+        service = self._service()
+        results: dict[str, list[dict[str, Any]]] = {}
+        errors: dict[str, str] = {}
+        quota_message: str | None = None
+        for playlist_id in playlist_ids:
+            if quota_message is not None:
+                errors[playlist_id] = quota_message
+                continue
+            try:
+                results[playlist_id] = self.fetch_playlist_items(playlist_id, service=service)
+            except (ClientSecretsMissingError, AuthorizationRequiredError):
+                raise
+            except HttpError as exc:
+                # str(exc) embeds the request URL, which carries the API key.
+                errors[playlist_id] = f"HTTP {exc.status_code}: {exc.reason}"
+                if _is_quota_exceeded(exc):
+                    quota_message = errors[playlist_id]
+            except Exception as exc:  # noqa: BLE001 - one playlist must not sink the rest
+                errors[playlist_id] = f"{type(exc).__name__}: {exc}"
+        return results, errors
 
     def fetch_likes_item_count(self) -> int:
         """Return the likes playlist's ``itemCount`` (1 quota unit once the

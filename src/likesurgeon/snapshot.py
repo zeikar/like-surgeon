@@ -1,6 +1,7 @@
 """Snapshot ingestion and retrieval.
 
-This module is the only writer of ``Track`` and ``Snapshot`` rows. Callers
+This module is the only writer of ``Track``, ``Snapshot`` and ``PlaylistScan``
+rows, and of the ``playlist_*`` columns on ``Snapshot``. Callers
 hand it raw provider dicts; ``_TRANSLATORS`` dispatches to the source's
 translator, which normalizes the dict into a ``record`` shape that
 ``_upsert_track`` and ``create_snapshot`` consume.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,11 +24,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from .classify import classify
-from .models import Snapshot, SnapshotItem, Track
+from .models import PlaylistScan, Snapshot, SnapshotItem, Track
 from .normalize import canonical_key
 
 YTMUSIC_LIKED_SONGS = "ytmusic_liked_songs"
 YOUTUBE_LIKED_VIDEOS = "youtube_liked_videos"
+YTMUSIC_PLAYLIST = "ytmusic_playlist"
+YOUTUBE_PLAYLIST = "youtube_playlist"
 
 
 def _utcnow() -> datetime:
@@ -86,6 +90,7 @@ def _ytmusic_to_record(item: dict[str, Any]) -> dict[str, Any]:
         "canonical_key": canon,
         "dedupe_key": dedupe,
         "raw": item,
+        "video_type": item.get("videoType"),
         "is_music_candidate": None,  # ytmusic source: every track is music
         "music_candidate_score": None,
         "music_candidate_reason": None,
@@ -176,6 +181,8 @@ def _youtube_to_record(item: dict[str, Any]) -> dict[str, Any]:
 _TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     YTMUSIC_LIKED_SONGS: _ytmusic_to_record,
     YOUTUBE_LIKED_VIDEOS: _youtube_to_record,
+    YTMUSIC_PLAYLIST: _ytmusic_to_record,
+    YOUTUBE_PLAYLIST: _youtube_to_record,
 }
 
 
@@ -254,6 +261,7 @@ def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any
                 ),
                 canonical_key=rec["canonical_key"],
                 raw_json=json.dumps(rec["raw"], ensure_ascii=False),
+                video_type=rec.get("video_type"),
                 is_music_candidate=rec["is_music_candidate"],
                 music_candidate_score=rec["music_candidate_score"],
                 music_candidate_reason=rec["music_candidate_reason"],
@@ -263,6 +271,63 @@ def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any
         )
     session.flush()
     return snapshot
+
+
+@dataclass(frozen=True)
+class PlaylistRead:
+    """One playlist as read from both providers.
+
+    ``youtube_items`` is ``None`` when the playlist has no YouTube side
+    (e.g. a YT Music-only playlist the Data API can't list).
+    """
+
+    playlist_id: str
+    title: str
+    ytmusic: dict[str, Any]
+    youtube_items: list[dict[str, Any]] | None
+
+
+# Track lists are stored as items; related/suggestions aren't part of the playlist.
+_HEADER_EXCLUDED = {"tracks", "related", "suggestions"}
+
+
+def create_playlist_scan(session: Session, reads: Iterable[PlaylistRead]) -> PlaylistScan:
+    """Persist one playlist scan: a ``PlaylistScan`` row plus a snapshot per side per read."""
+    scan = PlaylistScan(created_at=_utcnow())
+    session.add(scan)
+    session.flush()
+    for read in reads:
+        ytm = create_snapshot(session, YTMUSIC_PLAYLIST, read.ytmusic.get("tracks") or [])
+        ytm.playlist_owned = read.ytmusic.get("owned")
+        ytm.playlist_raw_json = json.dumps(
+            {k: v for k, v in read.ytmusic.items() if k not in _HEADER_EXCLUDED},
+            ensure_ascii=False,
+        )
+        ytm.playlist_scan_id = scan.id
+        ytm.playlist_id = read.playlist_id
+        ytm.playlist_title = read.title
+        if read.youtube_items is not None:
+            add_youtube_playlist_snapshot(
+                session, scan.id, read.playlist_id, read.title, read.youtube_items
+            )
+    session.flush()
+    return scan
+
+
+def add_youtube_playlist_snapshot(
+    session: Session,
+    scan_id: int,
+    playlist_id: str,
+    title: str,
+    items: Iterable[dict[str, Any]],
+) -> Snapshot:
+    """Attach a ``youtube_playlist`` snapshot to an existing scan, so the YT Music
+    backup can be committed before the advisory YouTube read."""
+    snap = create_snapshot(session, YOUTUBE_PLAYLIST, items)
+    snap.playlist_scan_id = scan_id
+    snap.playlist_id = playlist_id
+    snap.playlist_title = title
+    return snap
 
 
 def list_snapshots(session: Session) -> list[Snapshot]:

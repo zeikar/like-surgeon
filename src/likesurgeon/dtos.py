@@ -86,10 +86,20 @@ class SnapshotDTO(BaseModel):
     source: str
     created_at: datetime
     raw_count: int
+    # Playlist snapshots only (None, and left out of the export, for likes).
+    playlist_id: str | None = None
+    playlist_title: str | None = None
+    playlist_owned: bool | None = None
+    playlist_header: dict[str, Any] | None = None
 
     @classmethod
     def from_orm_snapshot(cls, snapshot: Snapshot) -> SnapshotDTO:
+        raw = snapshot.playlist_raw_json
         return cls(
+            playlist_id=snapshot.playlist_id,
+            playlist_title=snapshot.playlist_title,
+            playlist_owned=snapshot.playlist_owned,
+            playlist_header=json.loads(raw) if raw else None,
             id=snapshot.id,
             source=snapshot.source,
             created_at=snapshot.created_at,

@@ -28,14 +28,15 @@ uv run ruff format .
 Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<module>.py`. Three flavors:
 
 - **Unit** — pure-functional modules (`classify`, `normalize`, `drift`, `align`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network. `test_align.py` drives the LL→LM alignment with small synthetic lists (consecutive relinks, duplicate copies, edge gaps, *k* ≠ *m*). `test_canonicalize.py` drives `find_candidates` with hand-built liked-song dicts and `ArtistSongs` pages (`song` / `page` helpers: title key, ±1 s, listed vs. unlisted, unreadable artists, the version-keyword net); its `persist_report` and `plan` tests use the `session` fixture below. `test_ytmusic_client.py` feeds `parse_artist_page` minimal raw `browse` responses (a headerless promo carousel, a plain channel, an artist page without its songs shelf, a shelf without a Show-all link).
-- **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_pipeline`, `test_sync`, `test_sync_dispatch`, `test_sync_preflight`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
+- **Integration** — `test_db`, `test_snapshot`, `test_playlists`, `test_diagnosis`, `test_pipeline`, `test_sync`, `test_sync_dispatch`, `test_sync_preflight`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
   ```python
   @pytest.fixture
   def session() -> Iterator[Session]:
       """In-memory SQLite session, schema initialized."""
   ```
+  `test_playlists.py` builds playlist scans with `create_playlist_scan` and checks the report (music share, dead and unchecked items, playlists without a YouTube side, empty playlists).
   `diff_snapshots` takes a `Session` and reads snapshot/items rows directly, so it lives with the integration tier rather than the pure modules above.
-- **CLI wiring** — `test_cli` uses Typer's `CliRunner` against a `tmp_path` home (`LIKE_SURGEON_HOME` env override) and monkeypatched fakes for `YouTubeClient` / `YTMusicClient`. The pattern: replace the provider class on the module the command imports it from, then assert the captured kwargs. `canonicalize` report mode uses the discovery fake `_FakeYTMusicDiscovery` (fixture `patch_discovery_client`, swapped onto `cli.YTMusicClient`): class-level liked songs, artist pages and per-artist errors, plus a `during_artist_read` hook that runs mid-read so a test can inspect the DB (the snapshot is committed before artist pages are read) or make a write there. `canonicalize --apply` uses `FakeAccount` like `sync`.
+- **CLI wiring** — `test_cli` uses Typer's `CliRunner` against a `tmp_path` home (`LIKE_SURGEON_HOME` env override) and monkeypatched fakes for `YouTubeClient` / `YTMusicClient`. The pattern: replace the provider class on the module the command imports it from, then assert the captured kwargs. `canonicalize` report mode uses the discovery fake `_FakeYTMusicDiscovery` (fixture `patch_discovery_client`, swapped onto `cli.YTMusicClient`): class-level liked songs, artist pages and per-artist errors, plus a `during_artist_read` hook that runs mid-read so a test can inspect the DB (the snapshot is committed before artist pages are read) or make a write there. `canonicalize --apply` uses `FakeAccount` like `sync`. `scan playlists` uses a fake YT Music client (library list, per-playlist results and errors) and a fake YouTube client (per-playlist items, per-playlist errors, video statuses), swapped in the same way; the tests cover a YouTube side that fails, is unauthorized or is partial, and that nothing is written.
 - **Live** — `test_ytmusic_client_live.py` is opt-in (`@pytest.mark.live`), deselected by default via `pyproject.toml`. Set `LIKESURGEON_LIVE_BROWSER=firefox` to point at a non-default browser:
   ```bash
   uv run pytest -m live
@@ -71,7 +72,7 @@ Two auth flows live in this project. Both write credentials to `~/.like-surgeon/
 
 ### YouTube Music (browser-header)
 
-Cookie-based auth via [browser-cookie3](https://pypi.org/project/browser-cookie3/). The `--from-browser` flag reads cookies straight from a logged-in browser's local store, writes a ytmusicapi-compatible `browser.json` and records the browser and signed-in account as `ytmusic_browser` / `ytmusic_account` in `config.json`. Every CLI `YTMusicClient` gets both, so a stale Liked songs read re-extracts cookies once and retries if the browser is still that account (verified on a candidate file before it replaces `browser.json`; refresh-path `_build` overrides take an optional `path`); the manual flow clears both keys. Tests fake the extraction by monkeypatching `write_browser_json_from_browser` (on `likesurgeon.ytmusic_client` for the client, on `likesurgeon.cli` for `auth`, plus `YTMusicClient.account_identity`) — never a real browser. The `real_ytmusic_client` fixture in `test_cli.py` runs the real client over `FakeAccount` to test a refresh inside a `sync` LM check.
+Cookie-based auth via [browser-cookie3](https://pypi.org/project/browser-cookie3/). The `--from-browser` flag reads cookies straight from a logged-in browser's local store, writes a ytmusicapi-compatible `browser.json` and records the browser and signed-in account as `ytmusic_browser` / `ytmusic_account` in `config.json`. Every CLI `YTMusicClient` gets both, so a stale Liked songs or library playlists read (`scan playlists`) re-extracts cookies once and retries if the browser is still that account (verified on a candidate file before it replaces `browser.json`; refresh-path `_build` overrides take an optional `path`); the manual flow clears both keys. An empty library list followed by an unreadable account menu also counts as stale, because a logged-out library page parses as no playlists; per-playlist reads never refresh. Tests fake the extraction by monkeypatching `write_browser_json_from_browser` (on `likesurgeon.ytmusic_client` for the client, on `likesurgeon.cli` for `auth`, plus `YTMusicClient.account_identity`) — never a real browser. The `real_ytmusic_client` fixture in `test_cli.py` runs the real client over `FakeAccount` to test a refresh inside a `sync` LM check.
 
 ```bash
 uv run likesurgeon auth ytmusic --from-browser chrome
@@ -108,13 +109,15 @@ YouTube Data API default daily quota is **10,000 units**. A single full scan of 
 - ~100 units for `videos.list?part=status,contentDetails` (50 video ids per call, 1 unit/call regardless of `part` selection)
 - 1 unit for the likes `itemCount` lookup (`playlists.list`; the likes playlist id was already resolved by the fetch) that `scan youtube-likes` runs afterwards
 
+`scan playlists` costs 1 unit per 50 items of each playlist (`playlistItems.list`; at least 1 per playlist tried, including playlists the Data API can't read, which fail with an error), plus 1 unit per 50 distinct videos for availability.
+
 So you can comfortably re-scan dozens of times per day. If you hit the quota, the YouTube client surfaces a clean `quota_exceeded` reason rather than a traceback.
 
 ## Database operations
 
 ### Schema lifecycle
 
-`init_db(engine)` (called from `_bootstrap`) creates all tables on first run. There is no Alembic-style migration framework, but `make_engine` calls [`_migrate_in_place`](../src/likesurgeon/db.py) on every connection, which idempotently issues `ALTER TABLE ... ADD COLUMN` for nullable columns introduced after a table was first created (e.g. `snapshot_items.is_available` / `unavailable_reason` from 0.3). Existing rows aren't rewritten — the new columns just default to NULL.
+`init_db(engine)` (called from `_bootstrap`) creates all tables on first run. There is no Alembic-style migration framework, but `make_engine` calls [`_migrate_in_place`](../src/likesurgeon/db.py) on every connection, which idempotently issues `ALTER TABLE ... ADD COLUMN` for nullable columns introduced after a table was first created (e.g. `snapshot_items.is_available` / `unavailable_reason` from 0.3, and the `snapshots.playlist_*` columns and `snapshot_items.video_type` for playlist scans). Existing rows aren't rewritten — the new columns just default to NULL.
 
 This handles **additive** changes only. For breaking schema changes (renamed columns, type changes, FK reshuffles) during the 0.x series, drop the DB and re-scan:
 
@@ -134,6 +137,11 @@ The DB only holds derived data (snapshots are local archives, diagnoses are loca
 # Recent snapshots
 uv run sqlite3 ~/.like-surgeon/like-surgeon.sqlite \
   "SELECT id, source, created_at, raw_count FROM snapshots ORDER BY id DESC LIMIT 10;"
+
+# Snapshots of the latest playlist scan
+uv run sqlite3 ~/.like-surgeon/like-surgeon.sqlite \
+  "SELECT id, source, playlist_title, raw_count FROM snapshots
+   WHERE playlist_scan_id = (SELECT MAX(id) FROM playlist_scans) ORDER BY id;"
 
 # Why was a specific video classified as unavailable?
 uv run sqlite3 ~/.like-surgeon/like-surgeon.sqlite \
@@ -159,7 +167,7 @@ LIKE_SURGEON_HOME="$SCRATCH" uv run likesurgeon scan youtube-likes --region KR
 rm -rf "$SCRATCH"
 ```
 
-**Tracebacks for unexpected failures.** The CLI catches known exceptions (`InvalidRegionError`, `ClientSecretsMissingError`, `AuthorizationRequiredError`, `CookieExtractionError`, plus `AuthFileMissingError` / `UnexpectedResponseError` from YT Music and `HttpError` from the YouTube liked-videos fetch) and converts them to `_fail(...)`. The YT Music client wraps every ytmusicapi failure (parse, server, transport) into those two types, keeping the original as `__cause__`. Anything else (e.g. sqlalchemy IntegrityError) is intentionally allowed to propagate as a traceback so you have stack frames to debug from.
+**Tracebacks for unexpected failures.** The CLI catches known exceptions (`InvalidRegionError`, `ClientSecretsMissingError`, `AuthorizationRequiredError`, `CookieExtractionError`, plus `AuthFileMissingError` / `UnexpectedResponseError` from YT Music and `HttpError` from the YouTube liked-videos fetch; `scan playlists` fails only on the YT Music library read, since its YouTube side turns any error into a warning) and converts them to `_fail(...)`. The YT Music client wraps every ytmusicapi failure (parse, server, transport) into those two types, keeping the original as `__cause__`. Anything else (e.g. sqlalchemy IntegrityError) is intentionally allowed to propagate as a traceback so you have stack frames to debug from.
 
 **JSON output for piping.** `issues --format json` is structured for `jq` / `python3 -c '...'`:
 

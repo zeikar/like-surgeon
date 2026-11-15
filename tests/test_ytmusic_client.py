@@ -16,6 +16,7 @@ from likesurgeon.ytmusic_client import (
     AuthFileMissingError,
     CookieExtractionError,
     MissingSongsShelfError,
+    StaleAuthError,
     UnexpectedResponseError,
     YTMusicClient,
     parse_account_menu,
@@ -34,6 +35,10 @@ class _FakeYTMusic:
         self.last_limit = limit
         return self._payload
 
+    def get_library_playlists(self, limit: int | None) -> Any:
+        self.last_limit = limit
+        return self._payload
+
     def _send_request(self, endpoint: str, body: dict[str, Any]) -> Any:
         self.browse_calls.append((endpoint, body))
         result = self._payload[body["browseId"]]
@@ -44,8 +49,13 @@ class _FakeYTMusic:
         return result
 
     def get_playlist(self, playlist_id: str, limit: int | None = None) -> Any:
+        """The payload's entry for ``playlist_id`` (raised if an exception),
+        else a one-song playlist."""
         self.playlist_calls.append((playlist_id, limit))
-        return {"tracks": [{"videoId": f"{playlist_id}-song"}]}
+        result = self._payload.get(playlist_id, {"tracks": [{"videoId": f"{playlist_id}-song"}]})
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class _FakeClient(YTMusicClient):
@@ -215,27 +225,40 @@ def account_menu(account: dict[str, Any]) -> dict[str, Any]:
 
 
 class _SequenceYTMusic:
-    """Fake YTMusic whose successive ``get_liked_songs`` calls (shared across
-    rebuilds) raise or return the next item of ``outcomes``; ``account`` is
-    what the account menu reports (an exception is raised)."""
+    """Fake YTMusic whose successive reads (``get_liked_songs``,
+    ``get_library_playlists``, ``get_playlist``; shared across rebuilds) raise
+    or return the next item of ``outcomes``; ``account`` is what the account
+    menu reports (an exception is raised; a list gives successive reports)."""
 
     def __init__(self, outcomes: list[Any], account: Any = None) -> None:
         self.outcomes = outcomes
         self.calls = 0
         self.account = {"accountName": "Me", "channelHandle": "@me"} if account is None else account
+        self.account_reads = 0
 
-    def get_liked_songs(self, limit: int | None) -> Any:
+    def _next(self) -> Any:
         outcome = self.outcomes[self.calls]
         self.calls += 1
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
+    def get_liked_songs(self, limit: int | None) -> Any:
+        return self._next()
+
+    def get_library_playlists(self, limit: int | None) -> Any:
+        return self._next()
+
+    def get_playlist(self, playlist_id: str, limit: int | None = None) -> Any:
+        return self._next()
+
     def _send_request(self, endpoint: str, body: dict[str, Any]) -> Any:
         assert endpoint == "account/account_menu"
-        if isinstance(self.account, BaseException):
-            raise self.account
-        return account_menu(self.account)
+        self.account_reads += 1
+        account = self.account.pop(0) if isinstance(self.account, list) else self.account
+        if isinstance(account, BaseException):
+            raise account
+        return account_menu(account)
 
 
 class _RefreshClient(YTMusicClient):
@@ -592,6 +615,94 @@ def test_fetch_liked_songs_failing_on_refresh_fails_the_read(
     fake = _SequenceYTMusic([_STALE, {"tracks": []}])
     with pytest.raises(UnexpectedResponseError, match="stderr closed.*Retried once"):
         _refresh_client(fake, auth_file, on_refresh=boom).fetch_liked_songs()
+
+
+def test_fetch_library_playlists_returns_every_playlist() -> None:
+    payload = [{"playlistId": "PL1", "title": "Road trip"}, {"playlistId": "LM", "title": "Liked"}]
+    client = _FakeClient(payload)
+    assert client.fetch_library_playlists() == payload
+    assert client.fake is not None
+    assert client.fake.last_limit is None
+
+
+@pytest.mark.parametrize(
+    "first_failure", [_STALE, YTMusicServerError("Server returned HTTP 401: Unauthorized.")]
+)
+def test_fetch_library_playlists_refreshes_cookies_and_retries_once(
+    extractions: list[tuple[str, Path]], auth_file: Path, first_failure: Exception
+) -> None:
+    fake = _SequenceYTMusic([first_failure, [{"playlistId": "PL1"}]])
+    assert _refresh_client(fake, auth_file).fetch_library_playlists() == [{"playlistId": "PL1"}]
+    assert len(extractions) == 1
+    assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+    assert fake.calls == 2
+
+
+def test_fetch_library_playlists_transport_error_is_not_refreshed(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic([ConnectionError("network down"), [{"playlistId": "PL1"}]])
+    with pytest.raises(UnexpectedResponseError, match="network down"):
+        _refresh_client(fake, auth_file).fetch_library_playlists()
+    assert extractions == []
+
+
+def test_fetch_library_playlists_empty_with_readable_account_is_empty(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """A signed-in account without playlists: the menu still names it."""
+    fake = _SequenceYTMusic([[]])
+    assert _refresh_client(fake, auth_file).fetch_library_playlists() == []
+    assert fake.account_reads == 1
+    assert extractions == []
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+
+
+def test_fetch_library_playlists_empty_with_unreadable_account_refreshes(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """ytmusicapi reads a logged-out library page as no playlists; an account
+    menu that can't be read tells it apart from an empty library."""
+    fake = _SequenceYTMusic(
+        [[], [{"playlistId": "PL1"}]],
+        # Stale cookies; then the refresh's check of the new cookies.
+        account=[KeyError("accountName"), {"accountName": "Me", "channelHandle": "@me"}],
+    )
+    assert _refresh_client(fake, auth_file).fetch_library_playlists() == [{"playlistId": "PL1"}]
+    assert len(extractions) == 1
+    assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+    assert fake.calls == 2
+
+
+def test_fetch_library_playlists_empty_with_unreadable_account_without_refresh_raises(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic([[], []], account=KeyError("accountName"))
+    with pytest.raises(StaleAuthError, match="couldn't confirm the signed-in"):
+        _RefreshClient(fake, auth_file).fetch_library_playlists()
+    assert extractions == []
+    assert fake.calls == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"playlists": []},
+        [{"title": "no id"}],
+        [{"playlistId": ""}],
+        [{"playlistId": 7}],
+        ["PL1"],
+    ],
+    ids=["not-a-list", "no-id", "empty-id", "non-string-id", "entry-not-a-dict"],
+)
+def test_fetch_library_playlists_reshaped_response_is_not_refreshed(
+    extractions: list[tuple[str, Path]], auth_file: Path, payload: Any
+) -> None:
+    fake = _SequenceYTMusic([payload, [{"playlistId": "PL1"}]])
+    with pytest.raises(UnexpectedResponseError, match="get_library_playlists"):
+        _refresh_client(fake, auth_file).fetch_library_playlists()
+    assert extractions == []
+    assert fake.calls == 1
 
 
 class _StubCookie:
@@ -1064,3 +1175,59 @@ def test_fetch_artist_songs_missing_auth_raises() -> None:
     client = YTMusicClient(browser_path=Path("/nope/browser.json"))
     with pytest.raises(AuthFileMissingError):
         client.fetch_artist_songs(["UC1"])
+
+
+def test_fetch_playlists_reads_each_playlist_with_one_build(sleeps: list[float]) -> None:
+    road_trip = {"title": "Road trip", "tracks": [{"videoId": "v1"}]}
+    client = _ArtistClient({"PL1": road_trip})  # get_playlist reads the payload by id
+    results, errors = client.fetch_playlists(["PL1", "PL2"])
+    assert errors == {}
+    assert results == {"PL1": road_trip, "PL2": {"tracks": [{"videoId": "PL2-song"}]}}
+    assert client.builds == 1
+    assert client.fake is not None
+    assert client.fake.playlist_calls == [("PL1", None), ("PL2", None)]
+    assert sleeps == [0.2]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        KeyError("contents"),
+        YTMusicServerError("Server returned HTTP 500"),
+        ["not", "a", "dict"],
+        {"title": "no tracks"},
+        {"tracks": "not-a-list"},
+    ],
+    ids=["parse-error", "server-error", "not-a-dict", "no-tracks", "tracks-not-a-list"],
+)
+def test_fetch_playlists_one_failing_playlist_does_not_stop_the_rest(
+    sleeps: list[float], bad: Any
+) -> None:
+    client = _ArtistClient({"PL1": bad})
+    results, errors = client.fetch_playlists(["PL1", "PL2"])
+    assert set(errors) == {"PL1"}
+    if isinstance(bad, Exception):
+        assert errors["PL1"] == f"{type(bad).__name__}: {bad}"
+    else:
+        assert errors["PL1"].startswith("UnexpectedResponseError: ")
+    assert set(results) == {"PL2"}
+
+
+def test_fetch_playlists_failure_does_not_refresh_cookies(
+    extractions: list[tuple[str, Path]], auth_file: Path, sleeps: list[float]
+) -> None:
+    """One playlist ytmusicapi can't parse isn't a reason to re-extract cookies."""
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}])
+    client = _refresh_client(fake, auth_file)
+    results, errors = client.fetch_playlists(["PL1", "PL2"])
+    assert set(errors) == {"PL1"}
+    assert results == {"PL2": {"tracks": []}}
+    assert extractions == []
+    assert client.built_from == [None]
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+
+
+def test_fetch_playlists_missing_auth_raises() -> None:
+    client = YTMusicClient(browser_path=Path("/nope/browser.json"))
+    with pytest.raises(AuthFileMissingError):
+        client.fetch_playlists(["PL1"])

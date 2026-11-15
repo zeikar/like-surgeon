@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from sqlalchemy.orm import sessionmaker
 
 from . import __version__
@@ -40,7 +41,11 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .pipeline import MissingSnapshotsError, compare_and_persist
+from .playlists import is_backed_up, playlist_report
 from .snapshot import (
+    PlaylistRead,
+    add_youtube_playlist_snapshot,
+    create_playlist_scan,
     create_snapshot,
     get_snapshot_items,
     list_snapshots,
@@ -82,7 +87,9 @@ app = typer.Typer(
     add_completion=False,
 )
 auth_app = typer.Typer(help="Set up authentication with music providers.", no_args_is_help=True)
-scan_app = typer.Typer(help="Scan music providers for liked songs.", no_args_is_help=True)
+scan_app = typer.Typer(
+    help="Scan music providers for liked songs and playlists.", no_args_is_help=True
+)
 app.add_typer(auth_app, name="auth")
 app.add_typer(scan_app, name="scan")
 
@@ -403,13 +410,7 @@ def scan_youtube_likes(
     except HttpError as e:
         _fail(f"YouTube API error while fetching liked videos: {e}", code=1)
 
-    video_ids: list[str] = []
-    for it in items:
-        snippet = it.get("snippet") or {}
-        content = it.get("contentDetails") or {}
-        vid = content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
-        if vid:
-            video_ids.append(vid)
+    video_ids = [vid for vid in map(_playlist_item_video_id, items) if vid]
 
     statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
@@ -443,15 +444,158 @@ def scan_youtube_likes(
         )
 
 
+def _playlist_item_video_id(item: dict[str, Any]) -> str | None:
+    """The video id of a raw ``playlistItems.list`` entry."""
+    snippet = item.get("snippet") or {}
+    content = item.get("contentDetails") or {}
+    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+
+
+@scan_app.command("playlists")
+def scan_playlists() -> None:
+    """Back up every library playlist from YT Music, with dead items from YouTube.
+
+    Read-only: nothing is written to YouTube or YT Music. Generated and system
+    playlists (liked songs, episodes, mixes) are skipped. The YouTube side is
+    advisory: without YouTube auth, or on a YouTube error, the YT Music backup
+    is still stored and the affected playlists get no dead-item data.
+    """
+    cfg, factory = _bootstrap()
+    client = _ytmusic_client(cfg)
+    console.print("[dim]Reading the YT Music library…[/dim]")
+    try:
+        library = client.fetch_library_playlists()
+    except (AuthFileMissingError, UnexpectedResponseError) as e:
+        _fail(escape(str(e)), code=2)
+
+    titles = {
+        p["playlistId"]: str(p.get("title") or p["playlistId"])
+        for p in library
+        if is_backed_up(p["playlistId"])
+    }
+    skipped = f"{len(library) - len(titles)} generated or system playlists skipped"
+    if not titles:
+        # Still stored: the report shows the latest scan, so playlists that are
+        # gone from the library must drop out of it.
+        with session_scope(factory) as session:
+            scan = create_playlist_scan(session, [])
+            console.print(
+                f"[green]✓[/green] No playlists to back up ({skipped}); "
+                f"empty playlist scan [bold]#{scan.id}[/bold] stored."
+            )
+        return
+
+    console.print(f"[dim]Reading {len(titles)} playlists from YT Music…[/dim]")
+    results, errors = client.fetch_playlists(titles)
+    for playlist_id, message in errors.items():
+        console.print(
+            f"[yellow]⚠[/yellow] Could not read {escape(titles[playlist_id])} "
+            f"from YT Music: {escape(message)}"
+        )
+    if not results:
+        _fail(
+            f"Could not read any of the {len(titles)} playlists from YT Music; nothing stored.",
+            code=2,
+        )
+
+    # Committed before any YouTube call: that stage is advisory and can be long or
+    # interrupted, and must not cost the backup already read.
+    read_ids = [playlist_id for playlist_id in titles if playlist_id in results]
+    reads = [PlaylistRead(pid, titles[pid], results[pid], None) for pid in read_ids]
+    with session_scope(factory) as session:
+        scan_id = create_playlist_scan(session, reads).id
+
+    # YouTube is only asked for playlists YT Music backed up: a report row needs both.
+    youtube_items = _youtube_playlist_items(cfg, read_ids, titles)
+    with session_scope(factory) as session:
+        for pid, items in youtube_items.items():
+            add_youtube_playlist_snapshot(session, scan_id, pid, titles[pid], items)
+    tracks = sum(len(r.ytmusic["tracks"]) for r in reads)
+    console.print(
+        f"[green]✓[/green] Playlist scan [bold]#{scan_id}[/bold] stored "
+        f"({len(reads)} playlists, {tracks} tracks; {skipped}). "
+        "Run [cyan]likesurgeon playlists[/cyan] for the report."
+    )
+
+
+def _youtube_playlist_items(
+    cfg: Config, playlist_ids: list[str], titles: dict[str, str]
+) -> dict[str, list[dict[str, Any]]]:
+    """YouTube items per playlist id, availability attached. Advisory: every
+    failure is printed, and the playlists it affects are left out (or, if only
+    the availability read fails, stored unchecked)."""
+    from .youtube_client import (
+        AuthorizationRequiredError,
+        ClientSecretsMissingError,
+        YouTubeClient,
+        attach_video_statuses,
+    )
+
+    console.print(f"[dim]Reading {len(playlist_ids)} playlists from YouTube…[/dim]")
+    client = YouTubeClient(
+        client_secrets_path=cfg.youtube_oauth_client_path,
+        token_path=cfg.youtube_token_path,
+    )
+    try:
+        results, errors = client.fetch_playlists(playlist_ids)
+    except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
+        console.print(
+            "[dim]No dead-item data (needs [cyan]likesurgeon auth youtube[/cyan]): "
+            f"{escape(str(e))}[/dim]"
+        )
+        return {}
+    except Exception as e:  # noqa: BLE001 — advisory; never lose the YT Music backup
+        console.print(
+            f"[yellow]⚠[/yellow] YouTube read failed ({type(e).__name__}: {escape(str(e))}); "
+            "no dead-item data this scan."
+        )
+        return {}
+
+    if errors:
+        console.print(
+            f"[yellow]⚠[/yellow] {len(errors)} playlist(s) couldn't be read through the "
+            "YouTube Data API (a 404 is expected for playlists it can't see); "
+            "no dead-item data for them:"
+        )
+        for playlist_id, message in errors.items():
+            console.print(f"  {escape(titles[playlist_id])}: {escape(message)}")
+
+    video_ids = list(
+        dict.fromkeys(
+            vid for items in results.values() for vid in map(_playlist_item_video_id, items) if vid
+        )
+    )
+    if cfg.region is None and video_ids:
+        console.print(
+            "[dim]No region configured — region-blocked items won't count as dead. Set "
+            "[cyan]region[/cyan] in [cyan]~/.like-surgeon/config.json[/cyan].[/dim]"
+        )
+    try:
+        statuses = client.fetch_video_statuses(video_ids, user_region=cfg.region)
+    except Exception as e:  # noqa: BLE001 — advisory; items without a status store as unchecked
+        console.print(
+            f"[yellow]⚠[/yellow] Could not check video availability "
+            f"({type(e).__name__}: {escape(str(e))}); YouTube items stored unchecked."
+        )
+        return results
+    for items in results.values():
+        attach_video_statuses(items, statuses)
+    return results
+
+
 @app.command()
 def snapshots() -> None:
     """List previous snapshots."""
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        rows = list_snapshots(session)
+        all_rows = list_snapshots(session)
+    # Playlist snapshots are one per playlist per scan and would bury the likes
+    # rows; `playlists` is where they are listed.
+    rows = [s for s in all_rows if s.playlist_id is None]
+    playlist_snapshots = len(all_rows) - len(rows)
 
     table = Table(title="Snapshots")
-    table.add_column("ID", justify="right")
+    table.add_column("ID", justify="right", min_width=2)
     table.add_column("Source")
     table.add_column("Created (UTC)")
     table.add_column("Items", justify="right")
@@ -463,11 +607,106 @@ def snapshots() -> None:
             str(s.raw_count),
         )
     if not rows:
+        if not playlist_snapshots:
+            console.print(
+                "[yellow]No snapshots yet.[/yellow] Run [cyan]likesurgeon scan ytmusic[/cyan]."
+            )
+            return
+        console.print("[yellow]No likes snapshots yet.[/yellow]")
+    else:
+        console.print(table)
+    if playlist_snapshots:
+        noun = "snapshot is" if playlist_snapshots == 1 else "snapshots are"
         console.print(
-            "[yellow]No snapshots yet.[/yellow] Run [cyan]likesurgeon scan ytmusic[/cyan]."
+            f"[dim]{playlist_snapshots} playlist {noun} not listed; "
+            "see [cyan]likesurgeon playlists[/cyan].[/dim]"
+        )
+
+
+@app.command()
+def playlists(
+    dead: Annotated[
+        bool, typer.Option("--dead", help="List the dead items of the latest scan.")
+    ] = False,
+) -> None:
+    """Report the latest playlist scan: music share and dead items per playlist."""
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        report = playlist_report(session)
+    if report is None:
+        console.print(
+            "[yellow]No playlist scan yet.[/yellow] Run [cyan]likesurgeon scan playlists[/cyan]."
         )
         return
+
+    when = report.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    if not report.rows:
+        console.print(
+            f"Playlist scan [bold]#{report.scan_id}[/bold] ({when} UTC) found no playlists."
+        )
+        return
+
+    table = Table(title=f"Playlist scan #{report.scan_id} ({when} UTC)")
+    # Counts never wrap; the title (plain Text, so no markup to escape) takes what's
+    # left and is cut with an ellipsis, so a row stays one line at 80 columns.
+    table.add_column("ID", justify="right", no_wrap=True)
+    table.add_column("Playlist", max_width=24)
+    table.add_column("Own", no_wrap=True, min_width=5)
+    table.add_column("YTM", justify="right", no_wrap=True, min_width=3)
+    table.add_column("Music%", justify="right", no_wrap=True, min_width=6)
+    table.add_column("Music", justify="right", no_wrap=True, min_width=5)
+    table.add_column("UGC", justify="right", no_wrap=True, min_width=3)
+    table.add_column("Other", justify="right", no_wrap=True, min_width=5)
+    table.add_column("YT", justify="right", no_wrap=True, min_width=2)
+    table.add_column("Dead", justify="right", no_wrap=True, min_width=4)
+    for r in report.rows:
+        dead_cell = "-" if r.dead is None else str(r.dead)
+        if r.unchecked:
+            dead_cell += f" ({r.unchecked} unchecked)"
+        table.add_row(
+            str(r.ytmusic_snapshot_id),
+            Text(r.title, no_wrap=True, overflow="ellipsis"),
+            "?" if r.owned is None else "own" if r.owned else "saved",
+            str(r.ytmusic_count),
+            "-" if r.music_share is None else f"{r.music_share:.0%}",
+            str(r.music),
+            str(r.ugc),
+            str(r.other),
+            "-" if r.youtube_count is None else str(r.youtube_count),
+            dead_cell,
+        )
     console.print(table)
+
+    no_youtube = all(r.youtube_count is None for r in report.rows)
+    if no_youtube:
+        hint = ""
+        if not cfg.youtube_token_path.exists():
+            hint = " Run [cyan]likesurgeon auth youtube[/cyan] and scan again to add it."
+        console.print(
+            f"[yellow]This scan has no YouTube coverage, so no dead items.[/yellow]{hint}"
+        )
+
+    if dead:
+        if not report.dead_items:
+            # With no YouTube side the line above already explains the absence.
+            if not no_youtube:
+                console.print("No dead items in this scan.")
+            return
+        dead_table = Table(title="Dead items")
+        dead_table.add_column("Playlist")
+        dead_table.add_column("Pos", justify="right")
+        dead_table.add_column("Video")
+        dead_table.add_column("Reason")
+        dead_table.add_column("Title")
+        for d in report.dead_items:
+            dead_table.add_row(
+                escape(d.playlist_title),
+                str(d.position),
+                escape(d.video_id or "-"),
+                escape(d.reason or "-"),
+                escape(d.title),
+            )
+        console.print(dead_table)
 
 
 @app.command()

@@ -26,7 +26,9 @@ def export_snapshot_json(session: Session, snapshot_id: int) -> str:
 
     items = get_snapshot_items(session, snapshot_id)
     payload = {
-        "snapshot": SnapshotDTO.from_orm_snapshot(snapshot).model_dump(mode="json"),
+        "snapshot": SnapshotDTO.from_orm_snapshot(snapshot).model_dump(
+            mode="json", exclude_none=True
+        ),
         "tracks": [
             TrackDTO.from_snapshot_item(item, source=snapshot.source).model_dump(mode="json")
             for item in items

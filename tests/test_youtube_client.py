@@ -18,10 +18,15 @@ from likesurgeon.youtube_client import (
 
 
 class _FakeRequest:
-    def __init__(self, response: dict[str, Any]) -> None:
-        self._response = response
+    def __init__(
+        self, response: dict[str, Any] | None = None, *, error: Exception | None = None
+    ) -> None:
+        self._response = response or {}
+        self._error = error
 
     def execute(self) -> dict[str, Any]:
+        if self._error is not None:
+            raise self._error
         return self._response
 
 
@@ -29,14 +34,28 @@ class _FakePlaylistItems:
     """Mimics ``service.playlistItems().list(...).execute()``.
 
     ``pages`` returned in order; each call records its kwargs in ``calls``.
+    ``by_playlist`` answers per ``playlistId`` instead: a list of pages, or an
+    exception to raise from ``execute()``.
     """
 
-    def __init__(self, pages: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        pages: list[dict[str, Any]],
+        by_playlist: dict[str, list[dict[str, Any]] | Exception] | None = None,
+    ) -> None:
         self._pages = list(pages)
+        self._by_playlist = {
+            k: (list(v) if isinstance(v, list) else v) for k, v in (by_playlist or {}).items()
+        }
         self.calls: list[dict[str, Any]] = []
 
     def list(self, **kwargs: Any) -> _FakeRequest:
         self.calls.append(kwargs)
+        if kwargs["playlistId"] in self._by_playlist:
+            answer = self._by_playlist[kwargs["playlistId"]]
+            if isinstance(answer, Exception):
+                return _FakeRequest(error=answer)
+            return _FakeRequest(answer.pop(0) if answer else {"items": []})
         if not self._pages:
             return _FakeRequest({"items": []})
         return _FakeRequest(self._pages.pop(0))
@@ -94,9 +113,10 @@ class _FakeClient(YouTubeClient):
         *,
         likes_playlist_id: str = "LL_resolved",
         likes_item_count: int | dict[str, Any] = 0,
+        by_playlist: dict[str, list[dict[str, Any]] | Exception] | None = None,
     ) -> None:
         super().__init__(client_secrets_path=None, token_path=None)
-        self._fake_pi = _FakePlaylistItems(pages)
+        self._fake_pi = _FakePlaylistItems(pages, by_playlist)
         self._fake_channels = _FakeChannels(
             {"items": [{"contentDetails": {"relatedPlaylists": {"likes": likes_playlist_id}}}]}
         )
@@ -1596,3 +1616,91 @@ def test_fetch_video_statuses_retries_rate_limit_instead_of_bailing(monkeypatch)
     out = client.fetch_video_statuses(["a"])
     assert out["a"] == VideoStatus(is_available=True, reason=None)
     assert attempts["n"] == 2
+
+
+def _http_error(status: int, message: str, reason: str | None = None) -> Any:
+    from googleapiclient.errors import HttpError
+
+    err: dict[str, Any] = {"code": status, "message": message}
+    if reason:
+        err["errors"] = [{"reason": reason, "domain": "youtube.quota"}]
+    import json
+
+    return HttpError(
+        _FakeResp(status),
+        json.dumps({"error": err}).encode(),
+        uri="https://youtube.example/playlistItems?key=SECRET",
+    )
+
+
+def _item(title: str) -> dict[str, Any]:
+    return {"snippet": {"title": title}}
+
+
+def test_fetch_playlists_reads_each_id_in_order_without_visibility_lookup():
+    c = _FakeClient(
+        [],
+        by_playlist={
+            "PL_one": [{"items": [_item("a")]}],
+            "PL_empty": [{"items": []}],
+            "PL_two": [{"items": [_item("b"), _item("c")]}],
+        },
+    )
+    results, errors = c.fetch_playlists(["PL_one", "PL_empty", "PL_two"])
+    assert errors == {}
+    assert list(results) == ["PL_one", "PL_empty", "PL_two"]
+    assert [i["snippet"]["title"] for i in results["PL_two"]] == ["b", "c"]
+    assert results["PL_empty"] == []
+    assert [call["playlistId"] for call in c._fake_pi.calls] == ["PL_one", "PL_empty", "PL_two"]
+    assert c._fake_channels.calls == []
+    assert c._fake_playlists.calls == []
+
+
+def test_fetch_playlists_http_error_lands_in_errors_and_next_is_read():
+    c = _FakeClient(
+        [],
+        by_playlist={
+            "PL_hidden": _http_error(404, "Playlist not found."),
+            "PL_ok": [{"items": [_item("a")]}],
+        },
+    )
+    results, errors = c.fetch_playlists(["PL_hidden", "PL_ok"])
+    assert list(results) == ["PL_ok"]
+    assert errors == {"PL_hidden": "HTTP 404: Playlist not found."}
+    assert "SECRET" not in errors["PL_hidden"]
+
+
+def test_fetch_playlists_non_http_error_lands_in_errors_and_next_is_read():
+    c = _FakeClient(
+        [],
+        by_playlist={"PL_bad": TimeoutError("timed out"), "PL_ok": [{"items": [_item("a")]}]},
+    )
+    results, errors = c.fetch_playlists(["PL_bad", "PL_ok"])
+    assert list(results) == ["PL_ok"]
+    assert "timed out" in errors["PL_bad"]
+
+
+def test_fetch_playlists_quota_exceeded_fails_remaining_without_calls():
+    c = _FakeClient(
+        [],
+        by_playlist={
+            "PL_ok": [{"items": [_item("a")]}],
+            "PL_quota": _http_error(403, "Quota exceeded.", reason="quotaExceeded"),
+            "PL_later": [{"items": [_item("b")]}],
+        },
+    )
+    results, errors = c.fetch_playlists(["PL_ok", "PL_quota", "PL_later"])
+    assert list(results) == ["PL_ok"]
+    assert set(errors) == {"PL_quota", "PL_later"}
+    assert [call["playlistId"] for call in c._fake_pi.calls] == ["PL_ok", "PL_quota"]
+
+
+def test_fetch_playlists_authorization_required_propagates():
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def boom() -> Any:
+        raise AuthorizationRequiredError("no token")
+
+    c._service = boom  # type: ignore[method-assign]
+    with pytest.raises(AuthorizationRequiredError):
+        c.fetch_playlists(["PL_one"])

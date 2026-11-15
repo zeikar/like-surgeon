@@ -83,3 +83,53 @@ def test_migrate_in_place_adds_diagnoses_kind(tmp_path: Path) -> None:
         after = list(conn.execute(text("PRAGMA table_info(diagnoses)")))
     assert "kind" in {row[1] for row in before}
     assert after == before
+
+
+def _legacy_playlist_db(db_path: Path) -> None:
+    legacy = create_engine(f"sqlite:///{db_path}", future=True)
+    with legacy.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE snapshots (id INTEGER PRIMARY KEY, source TEXT, created_at DATETIME, raw_count INTEGER)"
+            )
+        )
+        conn.execute(text("CREATE TABLE snapshot_items (id INTEGER PRIMARY KEY, title TEXT)"))
+
+
+def test_migrate_in_place_adds_playlist_columns(tmp_path: Path) -> None:
+    """A pre-playlist DB gains the snapshot playlist columns and
+    `snapshot_items.video_type`; a second call is a no-op."""
+    db_path = tmp_path / "legacy_playlists.sqlite"
+    _legacy_playlist_db(db_path)
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        before_snap = list(conn.execute(text("PRAGMA table_info(snapshots)")))
+        before_items = list(conn.execute(text("PRAGMA table_info(snapshot_items)")))
+    _migrate_in_place(engine)
+    with engine.connect() as conn:
+        after_snap = list(conn.execute(text("PRAGMA table_info(snapshots)")))
+        after_items = list(conn.execute(text("PRAGMA table_info(snapshot_items)")))
+
+    assert {
+        "playlist_scan_id",
+        "playlist_id",
+        "playlist_title",
+        "playlist_owned",
+        "playlist_raw_json",
+    } <= {row[1] for row in before_snap}
+    assert "video_type" in {row[1] for row in before_items}
+    assert after_snap == before_snap
+    assert after_items == before_items
+
+
+def test_init_db_creates_playlist_scans_on_legacy_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_init.sqlite"
+    _legacy_playlist_db(db_path)
+
+    engine = make_engine(db_path)
+    init_db(engine)
+
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(playlist_scans)"))}
+    assert {"id", "created_at"} <= cols
