@@ -5,7 +5,17 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from likesurgeon.compare import CanonicalMetadata
-from likesurgeon.playlist_repoint import PlaylistPair, find_pairs, report_only_cause
+from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS, ISSUE_PLAYLIST_RELINKED
+from likesurgeon.playlist_repoint import (
+    PlaylistAction,
+    PlaylistPair,
+    PlaylistState,
+    find_pairs,
+    persist_report,
+    plan,
+    report_only_cause,
+    summarize,
+)
 from likesurgeon.playlists import load_scan
 from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
 
@@ -209,3 +219,176 @@ def test_report_only_cause_missing_metadata(session: Session):
     pair = _one_pair(session, _TRACKS, _YOUTUBE)
     assert report_only_cause(pair, {"b1": _meta("b1")}) == "no videos.list metadata for A"
     assert report_only_cause(pair, {"a1": _meta("a1")}) == "no videos.list metadata for B"
+
+
+def _reportable(session: Session, *reads: PlaylistRead, meta=None):
+    scan = create_playlist_scan(session, reads)
+    pairs = find_pairs(load_scan(session, scan.id)).pairs
+    return (
+        scan,
+        pairs,
+        persist_report(session, scan.id, pairs, _GOOD_META if meta is None else meta),
+    )
+
+
+def test_persist_report_writes_one_item_per_pair(session: Session):
+    youtube = [_ok("v1"), _yt("a1", False, "region-blocked"), _ok("v3")]
+    scan, (pair,), (diagnosis, carried) = _reportable(
+        session, _read("PLa", "Mix", _TRACKS, youtube)
+    )
+    assert (diagnosis.kind, diagnosis.playlist_scan_id) == (DIAGNOSIS_KIND_PLAYLISTS, scan.id)
+    assert carried == 0
+    (item,) = diagnosis.items
+    assert item.issue_type == ISSUE_PLAYLIST_RELINKED
+    assert (item.confidence, item.status) == (1.0, "open")
+    assert (item.source_item_id, item.related_item_id) == (pair.a.id, pair.b.id)
+    assert (item.source_track_id, item.related_track_id) == (pair.a.track_id, pair.b.track_id)
+    for text in ("Mix", "position 2", "a1", "b1", "Y a1", "T b1", "region-blocked"):
+        assert text in item.reason
+    assert "passed, \u03942s, same channel" in item.reason
+    assert "report-only" not in item.reason
+
+
+def test_persist_report_report_only_cause_lowers_confidence(session: Session):
+    _, _, (diagnosis, _) = _reportable(session, _read("PLa", "Mix", _TRACKS, _YOUTUBE, owned=False))
+    (item,) = diagnosis.items
+    assert item.confidence == 0.5
+    assert "saved playlist" in item.reason
+
+
+def test_persist_report_without_metadata_keeps_the_reason_readable(session: Session):
+    _, _, (diagnosis, _) = _reportable(session, _read("PLa", "Mix", _TRACKS, _YOUTUBE), meta={})
+    (item,) = diagnosis.items
+    assert item.confidence == 0.5
+    assert "no videos.list metadata" in item.reason
+
+
+def test_persist_report_carries_over_a_skipped_pair(session: Session):
+    read = _read("PLa", "Mix", _TRACKS, _YOUTUBE)
+    _, _, (first, _) = _reportable(session, read)
+    first.items[0].status = "skipped"
+    _, _, (second, carried) = _reportable(session, read)
+    assert carried == 1
+    assert second.items[0].status == "skipped"
+
+
+def _linked(video_id: str, item_id: str, position: int, available: bool = True) -> dict:
+    item = _ok(video_id) if available else _blocked(video_id)
+    item["id"] = item_id
+    item["snippet"]["position"] = position
+    return item
+
+
+def _plan_reads():
+    return (
+        _read(
+            "PLb",
+            "Big",
+            [_track("w1"), _track("b2"), _track("w3"), _track("w4")],
+            [_linked("w1", "i1", 0), _linked("a2", "i2", 1, False), _linked("w3", "i3", 2)]
+            + [_linked("w4", "i4", 3)],
+        ),
+        _read(
+            "PLa",
+            "Small",
+            [_track("b1"), _track("v2")],
+            [_linked("a1", "j1", 0, False), _linked("v2", "j2", 1)],
+        ),
+    )
+
+
+def _planned(session: Session, *reads: PlaylistRead):
+    meta = {
+        "a1": _meta("a1"),
+        "b1": _meta("b1"),
+        "a2": _meta("a2"),
+        "b2": _meta("b2"),
+    }
+    _, _, (diagnosis, _) = _reportable(session, *reads, meta=meta)
+    return diagnosis, plan(session, diagnosis)
+
+
+def test_plan_orders_actions_and_describes_each(session: Session):
+    diagnosis, (actions, states) = _planned(session, *_plan_reads())
+    assert [a.playlist_id for a in actions] == ["PLa", "PLb"]
+    small, big = actions
+    assert small == PlaylistAction(
+        item_id=small.item_id,
+        playlist_id="PLa",
+        playlist_title="Small",
+        a_index=0,
+        a_playlist_item_id="j1",
+        a_video_id="a1",
+        b_video_id="b1",
+        b_index=0,
+    )
+    assert small.item_id in {it.id for it in diagnosis.items}
+    assert (big.a_index, big.a_playlist_item_id, big.a_video_id) == (1, "i2", "a2")
+    assert (big.b_video_id, big.b_index) == ("b2", 1)
+
+
+def test_plan_states_hold_both_sequences_per_planned_playlist(session: Session):
+    _, (_, states) = _planned(session, *_plan_reads())
+    assert states["PLa"] == PlaylistState(
+        youtube=(("j1", "a1"), ("j2", "v2")), ytmusic=("b1", "v2")
+    )
+    assert states["PLb"].youtube[1] == ("i2", "a2")
+    assert states["PLb"].ytmusic == ("w1", "b2", "w3", "w4")
+
+
+def test_plan_skips_items_that_are_not_open_and_confident(session: Session):
+    diagnosis, (actions, _) = _planned(session, *_plan_reads())
+    skipped = actions[0].item_id
+    for it in diagnosis.items:
+        if it.id == skipped:
+            it.status = "skipped"
+        else:
+            it.status = "applied"
+    session.flush()
+    assert plan(session, diagnosis) == ([], {})
+    for it in diagnosis.items:
+        it.status = "open"
+        it.confidence = 0.5
+    assert plan(session, diagnosis) == ([], {})
+
+
+def test_plan_orders_by_playlist_size_then_playlist_id_then_position(session: Session):
+    reads = (
+        _read(
+            "PLz",
+            "Z",
+            [_track("b1"), _track("b2")],
+            [_linked("a1", "z1", 0, False), _linked("a2", "z2", 1, False)],
+        ),
+        _read("PLa", "A", [_track("b3")], [_linked("a3", "q1", 0, False)]),
+        _read(
+            "PLb",
+            "B",
+            [_track("b4"), _track("b5")],
+            [_linked("a4", "r1", 0, False), _linked("a5", "r2", 1, False)],
+        ),
+    )
+    meta = {f"{k}{n}": _meta(f"{k}{n}") for k in "ab" for n in range(1, 6)}
+    _, _, (diagnosis, _) = _reportable(session, *reads, meta=meta)
+    actions, _ = plan(session, diagnosis)
+    assert [(a.playlist_id, a.a_index) for a in actions] == [
+        ("PLa", 0),
+        ("PLb", 0),
+        ("PLb", 1),
+        ("PLz", 0),
+        ("PLz", 1),
+    ]
+
+
+def _summary_quota(n_items: int, n_actions: int) -> str:
+    state = PlaylistState(youtube=tuple((f"i{i}", f"v{i}") for i in range(n_items)), ytmusic=())
+    actions = [PlaylistAction(k, "PLa", "Mix", 0, "i0", "a", "b", 0) for k in range(n_actions)]
+    text = summarize(actions, {"PLa": state})
+    assert f"Actions: {n_actions}" in text
+    assert "Playlists: 1" in text
+    return text
+
+
+def test_summarize_estimates_quota_by_playlist_size(session: Session):
+    for n_items, n_actions, units in ((49, 1, 103), (50, 1, 104), (51, 1, 106), (50, 2, 207)):
+        assert f"Estimated YouTube quota: {units} units" in _summary_quota(n_items, n_actions)
