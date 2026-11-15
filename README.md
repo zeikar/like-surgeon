@@ -13,9 +13,12 @@
 
 **Fix the mismatches between your YouTube Music liked songs and YouTube likes — only the ones it can prove.**
 
-YouTube Music keeps no likes of its own: *Liked songs* is a view of your YouTube *Liked videos*, and over the years the two drift apart. A song gets swapped for another release while your like stays on the dead upload, the same song shows up twice, music you liked never appears, or a like is left on a deleted video. like-surgeon lines the two lists up, works out which YouTube like is behind every song, and fixes the mismatches it can prove — on YouTube, with a check after every change.
+YouTube Music keeps no likes of its own: *Liked songs* is a view of your YouTube *Liked videos*, and over the years the two drift apart. A song gets swapped for another release while your like stays on the dead upload, the same song shows up twice, music you liked never appears, or a like is left on a deleted video.
 
-Optionally, `canonicalize` moves each like to the release the artist's page lists (a compilation track → the original single), so your likes show on the artist page and in Top songs — and catches the same song liked twice as two releases along the way.
+like-surgeon does two things, both on YouTube with a check after every change:
+
+- **Fix what it can prove** — `compare-likes`, then `sync`. It lines the two lists up, works out which YouTube like is behind every song, and repairs the mismatches the list order proves: a like stuck on a dead upload, a music video shown twice as its audio track (opt-in while the video still plays). Opt-in, it also re-likes music that never shows up and checks the result.
+- **Tidy what you review** — `canonicalize`. Not a mismatch but a preference: the release you liked may not be the one the artist's page lists, so it doesn't show as liked there, on the album or in Top songs. It moves each like to the listed release (say, a single → the album version the artist page lists) and, when you've liked both the listed release and another one, drops the extra like. It matches the same title and length (±1 s) inside the artist's own song list, so you review its report before anything is written. On one 1,200-song library: 71 likes moved, 7 of them duplicates `compare-likes` can't see.
 
 It's a command-line tool that runs on your machine. Each scan of both lists is kept as a snapshot in a local SQLite file, which doubles as the backup YouTube Music doesn't offer. No server, no account of ours: your data and credentials stay on your computer.
 
@@ -26,6 +29,8 @@ It's a command-line tool that runs on your machine. Each scan of both lists is k
 </p>
 
 Liked songs keeps the order of Liked videos, filtered to what YT Music shows, and each entry may play a different video than the like behind it. YT Music never says which like backs which song, so like-surgeon lines the two lists up by position (no fuzzy title matching) and repairs the mismatches it can prove, on YouTube. The full model and the evidence for it: [docs/design/ll-lm-alignment.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/ll-lm-alignment.md). (The docs call the two lists **LL** and **LM**, after their playlist ids.)
+
+`canonicalize` doesn't use the list order; it compares each liked song with its artist's own song list on YT Music — see [Canonicalize](https://github.com/zeikar/like-surgeon#6-canonicalize-tidy-up-releases-and-duplicates) and [docs/design/canonicalize.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/canonicalize.md).
 
 ## Quick start
 
@@ -40,7 +45,7 @@ likesurgeon scan ytmusic
 likesurgeon scan youtube-likes --region US        # your country code, so region-blocked videos are caught
 likesurgeon compare-likes                         # what's wrong, and what can be fixed
 likesurgeon sync --dry-run                        # the plan, without writing anything
-likesurgeon canonicalize                          # optional: likes on another release than the artist page lists
+likesurgeon canonicalize                          # likes on another release than the artist page lists (review, then --apply)
 ```
 
 <p align="center">
@@ -63,7 +68,7 @@ Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — n
 | `unbacked_lm_entry` | a YT Music entry with no like that can be pinned behind it | report only |
 | `metadata_drift` | a title or artist changed between two scans | report only |
 
-`canonicalize` keeps its own report, separate from these: `canonical_version` (a liked audio track the artist page doesn't list, with exactly one same-title, same-length track that it does) and `canonical_ambiguous` — see [Canonicalize](https://github.com/zeikar/like-surgeon#6-canonicalize-optional).
+`canonicalize` keeps its own report, separate from these: `canonical_version` (a liked audio track the artist page doesn't list, with exactly one same-title, same-length track that it does) and `canonical_ambiguous` — see [Canonicalize](https://github.com/zeikar/like-surgeon#6-canonicalize-tidy-up-releases-and-duplicates).
 
 ## Safety
 
@@ -200,9 +205,9 @@ Sync stops early when:
 
 The run exits non-zero if any action failed or it stopped early on an unreadable Liked songs list, after a restore, after an unconfirmed B undo, or after a `relike` went wrong.
 
-### 6. Canonicalize (optional)
+### 6. Canonicalize (tidy up releases and duplicates)
 
-A song is often released as several identical audio tracks (a single, an album, a compilation), and the one you liked may not be the one the artist's page lists. `canonicalize` finds those likes and moves each one, on YouTube, to the listed version, so the song shows as liked on the artist page, the album and Top songs. Example: a like on the single "Kizuna Music♪" (316 s) moves to the same track on the album "Breakthrough!" (316 s, Top songs #1). Nothing is broken here, it's a preference, so it is a separate command and you review every finding first.
+A song is often released as several identical audio tracks (a single, an album, a compilation), and the one you liked may not be the one the artist's page lists. `canonicalize` finds those likes and moves each one, on YouTube, to the listed version, so the song shows as liked on the artist page, the album and Top songs. Example: a like on the single "Kizuna Music♪" (316 s) moves to the same track on the album "Breakthrough!" (316 s, Top songs #1). If you've also liked the listed version, the extra like is removed (merge), which clears a duplicate `compare-likes` can't see. Mostly a preference, not a breakage, so it is a separate command and you review every finding first.
 
 ```bash
 likesurgeon canonicalize                            # report only: reads Liked songs and each artist's songs list

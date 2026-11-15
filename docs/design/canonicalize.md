@@ -203,7 +203,7 @@ A stale finding (A unliked since the report, LM changed) ends `skipped`. Because
 | `sync_preflight.py` | `canonical_unlike` in `_UNLIKE_KINDS`; the three canonical writes in `_WRITE_KINDS`; `stranded_unliked_video_ids` keyed per video id |
 | `cli.py` | `canonicalize` (report, `--json`, `--apply`, `--limit`, `--yes`, `--include-flagged`); `issues --type canonical_*`; `skip` / `unskip` across both report kinds |
 | `CLAUDE.md` | doc map entry; the title-matching rule scoped with this exception; canonical actions in the write-action list, quota and write kinds |
-| README | "Canonicalize (optional)" section; Safety bullets name both writing commands |
+| README | "Canonicalize (tidy up releases and duplicates)" section; Safety bullets name both writing commands |
 | ARCHITECTURE / DEVELOPMENT | two writing commands, data flow, module rows, `diagnoses.kind`, the new issue types; test strategy and the latest-diagnosis snippet (`kind IS NULL`) |
 
 Old diagnoses read as `compare-likes` runs (`kind` NULL). One schema change: the nullable column.
