@@ -52,13 +52,14 @@ class PipelineResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _fetch_pair_metadata(
-    cfg: Config | None, video_ids: list[str], warnings: list[str]
+def fetch_pair_metadata(
+    cfg: Config | None, video_ids: list[str], warnings: list[str], *, report_only: str
 ) -> dict[str, CanonicalMetadata]:
     """``videos.list`` metadata for the aligned pairs' same-recording check.
 
     Without it every pair is merely report-only, so any failure (no auth,
-    HTTP, transport) is reported in one line instead of failing the run.
+    HTTP, transport) is reported in one line, naming the ``report_only``
+    findings, instead of failing the run.
     """
     # Resolved at call time so tests can patch ``youtube_client.YouTubeClient``.
     from .youtube_client import (
@@ -81,7 +82,7 @@ def _fetch_pair_metadata(
             reason = f"{type(exc).__name__}: {exc}"
     warnings.append(
         f"[yellow]⚠[/yellow] videos.list metadata unavailable ({escape(reason)}); "
-        "relinked and rendered_as_other pairs are report-only."
+        f"{report_only} are report-only."
     )
     return {}
 
@@ -128,7 +129,13 @@ def compare_and_persist(session: Session, cfg: Config | None = None) -> Pipeline
             if vid
         }
     )
-    metadata = _fetch_pair_metadata(cfg, pair_vids, warnings) if pair_vids else {}
+    metadata = (
+        fetch_pair_metadata(
+            cfg, pair_vids, warnings, report_only="relinked and rendered_as_other pairs"
+        )
+        if pair_vids
+        else {}
+    )
     diagnosis = create_alignment_diagnosis(
         session,
         ytmusic_snapshot_id=ytm_snap.id,

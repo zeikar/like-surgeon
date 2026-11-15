@@ -32,15 +32,18 @@ from .diagnosis import (
     ALIGNMENT_ISSUE_TYPES,
     CANONICAL_ISSUE_TYPES,
     DIAGNOSIS_KIND_CANONICALIZE,
+    DIAGNOSIS_KIND_PLAYLISTS,
     ISSUE_CANONICAL_AMBIGUOUS,
     ISSUE_CANONICAL_VERSION,
+    ISSUE_PLAYLIST_RELINKED,
+    PLAYLIST_ISSUE_TYPES,
     diagnosis_items,
     latest_diagnosis,
 )
 from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
-from .pipeline import MissingSnapshotsError, compare_and_persist
+from .pipeline import MissingSnapshotsError, compare_and_persist, fetch_pair_metadata
 from .playlists import is_backed_up, playlist_report
 from .snapshot import (
     PlaylistRead,
@@ -907,6 +910,19 @@ def _findings_table(title: str, rows: list[dict[str, Any]]) -> Table:
     return table
 
 
+# Diagnosis kind -> (report name, the command that writes it). ``None`` is compare-likes.
+_REPORTS: dict[str | None, tuple[str, str]] = {
+    None: ("Diagnosis", "compare-likes"),
+    DIAGNOSIS_KIND_CANONICALIZE: ("Canonicalize report", "canonicalize"),
+    DIAGNOSIS_KIND_PLAYLISTS: ("Playlist repoint report", "repoint-playlists"),
+}
+# Issue types that live in a report other than the compare-likes diagnosis.
+_KIND_BY_ISSUE_TYPE: dict[str, str] = {
+    **dict.fromkeys(CANONICAL_ISSUE_TYPES, DIAGNOSIS_KIND_CANONICALIZE),
+    **dict.fromkeys(PLAYLIST_ISSUE_TYPES, DIAGNOSIS_KIND_PLAYLISTS),
+}
+
+
 @app.command()
 def issues(
     type: Annotated[
@@ -915,8 +931,9 @@ def issues(
             "--type",
             help=(
                 "Filter findings by issue type. One of: "
-                f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; or, from the latest canonicalize "
-                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}."
+                f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; from the latest canonicalize "
+                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}; or, from the latest "
+                f"repoint-playlists report, {' | '.join(PLAYLIST_ISSUE_TYPES)}."
             ),
         ),
     ] = None,
@@ -932,25 +949,26 @@ def issues(
         typer.Option("--format", "-f", help="Output format: 'table' (default) or 'json'."),
     ] = "table",
 ) -> None:
-    """List issues from the latest diagnosis (or canonicalize report, for its types)."""
+    """List issues from the latest diagnosis (or canonicalize / repoint-playlists report,
+    for their types)."""
     import json as jsonlib
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
-    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES
+    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES + PLAYLIST_ISSUE_TYPES
     if type is not None and type not in known:
         _fail(f"Unknown issue type: {type!r}. One of: {', '.join(known)}.", code=2)
-    canonical = type in CANONICAL_ISSUE_TYPES
+    kind = _KIND_BY_ISSUE_TYPE.get(type) if type is not None else None
+    report, command = _REPORTS[kind]
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE if canonical else None)
+        diag = latest_diagnosis(session, kind=kind)
         if diag is None:
-            command = "canonicalize" if canonical else "compare-likes"
-            what = "canonicalize report" if canonical else "diagnosis"
             console.print(
-                f"[yellow]No {what} yet.[/yellow] Run [cyan]likesurgeon {command}[/cyan] first."
+                f"[yellow]No {report.lower()} yet.[/yellow] "
+                f"Run [cyan]likesurgeon {command}[/cyan] first."
             )
             return
         items = diagnosis_items(session, diag.id)
@@ -968,7 +986,6 @@ def issues(
     if not rows:
         console.print("[dim]No issues match the filter.[/dim]")
         return
-    report = "Canonicalize report" if canonical else "Diagnosis"
     console.print(_findings_table(f"{report} #{diag.id} — issues ({len(rows)})", rows))
 
 
@@ -1291,14 +1308,101 @@ def _print_left_behind(result) -> None:
         )
 
 
+@app.command("repoint-playlists")
+def repoint_playlists_cmd(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help=(
+                "Instead of a new report, replace each open write-eligible playlist_relinked "
+                "item of the latest report with the video YT Music shows in its place."
+            ),
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=0, help="With --apply: act on at most N findings."),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="With --apply: skip the interactive confirmation prompt."),
+    ] = False,
+) -> None:
+    """Find dead playlist items that YT Music shows as another video.
+
+    Reads the latest playlist scan and saves one playlist_relinked finding per
+    dead item on a playlist's YouTube side that YT Music shows as another
+    video in its place. videos.list metadata for both videos decides which are
+    write-eligible. Nothing is written to YouTube, except by --apply.
+    """
+    from .playlist_repoint import find_pairs, persist_report
+    from .playlists import load_scan
+
+    if not apply and (limit is not None or yes):
+        _fail("--limit and --yes only apply with --apply.", code=2)
+    if apply:
+        _fail("--apply is not implemented yet.", code=2)
+
+    cfg, factory = _bootstrap()
+    warnings: list[str] = []
+    with session_scope(factory) as session:
+        scan = load_scan(session)
+        if scan is None:
+            _fail("No playlist scan yet. Run `likesurgeon scan playlists` first.")
+        found = find_pairs(scan)
+        # A dead row can lack a video id; it then has no metadata to fetch.
+        vids = sorted({v for p in found.pairs for v in (p.a.video_id, p.b.video_id) if v})
+        metadata = (
+            fetch_pair_metadata(cfg, vids, warnings, report_only=f"{ISSUE_PLAYLIST_RELINKED} pairs")
+            if vids
+            else {}
+        )
+        diag, carried = persist_report(session, scan.scan.id, found.pairs, metadata)
+        diag_id = diag.id
+        rows = _finding_rows(session, diagnosis_items(session, diag.id))
+        with_youtube = sum(p.youtube_items is not None for p in scan.playlists)
+        dead = sum(it.is_available is False for p in scan.playlists for it in p.youtube_items or ())
+        playlist_count = len(scan.playlists)
+
+    for warning in warnings:
+        console.print(warning)
+    if carried:
+        console.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
+    console.print(f"[green]✓[/green] Playlist repoint report [bold]#{diag_id}[/bold] saved.")
+    # What `--apply` would act on: carried-over skips don't count.
+    eligible = sum(r["confidence"] == 1.0 and r["status"] == "open" for r in rows)
+    table = Table(title="repoint-playlists summary")
+    table.add_column("Bucket")
+    table.add_column("Count", justify="right")
+    table.add_row("Playlists with a YouTube side / total", f"{with_youtube} / {playlist_count}")
+    table.add_row("Dead items on the YouTube side", str(dead))
+    table.add_row(
+        f"{ISSUE_PLAYLIST_RELINKED} (open write-eligible / total)", f"{eligible} / {len(rows)}"
+    )
+    table.add_row("Dead items YT Music shows as themselves", str(found.dead_shown_as_itself))
+    table.add_row("Dead items YT Music doesn't place (no finding)", str(found.dead_unplaced))
+    console.print(table)
+    if not rows:
+        console.print("[dim]No findings.[/dim]")
+        return
+    console.print(
+        _findings_table(f"Playlist repoint report #{diag_id} — findings ({len(rows)})", rows)
+    )
+    console.print(
+        "Review them, keep any out with [cyan]likesurgeon skip <id>[/cyan], then run "
+        "[cyan]likesurgeon repoint-playlists --apply[/cyan]."
+    )
+
+
 def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     """Flip findings between 'open' and 'skipped'.
 
-    Ids must belong to the latest alignment diagnosis or the latest
-    canonicalize report. All-or-nothing: every id is validated first, so a
-    typo changes nothing. 'skipped' carries over to later diagnoses
-    (``carry_over_skipped``), so this is the durable way to keep ``sync`` or
-    ``canonicalize --apply`` off a finding.
+    Ids must belong to the latest alignment diagnosis, canonicalize report or
+    repoint-playlists report. All-or-nothing: every id is validated first, so
+    a typo changes nothing. 'skipped' carries over to later diagnoses
+    (``carry_over_skipped``), so this is the durable way to keep ``sync``,
+    ``canonicalize --apply`` or ``repoint-playlists --apply`` off a finding.
     """
     from .models import DiagnosisItem
 
@@ -1306,17 +1410,14 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     _, factory = _bootstrap()
     with session_scope(factory) as session:
         latest = {
-            label: diag
-            for label, kind in (
-                ("compare-likes", None),
-                ("canonicalize", DIAGNOSIS_KIND_CANONICALIZE),
-            )
+            command: diag
+            for kind, (_, command) in _REPORTS.items()
             if (diag := latest_diagnosis(session, kind=kind)) is not None
         }
         if not latest:
+            commands = [f"`likesurgeon {command}`" for _, command in _REPORTS.values()]
             _fail(
-                "No diagnosis yet. Run `likesurgeon compare-likes` or "
-                "`likesurgeon canonicalize` first.",
+                f"No diagnosis yet. Run {', '.join(commands[:-1])} or {commands[-1]} first.",
                 code=1,
             )
         latest_ids = {diag.id for diag in latest.values()}
@@ -1342,8 +1443,8 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
 
 
 _FINDING_IDS_HELP = (
-    "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis or the "
-    "latest canonicalize report."
+    "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis, "
+    "canonicalize report or repoint-playlists report."
 )
 
 
@@ -1351,7 +1452,8 @@ _FINDING_IDS_HELP = (
 def skip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Keep `sync` or `canonicalize --apply` off these findings, across future runs too."""
+    """Keep `sync`, `canonicalize --apply` or `repoint-playlists --apply` off these findings,
+    across future runs too."""
     _set_findings_status(item_ids, to="skipped")
 
 
@@ -1359,7 +1461,8 @@ def skip(
 def unskip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Re-open skipped findings so the next `sync` or `canonicalize --apply` acts on them."""
+    """Re-open skipped findings so the next `sync`, `canonicalize --apply` or
+    `repoint-playlists --apply` acts on them."""
     _set_findings_status(item_ids, to="open")
 
 

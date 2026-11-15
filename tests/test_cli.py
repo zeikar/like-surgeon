@@ -3358,3 +3358,233 @@ def test_canonicalize_apply_prints_markup_in_titles_literally(
     assert result.exit_code == 1, result.output
     assert _MARKUP_TITLE in result.output
     assert "Proceed?" in result.output  # reached the prompt
+
+
+# ---------------------------------------------------------------------------
+# repoint-playlists (report mode). The playlist scan is seeded on the on-disk
+# DB; videos.list metadata comes from ``_FakeYouTubeMetadata``, which has no
+# write methods, so a report that tried an insert or delete would crash.
+# ---------------------------------------------------------------------------
+
+_PLAYLIST_TITLE = "[Live] Mix"
+
+
+def _pl_yt(video_id: str, position: int, available: bool, reason: str | None = None) -> dict:
+    """A ``playlistItems.list`` item with the availability ``scan playlists`` stores."""
+    item = _yt_raw(video_id, f"Track {video_id}")
+    item["id"] = f"pi_{video_id}"
+    item["snippet"]["position"] = position
+    item["_likesurgeon_video_status"] = {"is_available": available, "reason": reason}
+    return item
+
+
+def _seed_playlist_scan(home: Path) -> None:
+    """``PLmix`` (owned): YouTube [v1, A, v3, a2, d1], YT Music [v1, B, v3, a2].
+    YT Music shows region-blocked A as B (a pair), blocked a2 as itself, and
+    not deleted d1 at all. ``PLytm`` has no YouTube side."""
+    from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
+
+    youtube = [
+        _pl_yt("v1", 0, True),
+        _pl_yt("A", 1, False, "region-blocked"),
+        _pl_yt("v3", 2, True),
+        _pl_yt("a2", 3, False, "region-blocked"),
+        _pl_yt("d1", 4, False, "deleted"),
+    ]
+    s = _open_db(home)
+    try:
+        create_playlist_scan(
+            s,
+            [
+                PlaylistRead(
+                    playlist_id="PLmix",
+                    title=_PLAYLIST_TITLE,
+                    ytmusic={
+                        "id": "PLmix",
+                        "title": _PLAYLIST_TITLE,
+                        "owned": True,
+                        "tracks": [_ytm_track(v) for v in ("v1", "B", "v3", "a2")],
+                    },
+                    youtube_items=youtube,
+                ),
+                PlaylistRead(
+                    playlist_id="PLytm",
+                    title="Only Music",
+                    ytmusic={"id": "PLytm", "title": "Only Music", "owned": True, "tracks": []},
+                    youtube_items=None,
+                ),
+            ],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def _playlist_findings(home: Path) -> list[tuple[int, int, float, str]]:
+    """Every playlists-report finding as (diagnosis id, item id, confidence, status)."""
+    from sqlalchemy import select
+
+    from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS
+    from likesurgeon.models import Diagnosis, DiagnosisItem
+
+    s = _open_db(home)
+    try:
+        return [
+            (it.diagnosis_id, it.id, it.confidence, it.status)
+            for it in s.scalars(
+                select(DiagnosisItem)
+                .join(Diagnosis)
+                .where(Diagnosis.kind == DIAGNOSIS_KIND_PLAYLISTS)
+                .order_by(DiagnosisItem.id)
+            )
+        ]
+    finally:
+        s.close()
+
+
+def _repoint_playlists(*args: str) -> Any:
+    from likesurgeon.cli import app
+
+    return CliRunner().invoke(app, ["repoint-playlists", *args], env={"COLUMNS": "400"})
+
+
+def test_repoint_playlists_without_a_scan_exits_one(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    result = _repoint_playlists()
+
+    assert result.exit_code == 1, result.output
+    assert "likesurgeon scan playlists" in _out(result)
+    assert patch_metadata_client.requested == []
+
+
+def test_repoint_playlists_reports_pairs_and_writes_nothing(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    _seed_playlist_scan(fake_home)
+    patch_metadata_client.metadata = _relink_metadata()
+
+    result = _repoint_playlists()
+
+    assert result.exit_code == 0, result.output
+    [(diag_id, item_id, confidence, status)] = _playlist_findings(fake_home)
+    assert (confidence, status) == (1.0, "open")
+    assert patch_metadata_client.requested == [["A", "B"]]
+    out = _cells(result)
+    assert f"Playlist repoint report #{diag_id} saved" in out
+    assert "Playlists with a YouTube side / total 1 / 2" in out
+    assert "Dead items on the YouTube side 3" in out
+    assert "playlist_relinked (open write-eligible / total) 1 / 1" in out
+    assert "Dead items YT Music shows as themselves 1" in out
+    assert "Dead items YT Music doesn't place (no finding) 1" in out
+    assert f"Playlist repoint report #{diag_id} — findings (1)" in out
+    assert f"{item_id} playlist_relinked 1.00 A B open" in out
+    assert _PLAYLIST_TITLE in out  # in the reason, printed literally
+    assert "likesurgeon skip <id>" in out
+    assert "likesurgeon repoint-playlists --apply" in out
+    assert "metadata unavailable" not in out
+
+
+def test_repoint_playlists_without_youtube_auth_keeps_every_pair_report_only(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    _seed_playlist_scan(fake_home)
+
+    result = _repoint_playlists()
+
+    assert result.exit_code == 0, result.output
+    [(_, _, confidence, _)] = _playlist_findings(fake_home)
+    assert confidence == 0.5
+    out = _out(result)
+    assert (
+        "videos.list metadata unavailable (no YouTube auth); playlist_relinked pairs are "
+        "report-only." in out
+    )
+    assert "playlist_relinked (open write-eligible / total) 0 / 1" in _cells(result)
+
+
+def test_repoint_playlists_rejects_apply_only_flags_without_apply(fake_home: Path) -> None:
+    for args in (["--limit", "1"], ["--yes"]):
+        result = _repoint_playlists(*args)
+        assert result.exit_code == 2, result.output
+        assert "only apply with --apply" in _out(result)
+
+
+def test_issues_type_playlist_relinked_lists_the_latest_playlists_report(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_DEAD_UNRENDERED
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["issues", "--type", "playlist_relinked"])
+    assert result.exit_code == 0, result.output
+    assert "No playlist repoint report yet" in _out(result)
+    assert "Run likesurgeon repoint-playlists first" in _out(result)
+
+    _seed_diagnosis(fake_home, issue_types=[ISSUE_DEAD_UNRENDERED])
+    _seed_playlist_scan(fake_home)
+    assert _repoint_playlists().exit_code == 0
+    [(diag_id, item_id, _, _)] = _playlist_findings(fake_home)
+
+    result = runner.invoke(app, ["issues", "--type", "playlist_relinked", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["diagnosis_id"] == diag_id
+    assert [
+        (it["id"], it["source_video_id"], it["related_video_id"]) for it in payload["items"]
+    ] == [(item_id, "A", "B")]
+    result = runner.invoke(app, ["issues", "--type", "playlist_relinked"], env={"COLUMNS": "400"})
+    assert f"Playlist repoint report #{diag_id} — issues (1)" in _out(result)
+
+    # Without a type, issues still lists the alignment diagnosis.
+    result = runner.invoke(app, ["issues", "--format", "json"])
+    assert [it["issue_type"] for it in json.loads(result.stdout)["items"]] == [
+        ISSUE_DEAD_UNRENDERED
+    ]
+
+    help_text = _out(runner.invoke(app, ["issues", "--help"]))
+    assert "playlist_relinked" in help_text
+
+
+def test_skip_and_unskip_accept_ids_from_the_latest_playlists_report(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_playlist_scan(fake_home)
+    assert _repoint_playlists().exit_code == 0
+    assert _repoint_playlists().exit_code == 0
+    [(_, older_id, _, _), (_, latest_id, _, _)] = _playlist_findings(fake_home)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["skip", str(older_id)])
+    assert result.exit_code == 2, result.output
+    assert f"#{older_id} is not a finding of the latest diagnosis" in _out(result)
+    assert "(repoint-playlists)" in _out(result)
+
+    result = runner.invoke(app, ["skip", str(latest_id)])
+    assert result.exit_code == 0, result.output
+    assert [st for *_, st in _playlist_findings(fake_home)] == ["open", "skipped"]
+    result = runner.invoke(app, ["unskip", str(latest_id)])
+    assert result.exit_code == 0, result.output
+    assert [st for *_, st in _playlist_findings(fake_home)] == ["open", "open"]
+
+    for command in ("skip", "unskip"):
+        assert "repoint-playlists" in _out(runner.invoke(app, [command, "--help"]))
+
+
+def test_skip_without_any_report_names_every_report_command(fake_home: Path) -> None:
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["skip", "1"])
+
+    assert result.exit_code == 1, result.output
+    assert "repoint-playlists" in _out(result)
