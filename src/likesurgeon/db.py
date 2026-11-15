@@ -44,7 +44,21 @@ def _migrate_in_place(engine: Engine) -> None:
         for table, additions in (
             (
                 "snapshot_items",
-                (("is_available", "BOOLEAN"), ("unavailable_reason", "VARCHAR(32)")),
+                (
+                    ("is_available", "BOOLEAN"),
+                    ("unavailable_reason", "VARCHAR(32)"),
+                    ("video_type", "VARCHAR(64)"),
+                ),
+            ),
+            (
+                "snapshots",
+                (
+                    ("playlist_scan_id", "INTEGER"),
+                    ("playlist_id", "VARCHAR(64)"),
+                    ("playlist_title", "TEXT"),
+                    ("playlist_owned", "BOOLEAN"),
+                    ("playlist_raw_json", "TEXT"),
+                ),
             ),
             ("diagnoses", (("kind", "VARCHAR(32)"),)),
         ):

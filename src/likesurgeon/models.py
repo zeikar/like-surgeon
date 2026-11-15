@@ -53,8 +53,22 @@ class Track(Base):
     __table_args__ = (UniqueConstraint("source", "dedupe_key", name="uq_track_source_dedupe"),)
 
 
+class PlaylistScan(Base):
+    """One ``scan playlists`` run; the playlist snapshots it took point back here."""
+
+    __tablename__ = "playlist_scans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Snapshot(Base):
-    """A point-in-time capture of liked songs from a single source."""
+    """A point-in-time capture of liked songs or one playlist from a single source.
+
+    The five ``playlist_*`` columns are NULL for likes snapshots.
+    ``playlist_owned`` and ``playlist_raw_json`` are set on the
+    ``ytmusic_playlist`` side only.
+    """
 
     __tablename__ = "snapshots"
 
@@ -62,6 +76,14 @@ class Snapshot(Base):
     source: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     raw_count: Mapped[int] = mapped_column(Integer)
+
+    # Plain Integer (no FK, no index) so fresh and migrated DBs share one shape,
+    # as with ``diagnoses.kind``.
+    playlist_scan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    playlist_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    playlist_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    playlist_owned: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    playlist_raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     items: Mapped[list[SnapshotItem]] = relationship(
         back_populates="snapshot", cascade="all, delete-orphan"
@@ -99,7 +121,7 @@ class SnapshotItem(Base):
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Music-candidate classifier output (Task 2). Populated by sources whose
-    # items aren't guaranteed-music (i.e. youtube_liked_videos). NULL for
+    # items aren't guaranteed-music (youtube_liked_videos, youtube_playlist). NULL for
     # ytmusic_liked_songs since those are always music by definition.
     is_music_candidate: Mapped[bool | None] = mapped_column(nullable=True)
     music_candidate_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -107,9 +129,13 @@ class SnapshotItem(Base):
 
     # Ghost detection (0.3): availability of the underlying YouTube video at
     # scan time. ``None`` means "unknown" (snapshot taken before 0.3, or
-    # status check failed). Only populated for ``youtube_liked_videos`` rows.
+    # status check failed). Only populated for ``youtube_liked_videos`` and
+    # ``youtube_playlist`` rows.
     is_available: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     unavailable_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # YT Music's ``videoType`` (e.g. MUSIC_VIDEO_TYPE_ATV); NULL on YouTube rows.
+    video_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     snapshot: Mapped[Snapshot] = relationship(back_populates="items")
     track: Mapped[Track] = relationship()
