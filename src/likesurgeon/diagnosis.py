@@ -34,6 +34,10 @@ ISSUE_CANONICAL_AMBIGUOUS = "canonical_ambiguous"
 CANONICAL_ISSUE_TYPES = (ISSUE_CANONICAL_VERSION, ISSUE_CANONICAL_AMBIGUOUS)
 # ``Diagnosis.kind`` of a ``canonicalize`` report; ``compare-likes`` rows have ``None``.
 DIAGNOSIS_KIND_CANONICALIZE = "canonicalize"
+# A ``repoint-playlists`` report: ``Diagnosis.kind`` and its one issue type.
+DIAGNOSIS_KIND_PLAYLISTS = "playlists"
+ISSUE_PLAYLIST_RELINKED = "playlist_relinked"
+PLAYLIST_ISSUE_TYPES = (ISSUE_PLAYLIST_RELINKED,)
 # The findings that pair an LL video A with the LM entry B rendering it.
 PAIR_ISSUE_TYPES = (ISSUE_RELINKED, ISSUE_RENDERED_AS_OTHER, ISSUE_SHADOW_DUPLICATE)
 
@@ -95,7 +99,7 @@ def _availability_text(item: SnapshotItem) -> str:
     return f"unavailable: {item.unavailable_reason}" if item.unavailable_reason else "unavailable"
 
 
-def _same_recording_text(
+def same_recording_text(
     sanity: bool, a_meta: CanonicalMetadata | None, b_meta: CanonicalMetadata | None
 ) -> str:
     if a_meta is None or b_meta is None:
@@ -120,7 +124,7 @@ def _alignment_pair_reason(
     check_gates: bool,
 ) -> str:
     a, lm = b.ll_item, b.lm_item
-    check = _same_recording_text(sanity, a_meta, b_meta)
+    check = same_recording_text(sanity, a_meta, b_meta)
     missing = a_meta is None or b_meta is None
     if not check_gates:
         verdict = "report-only: availability unknown" if a.is_available is None else None

@@ -85,6 +85,31 @@ def test_migrate_in_place_adds_diagnoses_kind(tmp_path: Path) -> None:
     assert after == before
 
 
+def test_migrate_in_place_adds_playlist_report_columns(tmp_path: Path) -> None:
+    """A legacy DB gains the playlist-report columns; a second call is a no-op."""
+    db_path = tmp_path / "legacy_report.sqlite"
+    legacy = create_engine(f"sqlite:///{db_path}", future=True)
+    with legacy.begin() as conn:
+        conn.execute(text("CREATE TABLE diagnoses (id INTEGER PRIMARY KEY, created_at DATETIME)"))
+        conn.execute(text("CREATE TABLE diagnosis_items (id INTEGER PRIMARY KEY, reason TEXT)"))
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        before = {
+            t: list(conn.execute(text(f"PRAGMA table_info({t})")))
+            for t in ("diagnoses", "diagnosis_items")
+        }
+    _migrate_in_place(engine)
+    with engine.connect() as conn:
+        after = {
+            t: list(conn.execute(text(f"PRAGMA table_info({t})")))
+            for t in ("diagnoses", "diagnosis_items")
+        }
+    assert "playlist_scan_id" in {row[1] for row in before["diagnoses"]}
+    assert {"source_item_id", "related_item_id"} <= {row[1] for row in before["diagnosis_items"]}
+    assert after == before
+
+
 def _legacy_playlist_db(db_path: Path) -> None:
     legacy = create_engine(f"sqlite:///{db_path}", future=True)
     with legacy.begin() as conn:

@@ -153,11 +153,13 @@ class SnapshotItem(Base):
 
 
 class Diagnosis(Base):
-    """A persisted ``compare-likes`` or ``canonicalize`` run.
+    """A persisted ``compare-likes``, ``canonicalize`` or ``repoint-playlists`` run.
 
-    ``kind`` is ``None`` for a ``compare-likes`` (alignment) run and
-    ``'canonicalize'`` for a ``canonicalize`` report, so ``sync`` and
-    ``doctor`` never mistake one for the other.
+    ``kind`` is ``None`` for a ``compare-likes`` (alignment) run,
+    ``'canonicalize'`` for a ``canonicalize`` report and ``'playlists'`` for a
+    ``repoint-playlists`` report, so ``sync`` and ``doctor`` never mistake one
+    for another. A playlists report sets ``playlist_scan_id`` to the scan it
+    was built from (a plain integer, no FK, like ``snapshots.playlist_scan_id``).
     """
 
     __tablename__ = "diagnoses"
@@ -171,6 +173,7 @@ class Diagnosis(Base):
         ForeignKey("snapshots.id", ondelete="SET NULL"), nullable=True
     )
     kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    playlist_scan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     items: Mapped[list[DiagnosisItem]] = relationship(
         back_populates="diagnosis", cascade="all, delete-orphan"
@@ -197,6 +200,12 @@ class DiagnosisItem(Base):
     ``diagnosis.CANONICAL_ISSUE_TYPES``): a liked video that has a better
     version, or one whose better version can't be picked unambiguously.
 
+    A playlists report (``Diagnosis.kind == 'playlists'``) uses
+    ``playlist_relinked`` (see ``diagnosis.PLAYLIST_ISSUE_TYPES``): A is a dead
+    YouTube playlist item and B the video YT Music shows in its place.
+    ``source_item_id`` / ``related_item_id`` are the ``SnapshotItem`` ids of
+    A's ``youtube_playlist`` row and B's ``ytmusic_playlist`` row.
+
     Rows written before the LL → LM alignment redesign may carry legacy
     values (``possibly_missing_from_ytmusic``, ``possible_pointer_drift``,
     ``ytmusic_only``, ``unavailable_video``, ``duplicate_in_source``); nothing
@@ -218,6 +227,8 @@ class DiagnosisItem(Base):
     related_track_id: Mapped[int | None] = mapped_column(
         ForeignKey("tracks.id", ondelete="SET NULL"), nullable=True
     )
+    source_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    related_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="open")
 
     diagnosis: Mapped[Diagnosis] = relationship(back_populates="items")
