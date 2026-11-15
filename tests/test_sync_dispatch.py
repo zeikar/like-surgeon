@@ -14,10 +14,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from likesurgeon.db import make_session_factory
-from likesurgeon.diagnosis import ISSUE_SHADOW_DUPLICATE
-from likesurgeon.models import DiagnosisItem, SyncAttempt
+from likesurgeon.diagnosis import ISSUE_CANONICAL_VERSION, ISSUE_SHADOW_DUPLICATE
+from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt
 from likesurgeon.sync import PlannedAction, SkipRecord
 from likesurgeon.sync_dispatch import (
+    CANONICALIZE_STOP,
     QUOTA_REJECTED,
     RELIKE_STOP,
     RESTORED_STOP,
@@ -30,7 +31,16 @@ from likesurgeon.youtube_client import YouTubeWriteError
 from likesurgeon.ytmusic_client import UnexpectedResponseError
 
 from .fake_account import FakeAccount
-from .sync_items import make_diagnosis, pair, relike, repoint, unlike_shadow, unrendered
+from .sync_items import (
+    canonical_merge,
+    canonical_repoint,
+    make_diagnosis,
+    pair,
+    relike,
+    repoint,
+    unlike_shadow,
+    unrendered,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1196,3 +1206,379 @@ def test_a_relike_unlike_that_errors_but_lands_fails_without_stopping(session: S
         ("relike_lm_check", "applied"),
     ]
     assert acct.lm_reads == 3  # baseline + one check per action
+
+
+# ---------------------------------------------------------------------------
+# execute — canonicalize (canonical_repoint / canonical_merge)
+# ---------------------------------------------------------------------------
+
+_CANONICAL_PRECHECKS = [("canonical_precheck_a", "applied"), ("canonical_precheck_b", "applied")]
+_CANONICAL_REPOINTED = [
+    *_CANONICAL_PRECHECKS,
+    ("canonical_like", "applied"),
+    ("canonical_verify", "applied"),
+    ("canonical_unlike", "applied"),
+    ("canonical_unlike_verify", "applied"),
+]
+_CANONICAL_MERGED = [
+    *_CANONICAL_PRECHECKS,
+    ("canonical_unlike", "applied"),
+    ("canonical_unlike_verify", "applied"),
+]
+_CANONICAL_ROLLBACK = [("canonical_rollback", "applied"), ("canonical_rollback_verify", "applied")]
+
+
+def _canonical(
+    session: Session, diag: Diagnosis | None = None, *, a: str = "A", b: str = "B"
+) -> DiagnosisItem:
+    return pair(session, diag or make_diagnosis(session), ISSUE_CANONICAL_VERSION, a=a, b=b)
+
+
+def _two_canonical(session: Session) -> tuple[DiagnosisItem, DiagnosisItem]:
+    diag = make_diagnosis(session)
+    first = _canonical(session, diag, a="A1", b="B1")
+    second = _canonical(session, diag, a="A2", b="B2")
+    session.commit()
+    return first, second
+
+
+def test_canonical_repoint_moves_the_like_to_b(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    assert sorted(acct.lm) == ["B", "x", "y"]  # A gone, B added, same length
+    session.refresh(item)
+    assert item.status == "applied"
+    assert item.reason == "diagnosis-time evidence"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_CANONICAL_REPOINTED, ("lm_check", "applied")]
+    assert "repoint" in rows[1].reason
+    assert rows[-1].reason == "as expected: -A +B"
+
+
+def test_canonical_repoint_stops_before_unliking_a_when_bs_like_does_not_land(
+    session: Session,
+) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+    acct.like_does_not_land = {"B"}
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == [("B", "like")]
+    assert "A" in acct.liked
+    session.refresh(item)
+    assert item.status == "skipped"
+    assert _steps(session, item.id) == [
+        *_CANONICAL_PRECHECKS,
+        ("canonical_like", "applied"),
+        ("canonical_verify", "skipped"),
+    ]
+
+
+def test_canonical_merge_unlikes_a_and_keeps_b(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["B", "x", "A"])
+
+    res = execute(session, [canonical_merge(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("A", "none")]
+    assert acct.lm == ["B", "x"]
+    session.refresh(item)
+    assert item.status == "applied"
+    assert item.reason == "diagnosis-time evidence"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_CANONICAL_MERGED, ("lm_check", "applied")]
+    assert "merge" in rows[1].reason
+    assert rows[-1].reason == "as expected: -A"
+
+
+def test_a_planned_canonical_repoint_whose_b_is_liked_merges(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["B", "x", "A"])
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("A", "none")]
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_CANONICAL_MERGED, ("lm_check", "applied")]
+    assert "merge" in rows[1].reason
+
+
+def test_a_planned_canonical_merge_whose_b_is_not_liked_repoints(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+
+    res = execute(session, [canonical_merge(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=1, failed=0, skipped=0)
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [*_CANONICAL_REPOINTED, ("lm_check", "applied")]
+    assert "repoint" in rows[1].reason
+
+
+def test_two_as_sharing_one_b_repoint_then_merge(session: Session) -> None:
+    diag = make_diagnosis(session)
+    older = _canonical(session, diag, a="A2")
+    newer = _canonical(session, diag, a="A1")
+    session.commit()
+    acct = FakeAccount(["x", "A1", "A2"])
+    actions = [canonical_repoint(older, "A2"), canonical_merge(newer, "A1")]
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=2, failed=0, skipped=0)
+    assert acct.rate_calls == [("B", "like"), ("A2", "none"), ("A1", "none")]
+    assert acct.lm == ["B", "x"]
+    assert _steps(session, older.id) == [*_CANONICAL_REPOINTED, ("lm_check", "applied")]
+    assert _steps(session, newer.id) == [*_CANONICAL_MERGED, ("lm_check", "applied")]
+    assert acct.lm_reads == 3  # baseline + one check per action
+
+
+@pytest.mark.parametrize(
+    ("liked", "renders", "shown"),
+    [
+        (["x", "A", "y"], {"A": "Z"}, 0),  # A's like shows as something else
+        (["X", "A"], {"X": "A"}, 2),  # another like also shows as A
+    ],
+)
+def test_canonical_skips_when_lm_does_not_show_a_exactly_once(
+    session: Session, liked: list[str], renders: dict[str, str | None], shown: int
+) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(liked, renders=renders)
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == [] and acct.rating_reads == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    [row] = _attempts(session, item.id)
+    assert (row.kind, row.status) == ("canonical_precheck_lm", "skipped")
+    assert f"A {shown} time(s)" in row.reason
+
+
+def test_canonical_skips_when_a_is_shown_but_not_liked_itself(session: Session) -> None:
+    """LM shows A, but X's like backs that entry."""
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["X"], renders={"X": "A"})
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    assert _steps(session, item.id) == [("canonical_precheck_a", "skipped")]
+
+
+def test_canonical_fails_without_writes_when_bs_rating_is_unreadable(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+    acct.rating_errors = {"B"}
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=1, skipped=0)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "open"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        ("canonical_precheck_a", "applied"),
+        ("canonical_precheck_b", "failed"),
+    ]
+    assert "boom" in rows[-1].reason
+
+
+def test_canonical_merge_skips_when_b_is_liked_but_not_shown(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["B", "x", "A"], renders={"B": None})
+
+    res = execute(session, [canonical_merge(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(applied=0, failed=0, skipped=1)
+    assert acct.rate_calls == []
+    session.refresh(item)
+    assert item.status == "skipped"
+    rows = _attempts(session, item.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        *_CANONICAL_PRECHECKS,
+        ("canonical_precheck_lm", "skipped"),
+    ]
+    assert "doesn't show B" in rows[-1].reason
+
+
+def test_canonical_repoint_restores_a_and_undoes_b_when_b_is_not_shown(session: Session) -> None:
+    """B's like doesn't render as B, so LM lost A without gaining B: A is
+    re-liked, B's like undone, and the run stops."""
+    first, second = _two_canonical(session)
+    acct = FakeAccount(["x", "A1", "A2"], renders={"B1": None})
+    actions = [canonical_repoint(first, "A1", "B1"), canonical_repoint(second, "A2", "B2")]
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0, failed=0, skipped=1, restored=1, unattempted=1, aborted=CANONICALIZE_STOP
+    )
+    assert acct.rate_calls == [("B1", "like"), ("A1", "none"), ("A1", "like"), ("B1", "none")]
+    assert "A1" in acct.liked and "B1" not in acct.liked
+    session.refresh(first)
+    assert first.status == "skipped"
+    assert _steps(session, first.id) == [*_CANONICAL_REPOINTED, *_RESTORED, *_CANONICAL_ROLLBACK]
+    assert _attempts(session, second.id) == []
+
+
+def test_canonical_merge_restores_a_when_lm_does_not_change(session: Session) -> None:
+    diag = make_diagnosis(session)
+    first = _canonical(session, diag, a="A1")
+    second = _canonical(session, diag, a="A2", b="B2")
+    session.commit()
+    acct = FakeAccount(["B", "x", "A1", "A2"])
+    acct.lm_stale_reads = {2, 3}  # both post-unlike reads still show A1
+    actions = [canonical_merge(first, "A1"), canonical_repoint(second, "A2", "B2")]
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0, failed=0, skipped=1, restored=1, unattempted=1, aborted=CANONICALIZE_STOP
+    )
+    assert acct.rate_calls == [("A1", "none"), ("A1", "like")]
+    assert "A1" in acct.liked
+    assert _steps(session, first.id) == [*_CANONICAL_MERGED, *_RESTORED]
+    assert _attempts(session, second.id) == []
+
+
+def test_quota_on_the_canonical_unlike_leaves_a_liked(session: Session) -> None:
+    first, second = _two_canonical(session)
+    acct = FakeAccount(["A1", "A2"])
+    acct.quota_after = 4  # 2 prechecks + like B1 + getRating B1
+    actions = [canonical_repoint(first, "A1", "B1"), canonical_repoint(second, "A2", "B2")]
+
+    res = execute(session, actions, [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        quota_exhausted=True,
+        unattempted=1,
+        left_liked=("B1",),
+        aborted=ROLLBACK_STOP,
+    )
+    # The last two were rejected by the quota: nothing was sent.
+    assert acct.rate_calls == [("B1", "like"), ("A1", "none"), ("B1", "none")]
+    assert "A1" in acct.liked
+    rows = _attempts(session, first.id)
+    assert [(r.kind, r.status) for r in rows] == [
+        *_CANONICAL_REPOINTED[:4],
+        ("canonical_unlike", "failed"),
+        ("canonical_rollback", "failed"),
+    ]
+    assert rows[4].reason.startswith(QUOTA_REJECTED)
+    assert stranded_unliked_video_ids(session) == frozenset()
+
+
+def test_an_interrupt_after_the_canonical_unlike_strands_a(session: Session) -> None:
+    factory = make_session_factory(session.bind)
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+    acct.lm_read_errors = {2: KeyboardInterrupt()}  # read 1 is the baseline
+
+    with pytest.raises(KeyboardInterrupt):
+        execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    fresh = factory()
+    try:
+        assert _steps(fresh, item.id) == [*_CANONICAL_REPOINTED, ("interrupted", "failed")]
+        assert fresh.get(DiagnosisItem, item.id).status == "open"
+        assert stranded_unliked_video_ids(fresh) == {"A"}
+    finally:
+        fresh.close()
+
+
+def test_a_failed_canonical_restore_leaves_a_unliked_and_stops(session: Session) -> None:
+    """B's like isn't shown and A's re-like fails: A is reported, B's like
+    stays (it is the song's only like now), and the run stops."""
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"], renders={"B": None})
+    acct.rate_errors = {("A", "like")}
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0, failed=1, skipped=0, left_unliked=("A",), aborted=CANONICALIZE_STOP
+    )
+    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like")]
+    assert "A" not in acct.liked and "B" in acct.liked
+    session.refresh(item)
+    assert item.status == "open"
+    assert _steps(session, item.id) == [
+        *_CANONICAL_REPOINTED,
+        ("lm_check", "failed"),
+        ("restore_like", "failed"),
+    ]
+    assert stranded_unliked_video_ids(session) == {"A"}
+
+
+def test_lm_read_failure_after_the_canonical_unlike_keeps_its_own_stop(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"])
+    acct.lm_read_errors = {2: UnexpectedResponseError("network down")}
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert (res.applied, res.failed, res.skipped, res.restored) == (0, 0, 1, 1)
+    assert res.aborted is not None and "network down" in res.aborted
+    assert res.aborted != CANONICALIZE_STOP
+    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like"), ("B", "none")]
+    assert "A" in acct.liked and "B" not in acct.liked
+    assert _steps(session, item.id) == [
+        *_CANONICAL_REPOINTED,
+        ("lm_check", "failed"),
+        ("restore_like", "applied"),
+        ("restore_verify", "applied"),
+        *_CANONICAL_ROLLBACK,
+    ]
+
+
+def test_a_failed_b_rollback_after_a_canonical_restore_reports_b(session: Session) -> None:
+    item = _canonical(session)
+    session.commit()
+    acct = FakeAccount(["x", "A", "y"], renders={"B": None})
+    acct.rate_errors = {("B", "none")}
+
+    res = execute(session, [canonical_repoint(item)], [], ytm=acct, yt=acct)
+
+    assert res == ExecResult(
+        applied=0, failed=0, skipped=1, restored=1, left_liked=("B",), aborted=ROLLBACK_STOP
+    )
+    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like"), ("B", "none")]
+    assert "A" in acct.liked and "B" in acct.liked
+    assert _steps(session, item.id) == [
+        *_CANONICAL_REPOINTED,
+        *_RESTORED,
+        ("canonical_rollback", "failed"),
+    ]

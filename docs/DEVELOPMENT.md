@@ -27,7 +27,7 @@ uv run ruff format .
 
 Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<module>.py`. Three flavors:
 
-- **Unit** — pure-functional modules (`classify`, `normalize`, `drift`, `align`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network. `test_align.py` drives the LL→LM alignment with small synthetic lists (consecutive relinks, duplicate copies, edge gaps, *k* ≠ *m*).
+- **Unit** — pure-functional modules (`classify`, `normalize`, `drift`, `align`) get exhaustive coverage with lightweight stand-in inputs. No DB, no network. `test_align.py` drives the LL→LM alignment with small synthetic lists (consecutive relinks, duplicate copies, edge gaps, *k* ≠ *m*). `test_canonicalize.py` drives `find_candidates` with hand-built liked-song dicts and `ArtistSongs` pages (`song` / `page` helpers: title key, ±1 s, listed vs. unlisted, unreadable artists, the version-keyword net); its `persist_report` and `plan` tests use the `session` fixture below. `test_ytmusic_client.py` feeds `parse_artist_page` minimal raw `browse` responses (a headerless promo carousel, a plain channel, a shelf without a Show-all link).
 - **Integration** — `test_db`, `test_snapshot`, `test_diagnosis`, `test_pipeline`, `test_sync`, `test_sync_dispatch`, `test_sync_preflight`, `test_doctor`, `test_export`, `test_diff` use the in-memory SQLite fixture from [`tests/conftest.py`](../tests/conftest.py):
   ```python
   @pytest.fixture
@@ -35,7 +35,7 @@ Test layout mirrors source: `tests/test_<module>.py` per `src/likesurgeon/<modul
       """In-memory SQLite session, schema initialized."""
   ```
   `diff_snapshots` takes a `Session` and reads snapshot/items rows directly, so it lives with the integration tier rather than the pure modules above.
-- **CLI wiring** — `test_cli` uses Typer's `CliRunner` against a `tmp_path` home (`LIKE_SURGEON_HOME` env override) and monkeypatched fakes for `YouTubeClient` / `YTMusicClient`. The pattern: replace the provider class on the module the command imports it from, then assert the captured kwargs.
+- **CLI wiring** — `test_cli` uses Typer's `CliRunner` against a `tmp_path` home (`LIKE_SURGEON_HOME` env override) and monkeypatched fakes for `YouTubeClient` / `YTMusicClient`. The pattern: replace the provider class on the module the command imports it from, then assert the captured kwargs. `canonicalize` report mode uses the discovery fake `_FakeYTMusicDiscovery` (fixture `patch_discovery_client`, swapped onto `cli.YTMusicClient`): class-level liked songs, artist pages and per-artist errors, plus a `during_artist_read` hook that runs mid-read so a test can inspect the DB (the snapshot is committed before artist pages are read) or make a write there. `canonicalize --apply` uses `FakeAccount` like `sync`.
 - **Live** — `test_ytmusic_client_live.py` is opt-in (`@pytest.mark.live`), deselected by default via `pyproject.toml`. Set `LIKESURGEON_LIVE_BROWSER=firefox` to point at a non-default browser:
   ```bash
   uv run pytest -m live
@@ -71,7 +71,7 @@ Two auth flows live in this project. Both write credentials to `~/.like-surgeon/
 
 ### YouTube Music (browser-header)
 
-Cookie-based auth via [browser-cookie3](https://pypi.org/project/browser-cookie3/). The `--from-browser` flag reads cookies straight from a logged-in browser's local store and writes a ytmusicapi-compatible `browser.json`.
+Cookie-based auth via [browser-cookie3](https://pypi.org/project/browser-cookie3/). The `--from-browser` flag reads cookies straight from a logged-in browser's local store, writes a ytmusicapi-compatible `browser.json` and records the browser and signed-in account as `ytmusic_browser` / `ytmusic_account` in `config.json`. Every CLI `YTMusicClient` gets both, so a stale Liked songs read re-extracts cookies once and retries if the browser is still that account; the manual flow clears both keys. Tests fake the extraction by monkeypatching `write_browser_json_from_browser` (on `likesurgeon.ytmusic_client` for the client, on `likesurgeon.cli` for `auth`, plus `YTMusicClient.account_identity`) — never a real browser. The `real_ytmusic_client` fixture in `test_cli.py` runs the real client over `FakeAccount` to test a refresh inside a `sync` LM check.
 
 ```bash
 uv run likesurgeon auth ytmusic --from-browser chrome
@@ -140,10 +140,10 @@ uv run sqlite3 ~/.like-surgeon/like-surgeon.sqlite \
   "SELECT video_id, is_available, unavailable_reason FROM snapshot_items
    WHERE video_id = 'u5trz8pk7rI' ORDER BY snapshot_id DESC;"
 
-# Latest diagnosis breakdown
+# Latest diagnosis breakdown (compare-likes; use kind = 'canonicalize' for the canonicalize report)
 uv run sqlite3 ~/.like-surgeon/like-surgeon.sqlite \
   "SELECT issue_type, COUNT(*) FROM diagnosis_items
-   WHERE diagnosis_id = (SELECT MAX(id) FROM diagnoses)
+   WHERE diagnosis_id = (SELECT MAX(id) FROM diagnoses WHERE kind IS NULL)
    GROUP BY issue_type ORDER BY 2 DESC;"
 ```
 

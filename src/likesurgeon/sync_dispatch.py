@@ -33,6 +33,14 @@ the confirmed re-like goes undetected. ``relike_like`` and ``relike_lm_check``
 are not settling rows for ``stranded_unliked_video_ids``: only a
 ``relike_verify`` proves the like landed.
 
+A canonicalize action (``canonical_repoint`` / ``canonical_merge``, a liked
+song moved to the version its artist page lists, B) runs one flow for both
+planned kinds, picked from B's live rating: not liked, it is a repoint (like
+B, confirm, unlike A; LM expects one A fewer and one B more), liked, a merge
+(unlike A; one A fewer). Before any rating read, LM must show A exactly once;
+then A must read liked, and for a merge LM must show B. Restores and B undos
+work as for a repoint; a restore stops the run with ``CANONICALIZE_STOP``.
+
 Invariants:
   * ``DiagnosisItem.reason`` is never modified — that field is the
     diagnosis-time evidence. Sync-side detail lives on ``SyncAttempt.reason``.
@@ -84,9 +92,10 @@ _LM_DIFF_SHOWN = 6
 # nothing was sent. ``stranded_unliked_video_ids`` keys on it.
 QUOTA_REJECTED = "not sent, YouTube quota exhausted"
 
-# ``ExecResult.aborted`` when B's like couldn't be undone after a repoint.
+# ``ExecResult.aborted`` when a B like this run made couldn't be undone (sync's
+# repoint or canonicalize's repoint flow).
 ROLLBACK_STOP = (
-    "a repoint's B like couldn't be undone, so the account differs from the diagnosis — "
+    "a B like couldn't be undone, so the account differs from the diagnosis — "
     "unlike B by hand, then re-scan both sources and re-run compare-likes"
 )
 
@@ -101,6 +110,13 @@ RELIKE_STOP = (
     "a relike didn't go as planned — its unlike didn't take, its re-like couldn't be "
     "confirmed, or YT Music liked songs changed in another way — so the lists may differ "
     "from the diagnosis; re-scan both sources and re-run compare-likes"
+)
+
+# ``ExecResult.aborted`` after a canonicalize action needed a restore (whether or not it worked).
+CANONICALIZE_STOP = (
+    "a canonicalize action needed A re-liked — its unlike didn't take, or YT Music liked "
+    "songs didn't change as expected — so later actions may rest on the same wrong "
+    "assumption; re-run canonicalize before applying more"
 )
 
 
@@ -122,8 +138,9 @@ class ExecResult:
     # re-likes them by hand.
     left_unliked: tuple[str, ...] = ()
     # Why the run stopped early: YT Music liked songs couldn't be read, an
-    # action was restored (the diagnosis' pairs can't be trusted any more), or
-    # a relike didn't go as planned (``RELIKE_STOP``).
+    # action was restored (the diagnosis' pairs can't be trusted any more, or
+    # for canonicalize ``CANONICALIZE_STOP``), or a relike didn't go as
+    # planned (``RELIKE_STOP``).
     aborted: str | None = None
     # Videos a repoint of this run liked on YouTube (B) that stayed liked or
     # may have: the undo failed or couldn't be confirmed (A restored, A's unlike
@@ -185,6 +202,8 @@ def execute(
             outcome = run.unlike_shadow(action, before)
         elif action.kind == "relike":
             outcome = run.relike(action, before)
+        elif action.kind in ("canonical_repoint", "canonical_merge"):
+            outcome = run.canonicalize(action, before)
         else:
             assert_never(action.kind)
         outcomes[outcome] += 1
@@ -281,36 +300,7 @@ class _SyncRun:
         )
         if not b_liked:
             return _unconfirmed(b_liked)
-        rated = self._rate(item_id, "repoint_like", b, "like")
-        if rated == "quota":
-            return "failed"  # nothing was sent
-        # A 2xx doesn't mean B's like landed (and an error may have): unliking
-        # A without it would drop the song from both platforms.
-        liked = self._has_rating(item_id, "repoint_verify", b, "like", miss="skipped")
-        if rated != "ok":
-            # A is untouched; whatever landed of B's like is undone.
-            if liked is not False:
-                self._undo_b_like(item_id, b)
-            return "failed"
-        if not liked:
-            if liked is None:
-                self._undo_b_like(item_id, b)  # unread: B may be liked
-            return _unconfirmed(liked)
-        self.unlike_rejected = False
-        restored_before = self.restored
-        outcome = self._unlike_and_check(
-            item_id,
-            a,
-            unlike_kind="repoint_unlike",
-            verify_kind="repoint_unlike_verify",
-            before=before,
-            expected=before,
-            # B's own like adds an entry while A still renders as B.
-            still_liked=before + Counter([b]),
-        )
-        if self.restored > restored_before or self.unlike_rejected:
-            self._undo_b_like(item_id, b)
-        return outcome
+        return self._like_b_then_unlike_a(item_id, a, b, before, prefix="repoint", expected=before)
 
     def unlike_shadow(self, action: PlannedAction, before: _LM) -> _DispatchOutcome:
         item_id, a, b = action.item_id, action.a_video_id, action.b_video_id
@@ -409,6 +399,109 @@ class _SyncRun:
             if stop:
                 self.aborted = self.aborted or RELIKE_STOP
             return outcome
+
+    def canonicalize(self, action: PlannedAction, before: _LM) -> _DispatchOutcome:
+        """Move A's like to the version the artist page lists (B). The planned
+        kind is only a forecast: B's live rating picks the flow — not liked:
+        like B, then unlike A (LM: one A fewer, one B more); liked: unlike A
+        (LM: one A fewer). Sets ``CANONICALIZE_STOP`` after a restore."""
+        item_id, a, b = action.item_id, action.a_video_id, action.b_video_id
+        if before[a] != 1:
+            # Zero: A's like shows as something else. Two: another like also
+            # shows as A, so "one A fewer" can't tell which entry went.
+            self._record(
+                item_id,
+                "canonical_precheck_lm",
+                "skipped",
+                f"YT Music shows {a} {before[a]} time(s), not once",
+            )
+            return "skipped"
+        # LM showing A doesn't prove A's own like backs that entry.
+        a_liked = self._has_rating(
+            item_id, "canonical_precheck_a", a, "like", miss="skipped", wait=False
+        )
+        if not a_liked:
+            return _unconfirmed(a_liked)
+        b_liked = self._read_rating(item_id, "canonical_precheck_b", b)
+        if b_liked is None:
+            return "failed"
+        restored_before = (self.restored, len(self.left_unliked))
+        expected = before.copy()
+        expected[a] -= 1
+        if b_liked:
+            self._record(
+                item_id, "canonical_precheck_b", "applied", "rating is like — merge: unlike A"
+            )
+            if not before[b]:
+                # The check expects B to stay shown; B's like may render as something else.
+                self._record(
+                    item_id,
+                    "canonical_precheck_lm",
+                    "skipped",
+                    f"YT Music doesn't show {b} although it is liked",
+                )
+                return "skipped"
+            outcome = self._unlike_and_check(
+                item_id,
+                a,
+                unlike_kind="canonical_unlike",
+                verify_kind="canonical_unlike_verify",
+                before=before,
+                expected=expected,
+                still_liked=before,
+            )
+        else:
+            self._record(
+                item_id,
+                "canonical_precheck_b",
+                "applied",
+                "rating is none — repoint: like B, then unlike A",
+            )
+            expected[b] += 1
+            outcome = self._like_b_then_unlike_a(
+                item_id, a, b, before, prefix="canonical", expected=expected
+            )
+        if (self.restored, len(self.left_unliked)) != restored_before and self.aborted is None:
+            self.aborted = CANONICALIZE_STOP
+        return outcome
+
+    def _like_b_then_unlike_a(
+        self, item_id: int, a: str, b: str, before: _LM, *, prefix: str, expected: _LM
+    ) -> _DispatchOutcome:
+        """Like B, confirm it, then unlike A and check LM against ``expected``
+        (rows ``{prefix}_like``, ``{prefix}_verify``, ``{prefix}_unlike``,
+        ``{prefix}_unlike_verify``). Whenever A stays liked after B's like may
+        have landed, B's like is undone."""
+        rated = self._rate(item_id, f"{prefix}_like", b, "like")
+        if rated == "quota":
+            return "failed"  # nothing was sent
+        # A 2xx doesn't mean B's like landed (and an error may have): unliking
+        # A without it would drop the song from both platforms.
+        liked = self._has_rating(item_id, f"{prefix}_verify", b, "like", miss="skipped")
+        if rated != "ok":
+            # A is untouched; whatever landed of B's like is undone.
+            if liked is not False:
+                self._undo_b_like(item_id, b, prefix)
+            return "failed"
+        if not liked:
+            if liked is None:
+                self._undo_b_like(item_id, b, prefix)  # unread: B may be liked
+            return _unconfirmed(liked)
+        self.unlike_rejected = False
+        restored_before = self.restored
+        outcome = self._unlike_and_check(
+            item_id,
+            a,
+            unlike_kind=f"{prefix}_unlike",
+            verify_kind=f"{prefix}_unlike_verify",
+            before=before,
+            expected=expected,
+            # B's own like adds an entry while A still shows.
+            still_liked=before + Counter([b]),
+        )
+        if self.restored > restored_before or self.unlike_rejected:
+            self._undo_b_like(item_id, b, prefix)
+        return outcome
 
     def _unlike_and_check(
         self,
@@ -572,15 +665,15 @@ class _SyncRun:
         self.left_unliked.append(a)
         return "failed"
 
-    def _undo_b_like(self, item_id: int, b: str) -> None:
+    def _undo_b_like(self, item_id: int, b: str, prefix: str) -> None:
         """Try to unlike a B this run may have liked while A stays liked
-        (``repoint_rollback`` / ``repoint_rollback_verify``) — after A's restore,
+        (``{prefix}_rollback`` / ``{prefix}_rollback_verify``) — after A's restore,
         after A's unlike was quota-rejected, or after B's like errored. A failure
         doesn't change the action's outcome (A is liked either way), but B is
         reported in ``left_liked`` and the run stops."""
         if (
-            self._rate(item_id, "repoint_rollback", b, "none") != "ok"
-            or self._has_rating(item_id, "repoint_rollback_verify", b, "none", miss="failed")
+            self._rate(item_id, f"{prefix}_rollback", b, "none") != "ok"
+            or self._has_rating(item_id, f"{prefix}_rollback_verify", b, "none", miss="failed")
             is not True
         ):
             self.left_liked.append(b)
@@ -627,11 +720,8 @@ class _SyncRun:
         rating changed, so each write is confirmed this way after a wait."""
         if wait:
             time.sleep(_VERIFY_WAIT_SECONDS)
-        try:
-            liked = self.yt.is_in_liked_videos(video_id)
-        except YouTubeWriteError as exc:
-            self._record(item_id, kind, "failed", str(exc))
-            self.quota_exhausted |= isinstance(exc, YouTubeQuotaExceededError)
+        liked = self._read_rating(item_id, kind, video_id)
+        if liked is None:
             return None
         if liked == (rating == "like"):
             self._record(item_id, kind, "applied", f"rating is {rating}")
@@ -639,6 +729,16 @@ class _SyncRun:
         after = f" after +{_VERIFY_WAIT_SECONDS}s" if wait else ""
         self._record(item_id, kind, miss, miss_note or f"rating is not {rating}{after}")
         return False
+
+    def _read_rating(self, item_id: int, kind: str, video_id: str) -> bool | None:
+        """``videos.getRating`` as liked or not; None (and a failed ``kind``
+        row) if the read failed."""
+        try:
+            return self.yt.is_in_liked_videos(video_id)
+        except YouTubeWriteError as exc:
+            self._record(item_id, kind, "failed", str(exc))
+            self.quota_exhausted |= isinstance(exc, YouTubeQuotaExceededError)
+            return None
 
     def _record(self, item_id: int, kind: str, status: str, reason: str) -> None:
         self.session.add(

@@ -217,6 +217,15 @@ def _upsert_track(session: Session, source: str, rec: dict[str, Any]) -> Track:
     return track
 
 
+def upsert_ytmusic_track(session: Session, raw: dict[str, Any]) -> Track:
+    """The ``ytmusic_liked_songs`` Track for one ytmusicapi song dict, created if new.
+
+    For tracks seen outside a liked-songs read (e.g. a canonical version B from
+    an artist's songs list) that a diagnosis item still has to point at.
+    """
+    return _upsert_track(session, YTMUSIC_LIKED_SONGS, _ytmusic_to_record(raw))
+
+
 def create_snapshot(session: Session, source: str, items: Iterable[dict[str, Any]]) -> Snapshot:
     """Persist a snapshot of ``items`` from ``source``. Returns the snapshot row."""
     if source not in _TRANSLATORS:

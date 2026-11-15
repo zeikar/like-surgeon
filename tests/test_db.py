@@ -65,3 +65,21 @@ def test_make_engine_runs_migration(tmp_path: Path) -> None:
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(snapshot_items)"))}
     assert "is_available" in cols
     assert "unavailable_reason" in cols
+
+
+def test_migrate_in_place_adds_diagnoses_kind(tmp_path: Path) -> None:
+    """A DB whose diagnoses table predates `kind` (and has no snapshot_items)
+    gets the column; a second call is a no-op."""
+    db_path = tmp_path / "legacy_diag.sqlite"
+    legacy = create_engine(f"sqlite:///{db_path}", future=True)
+    with legacy.begin() as conn:
+        conn.execute(text("CREATE TABLE diagnoses (id INTEGER PRIMARY KEY, created_at DATETIME)"))
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        before = list(conn.execute(text("PRAGMA table_info(diagnoses)")))
+    _migrate_in_place(engine)
+    with engine.connect() as conn:
+        after = list(conn.execute(text("PRAGMA table_info(diagnoses)")))
+    assert "kind" in {row[1] for row in before}
+    assert after == before

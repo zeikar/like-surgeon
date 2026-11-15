@@ -30,7 +30,13 @@ from .diagnosis import (
 )
 from .models import DiagnosisItem, Track
 
-ActionKind = Literal["repoint", "unlike_shadow", "relike"]
+ActionKind = Literal[
+    "repoint",
+    "unlike_shadow",
+    "relike",
+    "canonical_repoint",
+    "canonical_merge",
+]
 
 _TRACK_LOOKUP_BATCH_SIZE = 500
 
@@ -201,13 +207,16 @@ _ACTION_KINDS: tuple[ActionKind, ...] = ("repoint", "unlike_shadow", "relike")
 # isn't in the estimate. YT Music reads are free.
 _DAILY_QUOTA = 10000
 
-_QUOTA_COST: dict[ActionKind, int] = {
+QUOTA_COST: dict[ActionKind, int] = {
     # getRating A + getRating B + like B + getRating B + unlike A + getRating A
     "repoint": 104,
     # getRating B + getRating A + unlike A + getRating A
     "unlike_shadow": 53,
     # getRating A + unlike A + getRating A + like A + getRating A
     "relike": 103,
+    # canonicalize runs the same call sequences as repoint / unlike_shadow
+    "canonical_repoint": 104,
+    "canonical_merge": 53,
 }
 
 
@@ -215,7 +224,7 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
     """Human-readable plan summary. Plain text — Rich rendering belongs in cli.py."""
     by_action = Counter(a.kind for a in actions)
     by_skip = Counter(s.kind for s in skips)
-    quota = sum(_QUOTA_COST[a.kind] for a in actions)
+    quota = sum(QUOTA_COST[a.kind] for a in actions)
 
     lines = ["Sync plan:"]
     lines += [f"  {kind}: {by_action[kind]}" for kind in _ACTION_KINDS]
@@ -225,10 +234,16 @@ def summarize(actions: list[PlannedAction], skips: list[SkipRecord]) -> str:
         lines.append(
             "  note: each relike moves that video to the top of Liked videos and Liked songs"
         )
-    lines.append(f"Estimated YouTube quota: {quota} units (daily default {_DAILY_QUOTA})")
+    lines += quota_lines(quota)
+    return "\n".join(lines)
+
+
+def quota_lines(quota: int) -> list[str]:
+    """The estimate line, plus the over-daily-quota warning when it applies."""
+    lines = [f"Estimated YouTube quota: {quota} units (daily default {_DAILY_QUOTA})"]
     if quota > _DAILY_QUOTA:
         lines.append(
             "  WARNING: exceeds the default daily quota — the run stops when it runs "
             "out; slice it with --limit"
         )
-    return "\n".join(lines)
+    return lines

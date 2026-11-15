@@ -127,7 +127,12 @@ class SnapshotItem(Base):
 
 
 class Diagnosis(Base):
-    """A persisted ``compare-likes`` run."""
+    """A persisted ``compare-likes`` or ``canonicalize`` run.
+
+    ``kind`` is ``None`` for a ``compare-likes`` (alignment) run and
+    ``'canonicalize'`` for a ``canonicalize`` report, so ``sync`` and
+    ``doctor`` never mistake one for the other.
+    """
 
     __tablename__ = "diagnoses"
 
@@ -139,6 +144,7 @@ class Diagnosis(Base):
     youtube_snapshot_id: Mapped[int | None] = mapped_column(
         ForeignKey("snapshots.id", ondelete="SET NULL"), nullable=True
     )
+    kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     items: Mapped[list[DiagnosisItem]] = relationship(
         back_populates="diagnosis", cascade="all, delete-orphan"
@@ -146,7 +152,7 @@ class Diagnosis(Base):
 
 
 class DiagnosisItem(Base):
-    """A single finding produced by a ``compare-likes`` run.
+    """A single finding produced by a ``compare-likes`` or ``canonicalize`` run.
 
     ``issue_type`` is one of (see ``diagnosis.ALIGNMENT_ISSUE_TYPES``):
       - ``relinked`` / ``rendered_as_other`` / ``shadow_duplicate`` — pair
@@ -159,6 +165,11 @@ class DiagnosisItem(Base):
       - ``unbacked_lm_entry`` — a YT Music entry with no YouTube like behind it.
       - ``metadata_drift`` — the same ``video_id`` appears in two snapshots
         of one source with meaningfully different title or artists.
+
+    A ``canonicalize`` report (``Diagnosis.kind == 'canonicalize'``) uses
+    ``canonical_version`` / ``canonical_ambiguous`` instead (see
+    ``diagnosis.CANONICAL_ISSUE_TYPES``): a liked video that has a better
+    version, or one whose better version can't be picked unambiguously.
 
     Rows written before the LL → LM alignment redesign may carry legacy
     values (``possibly_missing_from_ytmusic``, ``possible_pointer_drift``,
@@ -190,7 +201,7 @@ class DiagnosisItem(Base):
 
 
 class SyncAttempt(Base):
-    """One row per ``sync`` API call, LM check, or skip decision.
+    """One row per ``sync`` / ``canonicalize --apply`` API call, LM check, or skip decision.
 
     ``kind`` names the step: ``repoint_precheck_a``,
     ``repoint_precheck_b``, ``repoint_like``, ``repoint_verify``,
@@ -200,7 +211,11 @@ class SyncAttempt(Base):
     ``restore_verify``; ``repoint_rollback``,
     ``repoint_rollback_verify``; ``relike_precheck``, ``relike_unlike``,
     ``relike_unlike_verify``, ``relike_like``, ``relike_verify``,
-    ``relike_lm_check``; or the action kind
+    ``relike_lm_check``; ``canonicalize --apply`` writes ``canonical_precheck_lm``,
+    ``canonical_precheck_a``, ``canonical_precheck_b``, ``canonical_like``,
+    ``canonical_verify``, ``canonical_unlike``, ``canonical_unlike_verify``,
+    ``canonical_rollback``, ``canonical_rollback_verify`` and the shared
+    ``lm_check`` / ``restore_*`` rows; or the action kind
     (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
     action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
     authoritative list. Rows written before the LL → LM alignment redesign may

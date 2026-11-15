@@ -11,9 +11,12 @@ import pytest
 from ytmusicapi.exceptions import YTMusicServerError
 
 from likesurgeon.ytmusic_client import (
+    ArtistSongs,
     AuthFileMissingError,
+    CookieExtractionError,
     UnexpectedResponseError,
     YTMusicClient,
+    parse_artist_page,
 )
 
 
@@ -21,10 +24,23 @@ class _FakeYTMusic:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
         self.last_limit: Any = "<unset>"
+        self.browse_calls: list[tuple[str, dict[str, Any]]] = []
+        self.playlist_calls: list[tuple[str, Any]] = []
 
     def get_liked_songs(self, limit: int | None) -> Any:
         self.last_limit = limit
         return self._payload
+
+    def _send_request(self, endpoint: str, body: dict[str, Any]) -> Any:
+        self.browse_calls.append((endpoint, body))
+        result = self._payload[body["browseId"]]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def get_playlist(self, playlist_id: str, limit: int | None = None) -> Any:
+        self.playlist_calls.append((playlist_id, limit))
+        return {"tracks": [{"videoId": f"{playlist_id}-song"}]}
 
 
 class _FakeClient(YTMusicClient):
@@ -168,6 +184,261 @@ def test_fetch_liked_songs_wraps_parse_indexerror_as_unexpected_response() -> No
     with pytest.raises(UnexpectedResponseError, match="auth ytmusic") as exc_info:
         _Client().fetch_liked_songs()
     assert isinstance(exc_info.value.__cause__, IndexError)
+
+
+class _SequenceYTMusic:
+    """Fake YTMusic whose successive ``get_liked_songs`` calls (shared across
+    rebuilds) raise or return the next item of ``outcomes``; ``account`` is
+    what ``get_account_info`` reports (an exception is raised)."""
+
+    def __init__(self, outcomes: list[Any], account: Any = None) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+        self.account = {"accountName": "Me", "channelHandle": "@me"} if account is None else account
+
+    def get_liked_songs(self, limit: int | None) -> Any:
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def get_account_info(self) -> Any:
+        if isinstance(self.account, Exception):
+            raise self.account
+        return self.account
+
+
+class _RefreshClient(YTMusicClient):
+    """Counts ``_build`` calls; every build hands out the same sequence fake.
+    The auth file is real (a refresh reads and may restore it)."""
+
+    def __init__(self, fake: _SequenceYTMusic, auth_file: Path, **kwargs: Any) -> None:
+        super().__init__(browser_path=auth_file, **kwargs)
+        self.fake = fake
+        self.builds = 0
+
+    def _build(self) -> Any:
+        self.builds += 1
+        return self.fake
+
+
+_STALE = KeyError("Unable to find 'twoColumnBrowseResultsRenderer' using path [...]")
+_OLD_COOKIES = '{"Cookie": "old"}'
+
+
+@pytest.fixture
+def auth_file(tmp_path: Path) -> Path:
+    from likesurgeon.fileio import write_private_text
+
+    path = tmp_path / "browser.json"
+    write_private_text(path, _OLD_COOKIES)
+    return path
+
+
+@pytest.fixture
+def extractions(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Path]]:
+    """Fake cookie re-extraction: writes new cookies, records ``(browser, target)``."""
+    calls: list[tuple[str, Path]] = []
+
+    def extract(browser: str, target: Path) -> None:
+        calls.append((browser, target))
+        target.write_text('{"Cookie": "new"}', encoding="utf-8")
+
+    monkeypatch.setattr("likesurgeon.ytmusic_client.write_browser_json_from_browser", extract)
+    return calls
+
+
+def _refresh_client(fake: _SequenceYTMusic, auth_file: Path, **kwargs: Any) -> _RefreshClient:
+    return _RefreshClient(
+        fake, auth_file, refresh_browser="chrome", refresh_account="@me", **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "first_failure", [_STALE, YTMusicServerError("Server returned HTTP 401: Unauthorized.")]
+)
+def test_fetch_liked_songs_refreshes_cookies_and_retries_once(
+    extractions: list[tuple[str, Path]], auth_file: Path, first_failure: Exception
+) -> None:
+    fake = _SequenceYTMusic([first_failure, {"tracks": [{"videoId": "v1"}]}])
+    refreshed: list[str] = []
+    client = _refresh_client(fake, auth_file, on_refresh=refreshed.append)
+
+    assert client.fetch_liked_songs() == [{"videoId": "v1"}]
+    assert extractions == [("chrome", auth_file)]
+    assert refreshed == ["chrome"]
+    assert fake.calls == 2
+    assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+
+
+def test_fetch_liked_songs_falls_back_to_account_name_without_handle(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic(
+        [_STALE, {"tracks": []}], account={"accountName": "Me", "channelHandle": None}
+    )
+    client = _RefreshClient(fake, auth_file, refresh_browser="chrome", refresh_account="Me")
+    assert client.fetch_liked_songs() == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"refresh_browser": "chrome"}, {"refresh_account": "@me"}],
+    ids=["neither", "no-account", "no-browser"],
+)
+def test_fetch_liked_songs_without_browser_and_account_does_not_refresh(
+    extractions: list[tuple[str, Path]], auth_file: Path, kwargs: dict[str, str]
+) -> None:
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}])
+    with pytest.raises(UnexpectedResponseError, match="auth file is stale"):
+        _RefreshClient(fake, auth_file, **kwargs).fetch_liked_songs()
+    assert extractions == []
+    assert fake.calls == 1
+
+
+def test_fetch_liked_songs_missing_auth_file_is_not_refreshed(
+    extractions: list[tuple[str, Path]],
+) -> None:
+    client = YTMusicClient(
+        browser_path=Path("/nope/browser.json"), refresh_browser="chrome", refresh_account="@me"
+    )
+    with pytest.raises(AuthFileMissingError):
+        client.fetch_liked_songs()
+    assert extractions == []
+
+
+def test_fetch_liked_songs_transport_error_is_not_refreshed(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """New cookies don't fix a dropped connection."""
+    fake = _SequenceYTMusic([ConnectionError("network down"), {"tracks": []}])
+    with pytest.raises(UnexpectedResponseError, match="network down"):
+        _refresh_client(fake, auth_file).fetch_liked_songs()
+    assert extractions == []
+
+
+def test_fetch_liked_songs_reshaped_response_is_not_refreshed(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """A well-read payload of the wrong shape is a ytmusicapi change, not stale
+    cookies: re-extracting wouldn't help."""
+    fake = _SequenceYTMusic([{"no_tracks": []}, {"tracks": []}])
+    with pytest.raises(UnexpectedResponseError, match="missing 'tracks'"):
+        _refresh_client(fake, auth_file).fetch_liked_songs()
+    assert extractions == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode")
+def test_fetch_liked_songs_other_account_restores_old_cookies(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """The browser is now signed in to someone else: every later read would
+    describe that account's likes, so its cookies must not stay."""
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}], account={"channelHandle": "@other"})
+    refreshed: list[str] = []
+    client = _refresh_client(fake, auth_file, on_refresh=refreshed.append)
+
+    with pytest.raises(UnexpectedResponseError) as exc_info:
+        client.fetch_liked_songs()
+    message = str(exc_info.value)
+    assert "auth file is stale" in message
+    assert "chrome is now signed in to @other, not @me" in message
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert auth_file.stat().st_mode & 0o777 == 0o600
+    assert refreshed == []
+    assert fake.calls == 1
+
+
+def test_fetch_liked_songs_unreadable_account_restores_old_cookies(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=KeyError("accountName"))
+    with pytest.raises(UnexpectedResponseError, match="couldn't confirm the signed-in"):
+        _refresh_client(fake, auth_file).fetch_liked_songs()
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert fake.calls == 1
+
+
+@pytest.mark.parametrize(
+    "refresh_error",
+    [
+        CookieExtractionError("Missing `__Secure-3PAPISID` cookie"),
+        # Anything from the extraction boundary must arrive as a read error,
+        # the one type the sync dispatcher's LM check handles.
+        PermissionError("Permission denied: 'browser.json'"),
+        RuntimeError("keychain locked"),
+        AttributeError("module 'browser_cookie3' has no attribute 'chrome'"),
+    ],
+)
+def test_fetch_liked_songs_refresh_failure_raises_read_error(
+    monkeypatch: pytest.MonkeyPatch, auth_file: Path, refresh_error: Exception
+) -> None:
+    def fail(browser: str, target: Path) -> None:
+        raise refresh_error
+
+    monkeypatch.setattr("likesurgeon.ytmusic_client.write_browser_json_from_browser", fail)
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}])
+    refreshed: list[str] = []
+    client = _refresh_client(fake, auth_file, on_refresh=refreshed.append)
+
+    with pytest.raises(UnexpectedResponseError) as exc_info:
+        client.fetch_liked_songs()
+    message = str(exc_info.value)
+    assert "auth file is stale" in message
+    assert "Refreshing cookies from chrome failed" in message
+    assert str(refresh_error) in message
+    assert isinstance(exc_info.value.__cause__, UnexpectedResponseError)
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert refreshed == []
+    assert fake.calls == 1
+
+
+def test_fetch_liked_songs_retry_failure_raises_after_one_refresh(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    retry_failure = YTMusicServerError("Server returned HTTP 401: Unauthorized.")
+    fake = _SequenceYTMusic([_STALE, retry_failure, {"tracks": []}])
+    client = _refresh_client(fake, auth_file)
+
+    with pytest.raises(UnexpectedResponseError, match="HTTP 401") as exc_info:
+        client.fetch_liked_songs()
+    assert "Retried once after refreshing cookies from chrome" in str(exc_info.value)
+    assert exc_info.value.__cause__.__cause__ is retry_failure
+    assert len(extractions) == 1
+    assert fake.calls == 2
+
+
+def test_fetch_liked_songs_retry_build_failure_is_a_read_error(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """An unusable rewritten auth file fails the read with the retry note."""
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}])
+    client = _refresh_client(fake, auth_file)
+    builds = iter([fake, fake])  # first read, account check; the retry build fails
+
+    def build() -> Any:
+        try:
+            return next(builds)
+        except StopIteration:
+            raise AuthFileMissingError("browser.json is unusable") from None
+
+    client._build = build  # type: ignore[method-assign]
+    with pytest.raises(UnexpectedResponseError, match="unusable.*Retried once"):
+        client.fetch_liked_songs()
+
+
+def test_fetch_liked_songs_failing_on_refresh_fails_the_read(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """Not swallowed: a read error makes the dispatcher restore and stop."""
+
+    def boom(browser: str) -> None:
+        raise OSError("stderr closed")
+
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}])
+    with pytest.raises(UnexpectedResponseError, match="stderr closed.*Retried once"):
+        _refresh_client(fake, auth_file, on_refresh=boom).fetch_liked_songs()
 
 
 class _StubCookie:
@@ -432,3 +703,140 @@ def test_write_browser_json_from_browser_rewrite_strips_old_mode(
     assert mode == 0o600
     headers = json_lib.loads(target.read_text(encoding="utf-8"))
     assert "__Secure-3PAPISID=fresh" in headers["Cookie"]
+
+
+def _page(*sections: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "contents": {
+            "singleColumnBrowseResultsRenderer": {
+                "tabs": [
+                    {"tabRenderer": {"content": {"sectionListRenderer": {"contents": [*sections]}}}}
+                ]
+            }
+        }
+    }
+
+
+def _songs_shelf(video_ids: list[str], browse_id: str | None) -> dict[str, Any]:
+    title: dict[str, Any] = {"runs": [{"text": "Songs"}]}
+    if browse_id is not None:
+        title["runs"][0]["navigationEndpoint"] = {"browseEndpoint": {"browseId": browse_id}}
+    return {
+        "musicShelfRenderer": {
+            "title": title,
+            "contents": [
+                {"musicResponsiveListItemRenderer": {"playlistItemData": {"videoId": v}}}
+                for v in video_ids
+            ],
+        }
+    }
+
+
+_PROMO_CAROUSEL = {"musicCarouselShelfRenderer": {"contents": []}}
+
+
+def test_parse_artist_page_reads_top_ids_and_show_all_id() -> None:
+    page = _page(_songs_shelf(["t1", "t2"], "VLOLAK-fictional"))
+    assert parse_artist_page(page) == (["t1", "t2"], "VLOLAK-fictional")
+
+
+def test_parse_artist_page_skips_headerless_carousel_before_songs_shelf() -> None:
+    page = _page(_PROMO_CAROUSEL, _songs_shelf(["t1"], "VLOLAK-fictional"))
+    assert parse_artist_page(page) == (["t1"], "VLOLAK-fictional")
+
+
+def test_parse_artist_page_plain_channel_has_no_songs_list() -> None:
+    page = _page({"musicCarouselShelfRenderer": {"header": {}}}, _PROMO_CAROUSEL)
+    page["header"] = {"musicVisualHeaderRenderer": {}}
+    assert parse_artist_page(page) is None
+
+
+def test_parse_artist_page_shelf_without_show_all_endpoint() -> None:
+    assert parse_artist_page(_page(_songs_shelf(["t1"], None))) == (["t1"], None)
+
+
+def test_parse_artist_page_without_tabs_path_raises() -> None:
+    with pytest.raises(UnexpectedResponseError, match="artist page"):
+        parse_artist_page({"responseContext": {}})
+
+
+class _ArtistClient(YTMusicClient):
+    def __init__(self, pages: dict[str, Any]) -> None:
+        super().__init__(browser_path=None)
+        self._pages = pages
+        self.builds = 0
+        self.fake: _FakeYTMusic | None = None
+
+    def _build(self) -> Any:
+        self.builds += 1
+        self.fake = _FakeYTMusic(self._pages)
+        return self.fake
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    calls: list[float] = []
+    monkeypatch.setattr("likesurgeon.ytmusic_client.time.sleep", calls.append)
+    return calls
+
+
+def test_fetch_artist_songs_reads_each_artist_with_one_build(sleeps: list[float]) -> None:
+    client = _ArtistClient(
+        {
+            "UC1": _page(_songs_shelf(["t1"], "VLOLAK1")),
+            "UC2": _page(_songs_shelf(["t2"], "VLOLAK2")),
+        }
+    )
+    progress: list[tuple[int, int]] = []
+    results, errors = client.fetch_artist_songs(
+        ["UC1", "UC2"], on_progress=lambda d, t: progress.append((d, t))
+    )
+    assert errors == {}
+    assert client.builds == 1
+    assert results["UC1"] == ArtistSongs(("t1",), ({"videoId": "VLOLAK1-song"},))
+    assert results["UC2"] == ArtistSongs(("t2",), ({"videoId": "VLOLAK2-song"},))
+    assert client.fake is not None
+    assert client.fake.playlist_calls == [("VLOLAK1", None), ("VLOLAK2", None)]
+    assert progress == [(1, 2), (2, 2)]
+    assert sleeps == [0.2]
+
+
+def test_fetch_artist_songs_without_show_all_link_skips_playlist(sleeps: list[float]) -> None:
+    client = _ArtistClient({"UC1": _page(_songs_shelf(["t1"], None))})
+    results, errors = client.fetch_artist_songs(["UC1"])
+    assert errors == {}
+    assert results["UC1"] == ArtistSongs(("t1",), ())
+    assert client.fake is not None
+    assert client.fake.playlist_calls == []
+
+
+def test_fetch_artist_songs_plain_channel_is_none(sleeps: list[float]) -> None:
+    client = _ArtistClient({"UC1": _page(_PROMO_CAROUSEL)})
+    results, errors = client.fetch_artist_songs(["UC1"])
+    assert results == {"UC1": None}
+    assert errors == {}
+
+
+def test_fetch_artist_songs_one_failing_artist_does_not_stop_the_rest(
+    sleeps: list[float],
+) -> None:
+    client = _ArtistClient(
+        {
+            "UC1": KeyError("boom"),
+            "UC2": YTMusicServerError("Server returned HTTP 500"),
+            "UC3": {"no": "tabs"},
+            "UC4": _page(_songs_shelf(["t4"], None)),
+        }
+    )
+    results, errors = client.fetch_artist_songs(["UC1", "UC2", "UC3", "UC4"])
+    assert set(errors) == {"UC1", "UC2", "UC3"}
+    assert "KeyError" in errors["UC1"]
+    assert "HTTP 500" in errors["UC2"]
+    assert results["UC4"] == ArtistSongs(("t4",), ())
+    assert "UC1" not in results
+
+
+def test_fetch_artist_songs_missing_auth_raises() -> None:
+    client = YTMusicClient(browser_path=Path("/nope/browser.json"))
+    with pytest.raises(AuthFileMissingError):
+        client.fetch_artist_songs(["UC1"])

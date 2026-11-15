@@ -1,13 +1,13 @@
 """Typer CLI for likesurgeon.
 
 Every command only reads the providers and writes the local DB, except
-``sync``, which writes likes on YouTube.
+``sync`` and ``canonicalize --apply``, which write likes on YouTube.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -16,10 +16,23 @@ from rich.table import Table
 from sqlalchemy.orm import sessionmaker
 
 from . import __version__
-from .config import Config, InvalidFuzzyThresholdError, InvalidRegionError, _validate_region
+from .config import (
+    CONFIG_FILENAME,
+    YTMUSIC_ACCOUNT_KEY,
+    YTMUSIC_BROWSER_KEY,
+    Config,
+    InvalidFuzzyThresholdError,
+    InvalidRegionError,
+    _validate_region,
+    update_config,
+)
 from .db import init_db, make_engine, make_session_factory, session_scope
 from .diagnosis import (
     ALIGNMENT_ISSUE_TYPES,
+    CANONICAL_ISSUE_TYPES,
+    DIAGNOSIS_KIND_CANONICALIZE,
+    ISSUE_CANONICAL_AMBIGUOUS,
+    ISSUE_CANONICAL_VERSION,
     diagnosis_items,
     latest_diagnosis,
 )
@@ -99,6 +112,20 @@ def _bootstrap() -> tuple[Config, sessionmaker]:
     engine = make_engine(cfg.db_path)
     init_db(engine)
     return cfg, make_session_factory(engine)
+
+
+def _ytmusic_client(cfg: Config) -> YTMusicClient:
+    """A client that re-extracts stale cookies once from the browser ``auth
+    ytmusic --from-browser`` recorded (if still signed in to the recorded
+    account), saying so on stderr (stdout may be JSON)."""
+    return YTMusicClient(
+        browser_path=cfg.ytmusic_browser_path,
+        refresh_browser=cfg.ytmusic_browser,
+        refresh_account=cfg.ytmusic_account,
+        on_refresh=lambda browser: err_console.print(
+            f"[dim]YT Music cookies refreshed from {browser}.[/dim]"
+        ),
+    )
 
 
 def _fail(msg: str, code: int = 1) -> NoReturn:
@@ -190,6 +217,47 @@ def auth_ytmusic(
             write_browser_json_from_browser(normalized, target)
         except CookieExtractionError as e:
             _fail(str(e), code=2)
+        # A refresh keeps new cookies only for this account (another one would
+        # make every later LM read describe the wrong likes), so no account, no refresh.
+        account: str | None = None
+        try:
+            account = YTMusicClient(browser_path=target).account_identity()
+        except (AuthFileMissingError, UnexpectedResponseError) as e:
+            err_console.print(
+                f"[yellow]Couldn't read the signed-in YT Music account[/yellow] "
+                f"({escape(str(e))}); stale cookies won't be refreshed automatically."
+            )
+        try:
+            update_config(
+                cfg.app_dir,
+                {
+                    YTMUSIC_BROWSER_KEY: normalized if account else None,
+                    YTMUSIC_ACCOUNT_KEY: account,
+                },
+            )
+        except (OSError, ValueError) as e:
+            recorded = (normalized if account else None, account)
+            armed = cfg.ytmusic_browser and cfg.ytmusic_account
+            if armed and recorded != (cfg.ytmusic_browser, cfg.ytmusic_account):
+                # The old pair would later "refresh" these cookies back to the
+                # previously recorded browser/account, so don't leave it armed.
+                _fail(
+                    f"Couldn't update {escape(str(cfg.app_dir / CONFIG_FILENAME))} "
+                    f"({escape(str(e))}); it still names {escape(cfg.ytmusic_browser)} for "
+                    f"{escape(str(cfg.ytmusic_account))}. Fix the file or remove the "
+                    f"{YTMUSIC_BROWSER_KEY} / {YTMUSIC_ACCOUNT_KEY} keys, then re-run auth."
+                )
+            if cfg.ytmusic_browser and cfg.ytmusic_account:
+                kept = (
+                    f"cookies are still refreshed from {cfg.ytmusic_browser} "
+                    f"for {cfg.ytmusic_account}, as recorded before"
+                )
+            else:
+                kept = "stale cookies won't be refreshed automatically"
+            err_console.print(
+                f"[yellow]Couldn't update {escape(str(cfg.app_dir / CONFIG_FILENAME))}[/yellow] "
+                f"({escape(str(e))}); {escape(kept)}."
+            )
         console.print(
             f"[green]✓[/green] browser.json written to [cyan]{target}[/cyan].\n"
             "[dim]Verify with: [/dim]"
@@ -197,6 +265,16 @@ def auth_ytmusic(
         )
         return
 
+    # A pasted browser.json isn't from the recorded browser; refreshing from it
+    # would replace the paste.
+    try:
+        update_config(cfg.app_dir, {YTMUSIC_BROWSER_KEY: None, YTMUSIC_ACCOUNT_KEY: None})
+    except (OSError, ValueError) as e:
+        _fail(
+            f"Couldn't clear the recorded browser in "
+            f"{escape(str(cfg.app_dir / CONFIG_FILENAME))} ({escape(str(e))}), so a cookie "
+            "refresh could overwrite a pasted browser.json. Fix the file and re-run."
+        )
     console.print("[bold]YouTube Music browser-header setup[/bold]")
     console.print(
         "Tip: skip the manual paste with "
@@ -258,11 +336,11 @@ def auth_youtube() -> None:
 def scan_ytmusic() -> None:
     """Fetch every YouTube Music liked song and store a snapshot."""
     cfg, factory = _bootstrap()
-    client = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
+    client = _ytmusic_client(cfg)
     try:
         items = client.fetch_liked_songs()
     except (AuthFileMissingError, UnexpectedResponseError) as e:
-        _fail(str(e), code=2)
+        _fail(escape(str(e)), code=2)
 
     with session_scope(factory) as session:
         snap = create_snapshot(session, "ytmusic_liked_songs", items)
@@ -543,13 +621,69 @@ def compare_likes_cmd() -> None:
     console.print("Run [cyan]likesurgeon issues[/cyan] for the full per-item breakdown.")
 
 
+def _finding_rows(session, items) -> list[dict[str, Any]]:
+    """Findings as JSON-ready dicts, with each track's video id next to its id."""
+    # Bulk-fetch the Tracks referenced by the items so we can surface video_id
+    # alongside the internal track_id PKs.
+    track_ids: set[int] = {
+        tid for it in items for tid in (it.source_track_id, it.related_track_id) if tid is not None
+    }
+    video_id_by_track = _video_ids_for_tracks(session, track_ids)
+
+    def _vid(track_id: int | None) -> str | None:
+        if track_id is None:
+            return None
+        return video_id_by_track.get(track_id)
+
+    return [
+        {
+            "id": it.id,
+            "issue_type": it.issue_type,
+            "confidence": it.confidence,
+            "reason": it.reason,
+            "source_track_id": it.source_track_id,
+            "source_video_id": _vid(it.source_track_id),
+            "related_track_id": it.related_track_id,
+            "related_video_id": _vid(it.related_track_id),
+            "status": it.status,
+        }
+        for it in items
+    ]
+
+
+def _findings_table(title: str, rows: list[dict[str, Any]]) -> Table:
+    table = Table(title=title)
+    table.add_column("ID", justify="right")
+    table.add_column("Type")
+    table.add_column("Conf", justify="right")
+    table.add_column("Source VID")
+    table.add_column("Related VID")
+    table.add_column("Status")
+    table.add_column("Reason")
+    for row in rows:
+        table.add_row(
+            str(row["id"]),
+            row["issue_type"],
+            f"{row['confidence']:.2f}",
+            row["source_video_id"] or "",
+            row["related_video_id"] or "",
+            row["status"],
+            escape(row["reason"]),  # holds titles and albums: user data, not markup
+        )
+    return table
+
+
 @app.command()
 def issues(
     type: Annotated[
         str | None,
         typer.Option(
             "--type",
-            help=f"Filter findings by issue type. One of: {' | '.join(ALIGNMENT_ISSUE_TYPES)}.",
+            help=(
+                "Filter findings by issue type. One of: "
+                f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; or, from the latest canonicalize "
+                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}."
+            ),
         ),
     ] = None,
     min_confidence: Annotated[
@@ -564,22 +698,25 @@ def issues(
         typer.Option("--format", "-f", help="Output format: 'table' (default) or 'json'."),
     ] = "table",
 ) -> None:
-    """List issues from the latest diagnosis."""
+    """List issues from the latest diagnosis (or canonicalize report, for its types)."""
     import json as jsonlib
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
-    if type is not None and type not in ALIGNMENT_ISSUE_TYPES:
-        _fail(f"Unknown issue type: {type!r}. One of: {', '.join(ALIGNMENT_ISSUE_TYPES)}.", code=2)
+    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES
+    if type is not None and type not in known:
+        _fail(f"Unknown issue type: {type!r}. One of: {', '.join(known)}.", code=2)
+    canonical = type in CANONICAL_ISSUE_TYPES
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        diag = latest_diagnosis(session)
+        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE if canonical else None)
         if diag is None:
+            command = "canonicalize" if canonical else "compare-likes"
+            what = "canonicalize report" if canonical else "diagnosis"
             console.print(
-                "[yellow]No diagnosis yet.[/yellow] "
-                "Run [cyan]likesurgeon compare-likes[/cyan] first."
+                f"[yellow]No {what} yet.[/yellow] Run [cyan]likesurgeon {command}[/cyan] first."
             )
             return
         items = diagnosis_items(session, diag.id)
@@ -587,91 +724,363 @@ def issues(
         if type is not None:
             items = [it for it in items if it.issue_type == type]
         items = [it for it in items if it.confidence >= min_confidence]
-
-        # Bulk-fetch the Tracks referenced by the filtered items so we
-        # can surface video_id alongside the internal track_id PKs.
-        # Done before leaving the session so the lookup can use the
-        # same connection.
-        track_ids: set[int] = {
-            tid
-            for it in items
-            for tid in (it.source_track_id, it.related_track_id)
-            if tid is not None
-        }
-        video_id_by_track = _video_ids_for_tracks(session, track_ids)
-
-    def _vid(track_id: int | None) -> str | None:
-        if track_id is None:
-            return None
-        return video_id_by_track.get(track_id)
+        rows = _finding_rows(session, items)
 
     if fmt == "json":
+        payload = {"diagnosis_id": diag.id, "items": rows}
+        print(jsonlib.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if not rows:
+        console.print("[dim]No issues match the filter.[/dim]")
+        return
+    report = "Canonicalize report" if canonical else "Diagnosis"
+    console.print(_findings_table(f"{report} #{diag.id} — issues ({len(rows)})", rows))
+
+
+@app.command("canonicalize")
+def canonicalize_cmd(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print the report as one JSON document on stdout (progress goes to stderr).",
+        ),
+    ] = False,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help=(
+                "Instead of a new report, move each open write-eligible canonical_version "
+                "of the latest report to its listed version on YouTube, oldest first."
+            ),
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", min=0, help="With --apply: act on at most the N oldest findings."),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="With --apply: skip the interactive confirmation prompt."),
+    ] = False,
+    include_flagged: Annotated[
+        bool,
+        typer.Option(
+            "--include-flagged",
+            help=(
+                "With --apply: also act on canonical_version findings that are report-only "
+                "only because A's album has a version keyword (Live, Remix, ...). Off by "
+                "default — the album may hold a different recording; keep individual findings "
+                "out with `likesurgeon skip`."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Find liked songs whose artists' song lists hold another version of the same track.
+
+    Reads YT Music Liked songs and each liked song's artist pages, and saves one
+    finding per liked track that none of its artists' song lists has: a
+    canonical_version when exactly one same-title, same-length track there
+    does, a report-only canonical_ambiguous when two or more do. Nothing is
+    written to YouTube, except by --apply.
+    """
+    import json as jsonlib
+    from dataclasses import asdict
+
+    from .canonicalize import artist_ids, artist_name, find_candidates, persist_report
+
+    if apply and json_output:
+        _fail("--json can't be combined with --apply.", code=2)
+    if not apply and (limit is not None or yes or include_flagged):
+        _fail("--limit, --yes and --include-flagged only apply with --apply.", code=2)
+    if apply:
+        _canonicalize_apply(limit=limit, yes=yes, include_flagged=include_flagged)
+        return
+
+    cfg, factory = _bootstrap()
+    out = err_console if json_output else console
+    client = _ytmusic_client(cfg)
+    try:
+        liked = client.fetch_liked_songs()
+    except (AuthFileMissingError, UnexpectedResponseError) as e:
+        _fail(escape(str(e)), code=2)
+    # Committed before any artist page is read, so the snapshot's time is when
+    # Liked songs was observed: a write during the slow artist reads still
+    # counts as newer than this scan (spec §4.3).
+    with session_scope(factory) as session:
+        snapshot_id = create_snapshot(session, "ytmusic_liked_songs", liked).id
+    out.print(
+        f"[green]✓[/green] Liked songs snapshot [bold]#{snapshot_id}[/bold] stored "
+        f"({len(liked)} tracks)."
+    )
+
+    ids = artist_ids(liked)
+
+    def _progress(done: int, total: int) -> None:
+        # Overwrite in place on a terminal; a log or pipe gets only the last line.
+        if err_console.is_terminal:
+            end = "\r" if done < total else "\n"
+        elif done == total:
+            end = "\n"
+        else:
+            return
+        err_console.print(f"Reading artist pages: {done}/{total}", end=end, highlight=False)
+
+    try:
+        artists, artist_errors = client.fetch_artist_songs(ids, on_progress=_progress)
+    except AuthFileMissingError as e:
+        _fail(escape(str(e)), code=2)
+    candidates, summary = find_candidates(liked, artists)
+    with session_scope(factory) as session:
+        diag, carried = persist_report(session, snapshot_id, candidates)
+        diag_id = diag.id
+        rows = _finding_rows(session, diagnosis_items(session, diag.id))
+
+    for artist_id, message in artist_errors.items():
+        out.print(
+            f"[yellow]⚠[/yellow] artist {escape(artist_name(artist_id, *liked))} "
+            f"({artist_id}) couldn't be read ({escape(message)}); its songs get no finding."
+        )
+    if carried:
+        out.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
+    if json_output:
         payload = {
-            "diagnosis_id": diag.id,
-            "items": [
-                {
-                    "id": it.id,
-                    "issue_type": it.issue_type,
-                    "confidence": it.confidence,
-                    "reason": it.reason,
-                    "source_track_id": it.source_track_id,
-                    "source_video_id": _vid(it.source_track_id),
-                    "related_track_id": it.related_track_id,
-                    "related_video_id": _vid(it.related_track_id),
-                    "status": it.status,
-                }
-                for it in items
-            ],
+            "diagnosis_id": diag_id,
+            "summary": asdict(summary),
+            "artist_errors": artist_errors,
+            "items": rows,
         }
         print(jsonlib.dumps(payload, indent=2, ensure_ascii=False))
         return
 
-    table = Table(title=f"Diagnosis #{diag.id} — issues ({len(items)})")
-    table.add_column("ID", justify="right")
-    table.add_column("Type")
-    table.add_column("Conf", justify="right")
-    table.add_column("Source VID")
-    table.add_column("Related VID")
-    table.add_column("Status")
-    table.add_column("Reason")
-    for it in items:
-        table.add_row(
-            str(it.id),
-            it.issue_type,
-            f"{it.confidence:.2f}",
-            _vid(it.source_track_id) or "",
-            _vid(it.related_track_id) or "",
-            it.status,
-            it.reason,
-        )
-    if not items:
-        console.print("[dim]No issues match the filter.[/dim]")
-        return
+    console.print(f"[green]✓[/green] Canonicalize report [bold]#{diag_id}[/bold] saved.")
+    # What `--apply` would act on: carried-over skips don't count.
+    eligible = sum(
+        r["issue_type"] == ISSUE_CANONICAL_VERSION
+        and r["confidence"] == 1.0
+        and r["status"] == "open"
+        for r in rows
+    )
+    # The first row counts every liked video; the rest only liked audio tracks
+    # (ATV) with an artist id and a length, so they don't add up to it.
+    table = Table(title="canonicalize summary")
+    table.add_column("Bucket")
+    table.add_column("Count", justify="right")
+    table.add_row("Liked songs (distinct videos)", str(summary.songs))
+    table.add_row("Artist pages read / total", f"{len(ids) - len(artist_errors)} / {len(ids)}")
+    table.add_row("Audio tracks already listed by their artist", str(summary.listed))
+    table.add_row("Audio tracks with an unreadable artist (no finding)", str(summary.unreadable))
+    table.add_row(
+        f"{ISSUE_CANONICAL_VERSION} (open write-eligible / total)",
+        f"{eligible} / {summary.candidates}",
+    )
+    table.add_row(ISSUE_CANONICAL_AMBIGUOUS, str(summary.ambiguous))
     console.print(table)
+    if not rows:
+        console.print("[dim]No findings.[/dim]")
+        return
+    console.print(_findings_table(f"Canonicalize report #{diag_id} — findings ({len(rows)})", rows))
+    console.print(
+        "Review them, keep any out with [cyan]likesurgeon skip <id>[/cyan], then run "
+        "[cyan]likesurgeon canonicalize --apply[/cyan]."
+    )
+
+
+def _canonicalize_apply(*, limit: int | None, yes: bool, include_flagged: bool) -> None:
+    """``canonicalize --apply``: act on the latest report, behind the same gates
+    as ``sync`` (spec §6). It doesn't refuse after earlier writes: each finding
+    is about one song, and every action re-checks live state first."""
+    from . import canonicalize
+
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE)
+        if diag is None:
+            console.print(
+                "[yellow]No canonicalize report yet.[/yellow] "
+                "Run [cyan]likesurgeon canonicalize[/cyan] first."
+            )
+            raise typer.Exit(1)
+        items = diagnosis_items(session, diag.id)
+        # The forecast (repoint or merge) and the order come from the Liked
+        # songs read the report was built on.
+        lm = get_snapshot_items(session, diag.ytmusic_snapshot_id)
+        flagged = canonicalize.flagged_keywords(lm) if include_flagged else {}
+        actions = canonicalize.plan(
+            items,
+            resolve_video_ids(session, items),
+            lm_position={it.track_id: it.position for it in lm},
+            liked_video_ids={it.video_id for it in lm if it.video_id},
+            flagged=flagged,
+        )
+        if limit is not None and limit < len(actions):
+            console.print(
+                f"[yellow]--limit {limit}: applying the {limit} oldest of "
+                f"{len(actions)} actions.[/yellow]"
+            )
+            actions = actions[:limit]
+        if actions:
+            source_track = {it.id: it.source_track_id for it in items}
+            title = {it.track_id: it.track.title for it in lm}
+            # A full-confidence finding's album has no keyword (it would be
+            # report-only), so only actions --include-flagged added get one.
+            keyword = {a.item_id: flagged.get(source_track[a.item_id]) for a in actions}
+            show_flagged = any(keyword.values())
+            table = Table(title=f"Canonicalize report #{diag.id} — plan, oldest first")
+            for column in ("ID", "Action", "A", "B", "Title"):
+                table.add_column(column, justify="right" if column == "ID" else "left")
+            if show_flagged:
+                table.add_column("Flagged")
+            for a in actions:
+                row = [
+                    str(a.item_id),
+                    a.kind,
+                    a.a_video_id,
+                    a.b_video_id,
+                    escape(title.get(source_track[a.item_id], "")),
+                ]
+                if show_flagged:
+                    kw = keyword[a.item_id]
+                    row.append(f"'{kw}' in album" if kw else "")
+                table.add_row(*row)
+            console.print(table)
+        console.print(canonicalize.summarize(actions))
+        _warn_stranded(session)
+        if not actions:
+            console.print("Nothing to apply.")
+            return
+
+        if not yes and not typer.confirm("Proceed?", default=False):
+            raise typer.Abort()
+
+        # Function-local so tests can swap the class on the youtube_client module.
+        from .youtube_client import YouTubeClient
+
+        yt = YouTubeClient(
+            client_secrets_path=cfg.youtube_oauth_client_path,
+            token_path=cfg.youtube_token_path,
+        )
+        if not yt.has_write_scope():
+            console.print(
+                "[yellow]YouTube write scope not granted.[/yellow] "
+                "Run [cyan]likesurgeon auth youtube[/cyan] to re-grant it."
+            )
+            raise typer.Exit(1)
+
+        ytm = _ytmusic_client(cfg)
+        # Every action is checked against Liked songs read before and after it;
+        # browser cookies go stale fast, so fail here (after the one automatic
+        # refresh) rather than mid-run.
+        try:
+            ytm.fetch_liked_songs(limit=1)
+        except (AuthFileMissingError, UnexpectedResponseError) as e:
+            console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {escape(str(e))}")
+            raise typer.Exit(1) from e
+        result = execute(session, actions, [], ytm=ytm, yt=yt)
+
+    console.print(
+        f"[bold]Canonicalize result:[/bold] "
+        f"applied=[green]{result.applied}[/green] "
+        f"failed=[red]{result.failed}[/red] "
+        f"skipped=[yellow]{result.skipped}[/yellow] "
+        f"restored=[yellow]{result.restored}[/yellow]"
+    )
+    if result.restored:
+        console.print(
+            f"[yellow]{result.restored} action(s) were undone:[/yellow] the unlike didn't "
+            "take or YT Music liked songs didn't change as expected, so the YouTube like was "
+            "restored and the finding marked 'skipped'. See "
+            f"[cyan]likesurgeon issues --type {ISSUE_CANONICAL_VERSION}[/cyan]."
+        )
+    if result.quota_exhausted:
+        console.print(
+            f"[red]YouTube daily quota exhausted — stopped early; {result.unattempted} "
+            "action(s) not attempted.[/red] After it resets (midnight Pacific), run "
+            "[cyan]canonicalize --apply[/cyan] again."
+        )
+    if result.aborted:
+        console.print(
+            f"[red]Stopped early: {escape(result.aborted)}; {result.unattempted} action(s) "
+            "not attempted.[/red]"
+        )
+    _print_left_behind(result)
+    console.print(
+        "Before the next [cyan]sync[/cyan], re-scan both sources ([cyan]scan youtube-likes[/cyan] "
+        "and [cyan]scan ytmusic[/cyan]) and re-run [cyan]compare-likes[/cyan]: sync refuses a "
+        "diagnosis older than these writes."
+    )
+    if result.failed or result.aborted:
+        raise typer.Exit(1)
+
+
+def _warn_stranded(session) -> None:
+    """Name the videos an earlier `sync` or `canonicalize --apply` may have left liked nowhere."""
+    if stranded := sorted(stranded_unliked_video_ids(session)):
+        console.print(
+            f"[bold red]{len(stranded)} video(s) an earlier run unliked on YouTube "
+            "without confirming the result:[/bold red] "
+            f"{', '.join(stranded)}. For each, check whether the song is still in your "
+            "YT Music Liked songs; if it isn't, re-like that original YouTube video by hand."
+        )
+
+
+def _print_left_behind(result) -> None:
+    """The videos a write run couldn't put back: unliked (A) or liked (B)."""
+    if result.left_unliked:
+        console.print(
+            "[bold red]These videos were unliked on YouTube and re-liking them failed, so "
+            "they may be liked nowhere right now:[/bold red] "
+            + ", ".join(result.left_unliked)
+            + "\nRe-like them on YouTube by hand."
+        )
+    if result.left_liked:
+        console.print(
+            "[bold red]A re-point liked these videos on YouTube, and undoing that like failed "
+            "or couldn't be confirmed, so they may still be liked:[/bold red] "
+            + ", ".join(result.left_liked)
+            + "\nNo song is lost, but unlike them on YouTube by hand if you don't want them."
+        )
 
 
 def _set_findings_status(item_ids: list[int], *, to: str) -> None:
-    """Flip findings of the latest diagnosis between 'open' and 'skipped'.
+    """Flip findings between 'open' and 'skipped'.
 
-    All-or-nothing: every id is validated first, so a typo changes nothing.
-    'skipped' carries over to later diagnoses (``carry_over_skipped``), so
-    this is the durable way to keep ``sync`` off a finding.
+    Ids must belong to the latest alignment diagnosis or the latest
+    canonicalize report. All-or-nothing: every id is validated first, so a
+    typo changes nothing. 'skipped' carries over to later diagnoses
+    (``carry_over_skipped``), so this is the durable way to keep ``sync`` or
+    ``canonicalize --apply`` off a finding.
     """
     from .models import DiagnosisItem
 
     source = "open" if to == "skipped" else "skipped"
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        diag = latest_diagnosis(session)
-        if diag is None:
-            _fail("No diagnosis yet. Run `likesurgeon compare-likes` first.", code=1)
+        latest = {
+            label: diag
+            for label, kind in (
+                ("compare-likes", None),
+                ("canonicalize", DIAGNOSIS_KIND_CANONICALIZE),
+            )
+            if (diag := latest_diagnosis(session, kind=kind)) is not None
+        }
+        if not latest:
+            _fail(
+                "No diagnosis yet. Run `likesurgeon compare-likes` or "
+                "`likesurgeon canonicalize` first.",
+                code=1,
+            )
+        latest_ids = {diag.id for diag in latest.values()}
+        named = " or ".join(f"#{diag.id} ({label})" for label, diag in latest.items())
         errors: list[str] = []
         targets: list[DiagnosisItem] = []
         for item_id in item_ids:
             it = session.get(DiagnosisItem, item_id)
-            if it is None or it.diagnosis_id != diag.id:
+            if it is None or it.diagnosis_id not in latest_ids:
                 errors.append(
-                    f"#{item_id} is not a finding of the latest diagnosis #{diag.id} "
+                    f"#{item_id} is not a finding of the latest diagnosis {named} "
                     "(ids come from `likesurgeon issues`)"
                 )
             elif it.status not in (source, to):
@@ -685,23 +1094,25 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     console.print(f"[green]✓[/green] {len(targets)} finding(s) now '{to}'.")
 
 
+_FINDING_IDS_HELP = (
+    "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis or the "
+    "latest canonicalize report."
+)
+
+
 @app.command()
 def skip(
-    item_ids: Annotated[
-        list[int], typer.Argument(help="Finding ids from `likesurgeon issues` (latest diagnosis).")
-    ],
+    item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Keep `sync` off these findings, across future diagnoses too."""
+    """Keep `sync` or `canonicalize --apply` off these findings, across future runs too."""
     _set_findings_status(item_ids, to="skipped")
 
 
 @app.command()
 def unskip(
-    item_ids: Annotated[
-        list[int], typer.Argument(help="Finding ids from `likesurgeon issues` (latest diagnosis).")
-    ],
+    item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Re-open skipped findings so the next `sync` acts on them again."""
+    """Re-open skipped findings so the next `sync` or `canonicalize --apply` acts on them."""
     _set_findings_status(item_ids, to="open")
 
 
@@ -795,13 +1206,7 @@ def sync(
         console.print(summarize(actions, skips))
         for warning in diagnosis_staleness(session, diag, now=datetime.now(UTC)):
             console.print(f"[yellow]⚠ Stale diagnosis:[/yellow] {warning}")
-        if stranded := sorted(stranded_unliked_video_ids(session)):
-            console.print(
-                f"[bold red]{len(stranded)} video(s) an earlier sync unliked on YouTube "
-                "without confirming the result:[/bold red] "
-                f"{', '.join(stranded)}. For each, check whether the song is still in your "
-                "YT Music Liked songs; if it isn't, re-like that original YouTube video by hand."
-            )
+        _warn_stranded(session)
         if attempts := sync_attempts_since_older_scan(session, diag):
             console.print(
                 f"[bold red]Refusing to sync:[/bold red] {attempts} sync attempt(s) ran after "
@@ -832,15 +1237,15 @@ def sync(
             )
             raise typer.Exit(1)
 
-        ytm = YTMusicClient(browser_path=cfg.ytmusic_browser_path)
+        ytm = _ytmusic_client(cfg)
         if actions:
             # Every action is checked against YT Music liked songs read before
             # and after it; cookies from a browser go stale fast, so fail here
-            # rather than mid-run.
+            # (after the one automatic refresh) rather than mid-run.
             try:
                 ytm.fetch_liked_songs(limit=1)
             except (AuthFileMissingError, UnexpectedResponseError) as e:
-                console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {e}")
+                console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {escape(str(e))}")
                 raise typer.Exit(1) from e
         result = execute(session, actions, skips, ytm=ytm, yt=yt)
 
@@ -875,20 +1280,7 @@ def sync(
             f"[red]Stopped early: {escape(result.aborted)}; {result.unattempted} action(s) "
             "not attempted.[/red]"
         )
-    if result.left_unliked:
-        console.print(
-            "[bold red]These videos were unliked on YouTube and re-liking them failed, so "
-            "they may be liked nowhere right now:[/bold red] "
-            + ", ".join(result.left_unliked)
-            + "\nRe-like them on YouTube by hand."
-        )
-    if result.left_liked:
-        console.print(
-            "[bold red]A re-point liked these videos on YouTube, and undoing that like failed "
-            "or couldn't be confirmed, so they may still be liked:[/bold red] "
-            + ", ".join(result.left_liked)
-            + "\nNo song is lost, but unlike them on YouTube by hand if you don't want them."
-        )
+    _print_left_behind(result)
     if result.failed or result.aborted:
         raise typer.Exit(1)
 

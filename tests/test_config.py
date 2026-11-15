@@ -262,3 +262,92 @@ def test_config_load_raises_invalid_fuzzy_threshold_error(
     with pytest.raises(InvalidFuzzyThresholdError) as exc_info:
         Config.load()
     assert "150" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# ytmusic_browser / ytmusic_account — recorded by `auth ytmusic --from-browser`
+# ---------------------------------------------------------------------------
+
+
+def test_config_load_reads_ytmusic_refresh_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from likesurgeon.config import Config
+
+    monkeypatch.setenv("LIKE_SURGEON_HOME", str(tmp_path))
+    _write_config(tmp_path, {"ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    cfg = Config.load()
+    assert (cfg.ytmusic_browser, cfg.ytmusic_account) == ("chrome", "@me")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"ytmusic_browser": 3, "ytmusic_account": 3},
+        {"ytmusic_browser": "netscape", "ytmusic_account": ""},
+        "{bad",
+    ],
+)
+def test_config_load_ytmusic_refresh_keys_none_when_absent_or_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    from likesurgeon.config import Config
+
+    monkeypatch.setenv("LIKE_SURGEON_HOME", str(tmp_path))
+    if payload is not None:
+        _write_config(tmp_path, payload)
+    cfg = Config.load()
+    assert (cfg.ytmusic_browser, cfg.ytmusic_account) == (None, None)
+
+
+def test_update_config_keeps_other_keys(tmp_path: Path) -> None:
+    from likesurgeon.config import update_config
+
+    _write_config(tmp_path, {"region": "KR", "fuzzy_threshold": 80})
+    update_config(tmp_path, {"ytmusic_browser": "firefox", "ytmusic_account": "@설"})
+    raw = (tmp_path / "config.json").read_text(encoding="utf-8")
+    assert json.loads(raw) == {
+        "region": "KR",
+        "fuzzy_threshold": 80,
+        "ytmusic_browser": "firefox",
+        "ytmusic_account": "@설",
+    }
+    assert "@설" in raw  # written as text, not \u escapes
+
+
+def test_update_config_creates_config_when_missing(tmp_path: Path) -> None:
+    from likesurgeon.config import update_config
+
+    update_config(tmp_path, {"ytmusic_browser": "chrome"})
+    data = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert data == {"ytmusic_browser": "chrome"}
+
+
+def test_update_config_none_removes_only_those_keys(tmp_path: Path) -> None:
+    from likesurgeon.config import update_config
+
+    _write_config(tmp_path, {"region": "KR", "ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    update_config(tmp_path, {"ytmusic_browser": None, "ytmusic_account": None})
+    data = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert data == {"region": "KR"}
+
+
+def test_update_config_without_change_writes_nothing(tmp_path: Path) -> None:
+    from likesurgeon.config import update_config
+
+    update_config(tmp_path, {"ytmusic_browser": None})
+    assert not (tmp_path / "config.json").exists()
+
+
+@pytest.mark.parametrize("raw", ["{bad", "[1, 2]"])
+def test_update_config_refuses_to_overwrite_unreadable_config(tmp_path: Path, raw: str) -> None:
+    """A config.json that isn't a JSON object is left for the user to fix,
+    never replaced (that would drop their region)."""
+    from likesurgeon.config import update_config
+
+    _write_config(tmp_path, raw)
+    with pytest.raises(ValueError):
+        update_config(tmp_path, {"ytmusic_browser": "chrome"})
+    assert (tmp_path / "config.json").read_text(encoding="utf-8") == raw

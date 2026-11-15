@@ -25,9 +25,9 @@ def _yt(video_id: str) -> dict:
     }
 
 
-def _ytm_track(session: Session, video_id: str) -> Track:
+def _ytm_track(session: Session, video_id: str, *, source: str = "ytmusic_liked_songs") -> Track:
     t = Track(
-        source="ytmusic_liked_songs",
+        source=source,
         video_id=video_id,
         title="t",
         artists="[]",
@@ -219,6 +219,125 @@ def test_stranded_covers_relike_histories(session: Session) -> None:
     assert stranded_unliked_video_ids(session) == set(stranded)
 
 
+def test_stranded_covers_canonical_histories(session: Session) -> None:
+    """``canonical_unlike`` settles like the other unlikes; the canonical verify
+    and rollback rows don't (spec canonicalize §6.6)."""
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    stranded = {
+        "unlike_last": [("canonical_unlike", "applied")],
+        "unlike_verified_only": [
+            ("canonical_unlike", "applied"),
+            ("canonical_unlike_verify", "applied"),
+        ],
+        "restore_failed": [
+            ("canonical_unlike", "applied"),
+            ("lm_check", "failed"),
+            ("restore_like", "failed"),
+            ("canonical_rollback", "applied"),
+            ("canonical_rollback_verify", "applied"),
+        ],
+    }
+    fine = {
+        "quota_rejected": [("canonical_unlike", "failed", f"{QUOTA_REJECTED}: quotaExceeded")],
+        "settled": [
+            ("canonical_unlike", "applied"),
+            ("canonical_unlike_verify", "applied"),
+            ("lm_check", "applied"),
+        ],
+        "restored_rollback_failed": [
+            ("canonical_unlike", "applied"),
+            ("lm_check", "failed"),
+            ("restore_like", "applied"),
+            ("restore_verify", "applied"),
+            ("canonical_rollback", "failed"),
+            ("canonical_rollback_verify", "failed"),
+        ],
+    }
+    for vid, rows in {**stranded, **fine}.items():
+        track = _ytm_track(session, vid)
+        for kind, status, *reason in rows:
+            _relike_attempt(session, track, status, kind=kind, at=t, reason="".join(reason))
+
+    assert stranded_unliked_video_ids(session) == set(stranded)
+
+
+def test_stranded_keeps_the_newest_settling_row_per_video_across_sources(
+    session: Session,
+) -> None:
+    """An alignment A is a YouTube track, a canonical A a YT Music track; both
+    rate the same video, so the newest row about that video decides."""
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    unconfirmed_restore = [
+        ("repoint_unlike", "applied"),
+        ("lm_check", "failed"),
+        ("restore_like", "applied"),
+        ("restore_verify", "failed"),
+    ]
+    canonical_settled = [("canonical_unlike", "applied"), ("lm_check", "applied")]
+    canonical_unsettled = [("canonical_unlike", "applied")]
+    confirmed_restore = [
+        ("unlike_shadow_unlike", "applied"),
+        ("lm_check", "failed"),
+        ("restore_like", "applied"),
+        ("restore_verify", "applied"),
+    ]
+    histories = {
+        # (source of the older history, its rows, source of the newer, its rows)
+        "healed": (
+            "youtube_liked_videos",
+            unconfirmed_restore,
+            "ytmusic_liked_songs",
+            canonical_settled,
+        ),
+        "restored_later": (
+            "ytmusic_liked_songs",
+            canonical_unsettled,
+            "youtube_liked_videos",
+            confirmed_restore,
+        ),
+        "failing_newest": (
+            "ytmusic_liked_songs",
+            canonical_settled,
+            "youtube_liked_videos",
+            unconfirmed_restore,
+        ),
+    }
+    for vid, (old_src, old_rows, new_src, new_rows) in histories.items():
+        for source, rows in ((old_src, old_rows), (new_src, new_rows)):
+            track = _ytm_track(session, vid, source=source)
+            for kind, status in rows:
+                _relike_attempt(session, track, status, kind=kind, at=t)
+
+    assert stranded_unliked_video_ids(session) == {"failing_newest"}
+
+
+def test_a_later_canonical_action_settles_a_relike_left_unverified(session: Session) -> None:
+    """A ``relike`` killed before its verify leaves A possibly unliked. A later
+    canonical action on the same video read it liked at its precheck, unliked it
+    on purpose and passed its LM check, so that newer row decides. The other
+    way round, a ``relike`` unlike left last strands the video."""
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    relike_unverified = [("relike_unlike", "applied"), ("relike_like", "applied")]
+    canonical_settled = [("canonical_unlike", "applied"), ("lm_check", "applied")]
+    histories = {
+        "canonical_later": [
+            ("youtube_liked_videos", relike_unverified),
+            ("ytmusic_liked_songs", canonical_settled),
+        ],
+        "relike_later": [
+            ("ytmusic_liked_songs", canonical_settled),
+            ("youtube_liked_videos", relike_unverified),
+        ],
+    }
+    for vid, parts in histories.items():
+        for source, rows in parts:
+            track = _ytm_track(session, vid, source=source)
+            for kind, status in rows:
+                _relike_attempt(session, track, status, kind=kind, at=t)
+
+    assert stranded_unliked_video_ids(session) == {"relike_later"}
+
+
 def test_stranded_clears_once_a_later_youtube_scan_shows_the_video_liked(
     session: Session,
 ) -> None:
@@ -347,6 +466,30 @@ def test_relike_writes_count_but_its_reads_and_notes_do_not(session: Session) ->
     for kind in ("relike_unlike", "relike_like"):
         _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
     assert sync_attempts_since_older_scan(session, diag) == 2
+
+
+def test_canonical_writes_count_but_its_reads_do_not(session: Session) -> None:
+    t = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+    ll = create_snapshot(session, "youtube_liked_videos", [])
+    lm = create_snapshot(session, "ytmusic_liked_songs", [])
+    lm.created_at = ll.created_at = t
+    diag = Diagnosis(youtube_snapshot_id=ll.id, ytmusic_snapshot_id=lm.id)
+    session.add(diag)
+    session.flush()
+
+    for kind in (
+        "canonical_precheck_lm",
+        "canonical_precheck_a",
+        "canonical_precheck_b",
+        "canonical_verify",
+        "canonical_unlike_verify",
+        "canonical_rollback_verify",
+    ):
+        _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
+    assert sync_attempts_since_older_scan(session, diag) == 0
+    for kind in ("canonical_like", "canonical_unlike", "canonical_rollback"):
+        _write_at(session, t + timedelta(hours=1), status="failed", kind=kind)
+    assert sync_attempts_since_older_scan(session, diag) == 3
 
 
 @pytest.mark.parametrize(

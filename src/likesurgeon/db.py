@@ -41,15 +41,19 @@ def _migrate_in_place(engine: Engine) -> None:
             row[0]
             for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        if "snapshot_items" not in tables:
-            return
-        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(snapshot_items)")}
-        for name, decl in (
-            ("is_available", "BOOLEAN"),
-            ("unavailable_reason", "VARCHAR(32)"),
+        for table, additions in (
+            (
+                "snapshot_items",
+                (("is_available", "BOOLEAN"), ("unavailable_reason", "VARCHAR(32)")),
+            ),
+            ("diagnoses", (("kind", "VARCHAR(32)"),)),
         ):
-            if name not in cols:
-                conn.exec_driver_sql(f"ALTER TABLE snapshot_items ADD COLUMN {name} {decl}")
+            if table not in tables:
+                continue
+            cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+            for name, decl in additions:
+                if name not in cols:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def make_engine(db_path: Path) -> Engine:

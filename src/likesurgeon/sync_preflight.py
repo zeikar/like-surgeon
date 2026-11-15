@@ -11,9 +11,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt
+from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt, Track
 from .snapshot import YOUTUBE_LIKED_VIDEOS, YTMUSIC_LIKED_SONGS, latest_snapshot
-from .sync import _video_ids_for_tracks
 from .sync_dispatch import QUOTA_REJECTED
 
 STALE_AFTER = timedelta(hours=1)
@@ -24,12 +23,18 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
-# Once A's unlike call has started, the newest of these rows per track says
+# Once A's unlike call has started, the newest of these rows per video says
 # whether A may be liked nowhere. Pre-alignment rows: the ``ytm_like`` re-like.
-_UNLIKE_KINDS = ("repoint_unlike", "unlike_shadow_unlike", "relike_unlike")
+_UNLIKE_KINDS = ("repoint_unlike", "unlike_shadow_unlike", "relike_unlike", "canonical_unlike")
 # ``relike_like`` is left out: only its verify proves the like landed, so a kill
 # before that verify keeps ``relike_unlike`` the newest settling row.
 # ``relike_lm_check`` is left out too: A is confirmed liked before it.
+# ``canonical_verify`` and the B-rollback rows are about B; like
+# ``repoint_unlike_verify``, ``canonical_unlike_verify`` is always followed by
+# the LM check or a restore, which settle. Keying on the newest row per video is
+# safe because every action prechecks ``getRating(A) = like`` before it writes a
+# settling row, so a newer settling row means A was confirmed liked after the
+# older one; the dispatcher must keep that order.
 _SETTLING_KINDS = (
     *_UNLIKE_KINDS,
     "relike_verify",
@@ -51,6 +56,9 @@ _WRITE_KINDS = (
     "repoint_rollback",
     "relike_unlike",
     "relike_like",
+    "canonical_like",
+    "canonical_unlike",
+    "canonical_rollback",
     "interrupted",
     # Writes recorded by versions before the LL -> LM alignment; their rows stay
     # in existing databases. (``ytm_like`` / ``yt_relike`` / ``yt_like`` alone were
@@ -78,35 +86,34 @@ def _may_be_unliked(kind: str, status: str, reason: str) -> bool:
 
 
 def stranded_unliked_video_ids(session: Session) -> frozenset[str]:
-    """Videos a ``sync`` unliked on YouTube that may be liked nowhere now.
+    """Videos ``sync`` or ``canonicalize --apply`` unliked on YouTube that may be liked nowhere now.
 
-    The newest settling row per track (``_may_be_unliked``) decides: an
+    The newest settling row per video (``_may_be_unliked``) decides: an
     ``interrupted`` row, an unlike with nothing after it (a hard kill), or a
-    failed re-like / restore. Keyed by track across all diagnoses, so the
-    state survives a re-run of ``compare-likes``. A video found in a YouTube
-    scan taken after that row has been re-liked since (by hand) and is dropped.
+    failed re-like / restore. Keyed by the source track's video id across all
+    diagnoses, so the state survives a re-run of ``compare-likes`` and an
+    alignment finding (a YouTube track) and a canonical finding (a YT Music
+    track) about the same video share one history. Rows whose track has no
+    video id are left out. A video found in a YouTube scan taken after that
+    row has been re-liked since (by hand) and is dropped.
     """
-    last_row: dict[int, tuple[bool, datetime]] = {}
-    for track_id, kind, status, reason, at in session.execute(
+    last_row: dict[str, tuple[bool, datetime]] = {}
+    for vid, kind, status, reason, at in session.execute(
         select(
-            DiagnosisItem.source_track_id,
+            Track.video_id,
             SyncAttempt.kind,
             SyncAttempt.status,
             SyncAttempt.reason,
             SyncAttempt.created_at,
         )
         .join(DiagnosisItem, SyncAttempt.diagnosis_item_id == DiagnosisItem.id)
+        .join(Track, DiagnosisItem.source_track_id == Track.id)
         .where(SyncAttempt.kind.in_(_SETTLING_KINDS))
         .order_by(SyncAttempt.id)
     ):
-        if track_id is not None:
-            last_row[track_id] = (_may_be_unliked(kind, status, reason), at)
-    unliked_at = {tid: at for tid, (unliked, at) in last_row.items() if unliked}
-    stranded = {
-        vid: unliked_at[tid]
-        for tid, vid in _video_ids_for_tracks(session, set(unliked_at)).items()
-        if vid
-    }
+        if vid:
+            last_row[vid] = (_may_be_unliked(kind, status, reason), at)
+    stranded = {vid: at for vid, (unliked, at) in last_row.items() if unliked}
     if not stranded:
         return frozenset()
     last_scanned_liked = dict(

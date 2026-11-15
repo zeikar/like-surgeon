@@ -90,3 +90,11 @@ def unlike_shadow(item: DiagnosisItem, a: str = "A", b: str = "B") -> PlannedAct
 
 def relike(item: DiagnosisItem, a: str = "A") -> PlannedAction:
     return PlannedAction(item.id, "relike", a_video_id=a, b_video_id=None)
+
+
+def canonical_repoint(item: DiagnosisItem, a: str = "A", b: str = "B") -> PlannedAction:
+    return PlannedAction(item.id, "canonical_repoint", a_video_id=a, b_video_id=b)
+
+
+def canonical_merge(item: DiagnosisItem, a: str = "A", b: str = "B") -> PlannedAction:
+    return PlannedAction(item.id, "canonical_merge", a_video_id=a, b_video_id=b)

@@ -330,6 +330,180 @@ def test_auth_ytmusic_converts_invalid_region_to_fail(
     assert "Traceback" not in result.output
 
 
+@pytest.fixture
+def fake_extraction(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Path]]:
+    """`auth ytmusic --from-browser` without a browser: extraction is recorded,
+    and the account read off the new cookies is ``@me``."""
+    import likesurgeon.cli as _cli_mod
+
+    calls: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        _cli_mod, "write_browser_json_from_browser", lambda b, t: calls.append((b, t))
+    )
+    monkeypatch.setattr(_cli_mod.YTMusicClient, "account_identity", lambda self: "@me")
+    return calls
+
+
+def test_auth_ytmusic_from_browser_records_browser_and_account(
+    fake_home: Path, fake_extraction: list[tuple[str, Path]]
+) -> None:
+    """Kept in config.json (beside the user's region) so a stale Liked songs
+    read can re-extract cookies, as long as the browser is still that account."""
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KR"}))
+
+    result = CliRunner().invoke(app, ["auth", "ytmusic", "--from-browser", " Chrome "])
+
+    assert result.exit_code == 0, result.output
+    assert fake_extraction == [("chrome", fake_home / "browser.json")]
+    saved = json.loads((fake_home / "config.json").read_text())
+    assert saved == {"region": "KR", "ytmusic_browser": "chrome", "ytmusic_account": "@me"}
+
+
+def test_auth_ytmusic_from_browser_unreadable_account_records_no_browser(
+    fake_home: Path, fake_extraction: list[tuple[str, Path]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the account a refresh couldn't tell a switched browser profile,
+    so refresh is off — including a pair recorded by an earlier auth."""
+    import json
+
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    def fail(self: Any) -> str:
+        raise UnexpectedResponseError("couldn't confirm the signed-in YT Music account")
+
+    monkeypatch.setattr(_cli_mod.YTMusicClient, "account_identity", fail)
+    (fake_home / "config.json").write_text(
+        json.dumps({"region": "KR", "ytmusic_browser": "firefox", "ytmusic_account": "@old"})
+    )
+
+    result = CliRunner().invoke(_cli_mod.app, ["auth", "ytmusic", "--from-browser", "chrome"])
+
+    assert result.exit_code == 0, result.output
+    assert "won't be refreshed automatically" in _out(result)
+    assert json.loads((fake_home / "config.json").read_text()) == {"region": "KR"}
+
+
+def test_auth_ytmusic_from_browser_failure_records_nothing(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.ytmusic_client import CookieExtractionError
+
+    def fail(browser: str, target: Path) -> None:
+        raise CookieExtractionError("not signed in")
+
+    monkeypatch.setattr(_cli_mod, "write_browser_json_from_browser", fail)
+
+    result = CliRunner().invoke(_cli_mod.app, ["auth", "ytmusic", "--from-browser", "chrome"])
+
+    assert result.exit_code == 2
+    assert not (fake_home / "config.json").exists()
+
+
+def test_auth_ytmusic_from_browser_unreadable_config_warns(
+    fake_home: Path, fake_extraction: list[tuple[str, Path]]
+) -> None:
+    """browser.json is written either way; a config.json that isn't a JSON
+    object is left alone and the user is told refresh is off."""
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text("{bad")
+
+    result = CliRunner().invoke(app, ["auth", "ytmusic", "--from-browser", "chrome"])
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "Couldn't update" in out and "won't be refreshed automatically" in out
+    assert (fake_home / "config.json").read_text() == "{bad"
+
+
+def test_auth_ytmusic_from_browser_save_failure_names_still_recorded_browser(
+    fake_home: Path, fake_extraction: list[tuple[str, Path]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    import likesurgeon.cli as _cli_mod
+
+    def fail(app_dir: Path, changes: dict[str, Any]) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(_cli_mod, "update_config", fail)
+    (fake_home / "config.json").write_text(
+        json.dumps({"ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    )
+
+    result = CliRunner().invoke(_cli_mod.app, ["auth", "ytmusic", "--from-browser", "chrome"])
+
+    assert result.exit_code == 0, result.output
+    assert "cookies are still refreshed from chrome for @me" in _out(result)
+
+
+def test_auth_ytmusic_from_browser_save_failure_with_a_different_recorded_pair_fails(
+    fake_home: Path, fake_extraction: list[tuple[str, Path]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale firefox/@old pair would later refresh chrome's @me cookies back
+    to @old, so the command must not end successfully with it still armed."""
+    import json
+
+    import likesurgeon.cli as _cli_mod
+
+    def fail(app_dir: Path, changes: dict[str, Any]) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(_cli_mod, "update_config", fail)
+    (fake_home / "config.json").write_text(
+        json.dumps({"ytmusic_browser": "firefox", "ytmusic_account": "@old"})
+    )
+
+    result = CliRunner().invoke(_cli_mod.app, ["auth", "ytmusic", "--from-browser", "chrome"])
+
+    assert result.exit_code == 1, result.output
+    assert "still names firefox for @old" in _out(result)
+
+
+def test_auth_ytmusic_manual_flow_forgets_recorded_browser(fake_home: Path) -> None:
+    """A pasted browser.json doesn't come from the recorded browser, so a
+    refresh must not overwrite it."""
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(
+        json.dumps({"region": "KR", "ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    )
+
+    result = CliRunner().invoke(app, ["auth", "ytmusic"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((fake_home / "config.json").read_text()) == {"region": "KR"}
+
+
+def test_auth_ytmusic_manual_flow_fails_when_browser_cannot_be_forgotten(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    import likesurgeon.cli as _cli_mod
+
+    def fail(app_dir: Path, changes: dict[str, Any]) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(_cli_mod, "update_config", fail)
+    (fake_home / "config.json").write_text(
+        json.dumps({"ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    )
+
+    result = CliRunner().invoke(_cli_mod.app, ["auth", "ytmusic"])
+
+    assert result.exit_code == 1
+    assert "could overwrite a pasted browser.json" in _out(result)
+
+
 def test_video_ids_for_tracks_chunks_lookup_above_batch_size(
     session: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -1146,6 +1320,94 @@ def test_sync_stops_when_liked_songs_cannot_be_read(
     assert acct.rate_calls == []
 
 
+@pytest.fixture
+def real_ytmusic_client(
+    fake_home: Path, patch_sync_clients: FakeAccount, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """The real ``YTMusicClient`` reading the fake account, with chrome / @me
+    recorded for refresh; returns the browsers cookies were re-extracted from."""
+    import json
+
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.ytmusic_client import YTMusicClient
+
+    acct = patch_sync_clients
+
+    class _AccountYTMusic:
+        def get_liked_songs(self, limit: int | None) -> dict[str, Any]:
+            return {"tracks": acct.fetch_liked_songs(limit)}
+
+        def get_account_info(self) -> dict[str, Any]:
+            return {"accountName": "Me", "channelHandle": "@me"}
+
+    class _AccountClient(YTMusicClient):
+        def _build(self) -> Any:
+            return _AccountYTMusic()
+
+    extractions: list[str] = []
+    monkeypatch.setattr(
+        "likesurgeon.ytmusic_client.write_browser_json_from_browser",
+        lambda browser, target: extractions.append(browser),
+    )
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", _AccountClient)
+    (fake_home / "browser.json").write_text("{}")
+    (fake_home / "config.json").write_text(
+        json.dumps({"ytmusic_browser": "chrome", "ytmusic_account": "@me"})
+    )
+    return extractions
+
+
+def test_sync_recovers_stale_liked_songs_read_by_refreshing_cookies(
+    fake_home: Path, patch_sync_clients: FakeAccount, real_ytmusic_client: list[str]
+) -> None:
+    """The post-action LM check hits a logged-out response, cookies are
+    re-extracted from the recorded browser, and the retried read passes the
+    check — no restore."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    ids = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A"], {"A": "B"}
+    # Read 1 is the auth probe, read 2 the baseline, read 3 the check after the
+    # action: a logged-out page, which ytmusicapi's parser reports as KeyError.
+    acct.lm_read_errors = {3: KeyError("twoColumnBrowseResultsRenderer")}
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert real_ytmusic_client == ["chrome"]
+    assert "YT Music cookies refreshed from chrome" in result.stderr
+    assert "applied=1" in result.output
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    assert _sync_rows(fake_home)[0] == {ids[0]: "applied"}
+
+
+def test_sync_restores_when_refreshed_liked_songs_read_fails_too(
+    fake_home: Path, patch_sync_clients: FakeAccount, real_ytmusic_client: list[str]
+) -> None:
+    """A refresh that doesn't help is a failed LM check, as before: A is
+    re-liked and the run stops."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    ids = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked, acct.renders = ["A"], {"A": "B"}
+    stale = KeyError("twoColumnBrowseResultsRenderer")
+    acct.lm_read_errors = {3: stale, 4: stale}
+
+    result = CliRunner().invoke(app, ["sync", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert real_ytmusic_client == ["chrome"]
+    assert "Retried once after refreshing cookies from chrome" in _out(result)
+    assert "restored=1" in result.output
+    # The restore re-likes A, then the rollback unlikes B.
+    assert acct.rate_calls == [("B", "like"), ("A", "none"), ("A", "like"), ("B", "none")]
+    assert _sync_rows(fake_home)[0] == {ids[0]: "skipped"}
+
+
 def test_sync_limit_truncates_actions_and_leaves_rest_open(
     fake_home: Path,
     patch_sync_clients: FakeAccount,
@@ -1626,3 +1888,768 @@ def test_skip_is_all_or_nothing_on_bad_ids(fake_home: Path) -> None:
         assert s.get(DiagnosisItem, ids[ISSUE_DEAD_UNRENDERED]).status == "open"
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# canonicalize (report mode). Discovery reads only YT Music: liked songs and
+# each artist's songs list, both served by ``_FakeYTMusicDiscovery``.
+# ---------------------------------------------------------------------------
+
+_ATV = "MUSIC_VIDEO_TYPE_ATV"
+
+
+def _atv(video_id: str, album: str, *, artist: str = "ch_art") -> dict[str, Any]:
+    """A ytmusicapi track dict: an ATV of "Paper Lantern", 200 s, by ``artist``."""
+    return {
+        "videoId": video_id,
+        "title": "Paper Lantern" if video_id != "vid_listed" else "Other Song",
+        "album": {"name": album, "id": f"alb_{video_id}"},
+        "artists": [{"name": f"Name {artist}", "id": artist}],
+        "videoType": _ATV,
+        "duration_seconds": 200,
+    }
+
+
+class _FakeYTMusicDiscovery:
+    """``YTMusicClient`` for `canonicalize`: class-level liked songs and artist
+    pages. ``during_artist_read`` runs inside ``fetch_artist_songs``, before
+    any result is returned, so a test can look at the DB mid-run."""
+
+    liked: list[dict[str, Any]] = []
+    liked_error: Exception | None = None
+    artists: dict[str, Any] = {}
+    artist_errors: dict[str, str] = {}
+    during_artist_read: Any = None
+    artist_reads: list[list[str]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def fetch_liked_songs(self, limit: int | None = None) -> list[dict[str, Any]]:
+        if type(self).liked_error is not None:
+            raise type(self).liked_error
+        return [dict(s) for s in type(self).liked]
+
+    def fetch_artist_songs(self, channel_ids: Any, on_progress: Any = None) -> tuple[dict, dict]:
+        ids = list(channel_ids)
+        type(self).artist_reads.append(ids)
+        if type(self).during_artist_read is not None:
+            type(self).during_artist_read()
+        errors = {i: msg for i, msg in type(self).artist_errors.items() if i in ids}
+        results = {i: type(self).artists.get(i) for i in ids if i not in errors}
+        for done in range(1, len(ids) + 1):
+            if on_progress is not None:
+                on_progress(done, len(ids))
+        return results, errors
+
+
+@pytest.fixture
+def patch_discovery_client(monkeypatch: pytest.MonkeyPatch) -> type[_FakeYTMusicDiscovery]:
+    """Swap `cli.YTMusicClient` for the discovery fake. Default data: A
+    (``vid_a``, on a single) is missing from its artist's list, which holds
+    exactly one same-title ATV B (``vid_b``); ``vid_listed`` is listed."""
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.ytmusic_client import ArtistSongs
+
+    fake = _FakeYTMusicDiscovery
+    fake.liked = [_atv("vid_a", "Paper Lantern - Single"), _atv("vid_listed", "Night Market")]
+    fake.liked_error = None
+    fake.artists = {
+        "ch_art": ArtistSongs(
+            top_video_ids=("vid_b",),
+            songs=(_atv("vid_b", "Night Market"), _atv("vid_listed", "Night Market")),
+        )
+    }
+    fake.artist_errors = {}
+    fake.during_artist_read = None
+    fake.artist_reads = []
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", fake)
+    return fake
+
+
+def _canonical_items(home: Path) -> list[tuple[int, int, str, str]]:
+    """Every canonicalize finding as (diagnosis id, item id, issue type, status)."""
+    from sqlalchemy import select
+
+    from likesurgeon.diagnosis import DIAGNOSIS_KIND_CANONICALIZE
+    from likesurgeon.models import Diagnosis, DiagnosisItem
+
+    s = _open_db(home)
+    try:
+        return [
+            (it.diagnosis_id, it.id, it.issue_type, it.status)
+            for it in s.scalars(
+                select(DiagnosisItem)
+                .join(Diagnosis, DiagnosisItem.diagnosis_id == Diagnosis.id)
+                .where(Diagnosis.kind == DIAGNOSIS_KIND_CANONICALIZE)
+                .order_by(DiagnosisItem.id)
+            )
+        ]
+    finally:
+        s.close()
+
+
+def test_canonicalize_reports_a_canonical_version_without_youtube(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import (
+        DIAGNOSIS_KIND_CANONICALIZE,
+        ISSUE_CANONICAL_VERSION,
+        latest_diagnosis,
+    )
+    from likesurgeon.models import Snapshot
+
+    monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakeYouTubeWrite)
+
+    result = CliRunner().invoke(app, ["canonicalize"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    assert patch_discovery_client.artist_reads == [["ch_art"]]
+    out = _out(result)
+    assert "Liked songs (distinct videos)" in out
+    assert "already listed" in out
+    [row] = [r for r in result.stdout.splitlines() if ISSUE_CANONICAL_VERSION in r and "vid_a" in r]
+    assert "vid_b" in row
+    assert "likesurgeon skip" in out
+    assert "--apply" in out
+    assert _FakeYouTubeWrite.instances == []
+    s = _open_db(fake_home)
+    try:
+        diag = latest_diagnosis(s, kind=DIAGNOSIS_KIND_CANONICALIZE)
+        assert diag is not None
+        assert diag.youtube_snapshot_id is None
+        [snap] = s.scalars(select(Snapshot)).all()
+        assert (diag.ytmusic_snapshot_id, snap.source, snap.raw_count) == (
+            snap.id,
+            "ytmusic_liked_songs",
+            2,
+        )
+        assert latest_diagnosis(s) is None  # not an alignment diagnosis
+    finally:
+        s.close()
+    [(_, _, issue_type, status)] = _canonical_items(fake_home)
+    assert (issue_type, status) == (ISSUE_CANONICAL_VERSION, "open")
+
+
+def test_canonicalize_json_is_one_document_on_stdout(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["canonicalize", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"diagnosis_id", "summary", "artist_errors", "items"}
+    assert payload["summary"]["candidates"] == 1
+    assert payload["summary"]["listed"] == 1
+    assert payload["artist_errors"] == {}
+    [item] = payload["items"]
+    assert (item["issue_type"], item["source_video_id"], item["related_video_id"]) == (
+        "canonical_version",
+        "vid_a",
+        "vid_b",
+    )
+    assert item["confidence"] == 1.0
+    assert "1/1" in result.stderr  # progress stays off stdout
+    assert "\r" not in result.stderr  # not a terminal: no in-place overwrite
+
+
+def test_canonicalize_failing_liked_songs_read_exits_2(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.models import Snapshot
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    patch_discovery_client.liked_error = UnexpectedResponseError("logged-out response")
+
+    result = CliRunner().invoke(app, ["canonicalize"])
+
+    assert result.exit_code == 2, result.output
+    assert "logged-out response" in result.output
+    assert patch_discovery_client.artist_reads == []
+    s = _open_db(fake_home)
+    try:
+        assert s.scalars(select(Snapshot)).all() == []
+    finally:
+        s.close()
+
+
+def test_canonicalize_unreadable_artist_is_a_warning(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+
+    fake = patch_discovery_client
+    fake.liked.append(_atv("vid_c", "Lone Single", artist="ch_broken"))
+    fake.artist_errors = {"ch_broken": "KeyError: 'header'"}
+
+    result = CliRunner().invoke(app, ["canonicalize"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "Name ch_broken" in out
+    assert "KeyError: 'header'" in out
+    assert len(_canonical_items(fake_home)) == 1  # vid_c gets no finding
+
+
+def test_canonicalize_second_run_keeps_a_skipped_finding_skipped(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+    [(_, first_id, _, _)] = _canonical_items(fake_home)
+    assert runner.invoke(app, ["skip", str(first_id)]).exit_code == 0
+
+    result = runner.invoke(app, ["canonicalize"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    assert "Kept 1 finding(s) 'skipped'" in _out(result)
+    [row] = [r for r in result.stdout.splitlines() if "open write-eligible / total" in r]
+    assert "0 / 1" in row  # the skipped finding isn't one --apply would act on
+    first, second = _canonical_items(fake_home)
+    assert first[0] != second[0]
+    assert second[3] == "skipped"
+
+
+def test_canonicalize_commits_the_snapshot_before_reading_artists(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    """Spec §4.3: the LM snapshot's timestamp is when LM was observed."""
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.models import Snapshot
+
+    seen: list[tuple[str, int]] = []
+
+    def look() -> None:
+        s = _open_db(fake_home)  # another connection: sees committed rows only
+        try:
+            seen.extend((snap.source, snap.raw_count) for snap in s.scalars(select(Snapshot)))
+        finally:
+            s.close()
+
+    patch_discovery_client.during_artist_read = look
+
+    result = CliRunner().invoke(app, ["canonicalize"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [("ytmusic_liked_songs", 2)]
+
+
+def test_a_write_during_the_artist_reads_makes_sync_refuse(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    """A write made while canonicalize reads artist pages is newer than its LM
+    snapshot, so an alignment built on that snapshot is refused (spec §4.3)."""
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+    from likesurgeon.models import SyncAttempt
+    from likesurgeon.snapshot import create_snapshot
+
+    [item_id] = _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+
+    def write() -> None:
+        s = _open_db(fake_home)
+        try:
+            s.add(
+                SyncAttempt(
+                    diagnosis_item_id=item_id, kind="repoint_unlike", status="applied", reason=""
+                )
+            )
+            s.commit()
+        finally:
+            s.close()
+
+    patch_discovery_client.during_artist_read = write
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+    s = _open_db(fake_home)
+    try:
+        create_snapshot(s, "youtube_liked_videos", [_yt_raw("vid_a", "Paper Lantern")])
+        s.commit()
+    finally:
+        s.close()
+
+    result = runner.invoke(app, ["compare-likes"])
+    assert result.exit_code == 0, result.output
+    assert "1 sync attempt(s) ran after the older of the two scans" in _out(result)
+
+    result = runner.invoke(app, ["sync", "--dry-run"])
+    assert result.exit_code == 1, result.output
+    assert "Refusing to sync" in _out(result)
+
+
+def test_issues_type_canonical_lists_the_latest_canonicalize_report(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["issues", "--type", "canonical_version"])
+    assert result.exit_code == 0, result.output
+    assert "Run likesurgeon canonicalize first" in _out(result)
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+    [(diag_id, item_id, _, _)] = _canonical_items(fake_home)
+
+    result = runner.invoke(app, ["issues", "--type", "canonical_version", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["diagnosis_id"] == diag_id
+    assert [(it["id"], it["source_video_id"]) for it in payload["items"]] == [(item_id, "vid_a")]
+    result = runner.invoke(app, ["issues", "--type", "canonical_version"])
+    assert f"Canonicalize report #{diag_id} — issues (1)" in _out(result)
+
+    result = runner.invoke(app, ["issues", "--type", "canonical_ambiguous", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"diagnosis_id": diag_id, "items": []}
+
+    # Without a type, issues still lists the alignment diagnosis.
+    result = runner.invoke(app, ["issues", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert [it["issue_type"] for it in json.loads(result.stdout)["items"]] == [ISSUE_RELINKED]
+
+
+def test_sync_dry_run_ignores_a_newer_canonicalize_report(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "A", "B", False)])
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+
+    result = runner.invoke(app, ["sync", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "\n  repoint: 1" in result.output
+    assert "canonical" not in result.output
+
+
+def test_skip_accepts_ids_from_both_latest_reports_only(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_DEAD_UNRENDERED
+    from likesurgeon.models import DiagnosisItem
+
+    ids = _seed_diagnosis(fake_home, issue_types=[ISSUE_DEAD_UNRENDERED])
+    alignment_id = ids[ISSUE_DEAD_UNRENDERED]
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+    assert runner.invoke(app, ["canonicalize"]).exit_code == 0
+    [(_, older_id, _, _), (_, latest_id, _, _)] = _canonical_items(fake_home)
+
+    # An older report's id fails the whole call.
+    result = runner.invoke(app, ["skip", str(alignment_id), str(latest_id), str(older_id)])
+    assert result.exit_code == 2, result.output
+    assert f"#{older_id} is not a finding of the latest diagnosis" in _out(result)
+    assert [st for *_, st in _canonical_items(fake_home)] == ["open", "open"]
+
+    result = runner.invoke(app, ["skip", str(alignment_id), str(latest_id)])
+    assert result.exit_code == 0, result.output
+    assert "2 finding(s) now 'skipped'" in _out(result)
+    result = runner.invoke(app, ["unskip", str(latest_id)])
+    assert result.exit_code == 0, result.output
+
+    s = _open_db(fake_home)
+    try:
+        assert s.get(DiagnosisItem, alignment_id).status == "skipped"
+        assert s.get(DiagnosisItem, latest_id).status == "open"
+        assert s.get(DiagnosisItem, older_id).status == "open"
+    finally:
+        s.close()
+
+    help_text = _out(runner.invoke(app, ["skip", "--help"]))
+    assert "canonicalize" in help_text
+
+
+# ---------------------------------------------------------------------------
+# canonicalize --apply. The report is seeded on the on-disk DB; the writes run
+# against ``FakeAccount`` through the sync fakes (``patch_sync_clients``).
+# ---------------------------------------------------------------------------
+
+_CANONICAL_REPOINT_ROWS = [
+    "canonical_precheck_a",
+    "canonical_precheck_b",
+    "canonical_like",
+    "canonical_verify",
+    "canonical_unlike",
+    "canonical_unlike_verify",
+    "lm_check",
+]
+
+
+def _seed_canonical(
+    home: Path, findings: list[tuple[str, str, bool]], *, title: str = "Paper Lantern"
+) -> list[int]:
+    """A canonicalize report built like the command builds it: an LM snapshot
+    of the A's (in the given order, newest first) and one ``canonical_version``
+    per ``(A, B, report_only)``, every A and B titled ``title``; a report-only
+    A's album has a version keyword (confidence 0.5). Returns item ids, in
+    ``findings`` order."""
+    from likesurgeon.canonicalize import Candidate, Match, persist_report, version_keyword
+    from likesurgeon.diagnosis import diagnosis_items
+    from likesurgeon.snapshot import create_snapshot
+
+    s = _open_db(home)
+    try:
+        liked = [
+            {
+                **_atv(a, "Best Live! collection" if report_only else "Paper Lantern - Single"),
+                "title": title,
+            }
+            for a, _, report_only in findings
+        ]
+        snap = create_snapshot(s, "ytmusic_liked_songs", liked)
+        candidates = [
+            Candidate(
+                a=song,
+                matches=(
+                    Match(
+                        {**_atv(b, "Night Market"), "title": title},
+                        "ch_art",
+                        in_top=True,
+                        liked=False,
+                    ),
+                ),
+                shown=1,
+                keyword=version_keyword(song["album"]["name"]),
+            )
+            for song, (_, b, _) in zip(liked, findings, strict=True)
+        ]
+        diag, _ = persist_report(s, snap.id, candidates)
+        s.commit()
+        return [it.id for it in sorted(diagnosis_items(s, diag.id), key=lambda it: it.id)]
+    finally:
+        s.close()
+
+
+def test_canonicalize_apply_without_a_report_exits_one(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "PA", "PB", False)])  # alignment only
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "No canonicalize report yet" in result.output
+    assert "likesurgeon canonicalize" in result.output
+    assert _FakeYouTubeWrite.instances == []
+    assert _FakeYTMusicWrite.instances == []
+
+
+def test_canonicalize_apply_moves_the_like_to_b(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    [item_id] = _seed_canonical(fake_home, [("A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked = ["A"]
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    [row] = [r for r in result.stdout.splitlines() if "canonical_repoint" in r and " A " in r]
+    assert str(item_id) in row and " B " in row and "Paper Lantern" in row
+    assert "canonical_repoint: 1" in out
+    assert "104 units" in out
+    assert "applied=1 failed=0 skipped=0 restored=0" in out
+    assert "re-scan both sources" in out and "compare-likes" in out
+    assert _FakeYouTubeWrite.instances[0].scope_calls == 1
+    assert acct.rate_calls == [("B", "like"), ("A", "none")]
+    statuses, attempts = _sync_rows(fake_home)
+    assert statuses == {item_id: "applied"}
+    assert [kind for _, kind, status in attempts if status == "applied"] == _CANONICAL_REPOINT_ROWS
+
+
+def test_canonicalize_apply_declined_prompt_writes_nothing(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    [item_id] = _seed_canonical(fake_home, [("A", "B", False)])
+    patch_sync_clients.liked = ["A"]
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert patch_sync_clients.rate_calls == []
+    assert _sync_rows(fake_home) == ({item_id: "open"}, [])
+    assert _FakeYouTubeWrite.instances == []
+    assert _FakeYTMusicWrite.instances == []
+
+
+def test_canonicalize_apply_leaves_skipped_and_report_only_findings_alone(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    skipped, report_only, eligible = _seed_canonical(
+        fake_home, [("A1", "B1", False), ("A2", "B2", True), ("A3", "B3", False)]
+    )
+    runner = CliRunner()
+    assert runner.invoke(app, ["skip", str(skipped)]).exit_code == 0
+    acct = patch_sync_clients
+    acct.liked = ["A1", "A2", "A3"]
+
+    result = runner.invoke(app, ["canonicalize", "--apply", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "applied=1" in _out(result)
+    assert acct.rate_calls == [("B3", "like"), ("A3", "none")]
+    assert _sync_rows(fake_home)[0] == {
+        skipped: "skipped",
+        report_only: "open",
+        eligible: "applied",
+    }
+
+
+def test_canonicalize_apply_include_flagged_acts_on_a_keyword_finding(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    skipped, flagged, eligible = _seed_canonical(
+        fake_home, [("A1", "B1", True), ("A2", "B2", True), ("A3", "B3", False)]
+    )
+    runner = CliRunner()
+    assert runner.invoke(app, ["skip", str(skipped)]).exit_code == 0
+    acct = patch_sync_clients
+    acct.liked = ["A1", "A2", "A3"]
+
+    result = runner.invoke(
+        app, ["canonicalize", "--apply", "--include-flagged", "--yes"], env={"COLUMNS": "250"}
+    )
+
+    assert result.exit_code == 0, result.output
+    [flagged_row] = [r for r in result.stdout.splitlines() if " A2 " in r]
+    [eligible_row] = [r for r in result.stdout.splitlines() if " A3 " in r]
+    assert "'Live' in album" in flagged_row
+    assert "Live" not in eligible_row
+    assert "applied=2" in _out(result)
+    assert acct.rate_calls == [("B3", "like"), ("A3", "none"), ("B2", "like"), ("A2", "none")]
+    assert _sync_rows(fake_home)[0] == {
+        skipped: "skipped",
+        flagged: "applied",
+        eligible: "applied",
+    }
+
+
+def test_canonicalize_apply_limit_takes_the_oldest(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    newer, older = _seed_canonical(fake_home, [("A1", "B1", False), ("A2", "B2", False)])
+    acct = patch_sync_clients
+    acct.liked = ["A1", "A2"]
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes", "--limit", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert acct.rate_calls == [("B2", "like"), ("A2", "none")]
+    assert _sync_rows(fake_home)[0] == {newer: "open", older: "applied"}
+
+
+def test_canonicalize_apply_with_nothing_left_builds_no_youtube_client(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_canonical(fake_home, [("A", "B", False)])
+    patch_sync_clients.liked = ["A"]
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize", "--apply", "--yes"]).exit_code == 0
+    _FakeYouTubeWrite.instances = []
+    _FakeYTMusicWrite.instances = []
+
+    result = runner.invoke(app, ["canonicalize", "--apply"])  # no prompt either
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to apply" in result.output
+    assert _FakeYouTubeWrite.instances == []
+    assert _FakeYTMusicWrite.instances == []
+
+
+def test_canonicalize_apply_missing_write_scope_blocks_run(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    [item_id] = _seed_canonical(fake_home, [("A", "B", False)])
+    patch_sync_clients.liked = ["A"]
+    _FakeYouTubeWrite.has_write_scope_return = False
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "write scope" in result.output
+    assert patch_sync_clients.rate_calls == []
+    assert _FakeYTMusicWrite.instances == []
+    assert _sync_rows(fake_home) == ({item_id: "open"}, [])
+
+
+def test_canonicalize_apply_failing_ytmusic_auth_blocks_run(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    [item_id] = _seed_canonical(fake_home, [("A", "B", False)])
+    acct = patch_sync_clients
+    acct.liked = ["A"]
+    acct.lm_read_errors = {1: UnexpectedResponseError("ytmusicapi request failed (HTTP 401)")}
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "auth check failed" in result.output
+    assert acct.rate_calls == []
+    assert _sync_rows(fake_home) == ({item_id: "open"}, [])
+
+
+def test_canonicalize_apply_restore_stops_the_run(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    # A is the older entry in the report, so it goes first.
+    second, first = _seed_canonical(fake_home, [("A2", "B2", False), ("A", "B", False)])
+    acct = patch_sync_clients
+    # LM shows A once, but that entry is D's like; A's own like shows as C.
+    acct.liked, acct.renders = ["A2", "A", "D"], {"A": "C", "D": "A"}
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "restored=1" in out
+    assert "Stopped early: a canonicalize action needed A re-liked" in out
+    assert "1 action(s) not attempted" in out
+    assert "A" in acct.liked and "B" not in acct.liked
+    assert _sync_rows(fake_home)[0] == {first: "skipped", second: "open"}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--json", "--apply"],
+        ["--limit", "1"],
+        ["--yes"],
+        ["--json", "--yes"],
+        ["--include-flagged"],
+    ],
+)
+def test_canonicalize_rejects_flag_combinations(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+    args: list[str],
+) -> None:
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["canonicalize", *args])
+
+    assert result.exit_code == 2, result.output
+    assert "No such option" not in result.output
+    assert _FakeYTMusicWrite.instances == []
+
+
+def test_sync_refuses_after_a_canonicalize_apply(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.diagnosis import ISSUE_RELINKED
+
+    _seed_pairs(fake_home, [(ISSUE_RELINKED, "PA", "PB", False)])
+    _seed_canonical(fake_home, [("A", "B", False)])
+    patch_sync_clients.liked = ["A"]
+    runner = CliRunner()
+    assert runner.invoke(app, ["canonicalize", "--apply", "--yes"]).exit_code == 0
+
+    result = runner.invoke(app, ["sync", "--dry-run"])
+
+    assert result.exit_code == 1, result.output
+    assert "Refusing to sync" in _out(result)
+
+
+_MARKUP_TITLE = "Song [/x] [bold]"
+
+
+def test_canonicalize_report_prints_markup_in_titles_literally(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+
+    fake = patch_discovery_client
+    fake.liked = [{**_atv("vid_a", "Paper Lantern - Single"), "title": _MARKUP_TITLE}]
+    fake.artists["ch_art"] = type(fake.artists["ch_art"])(
+        top_video_ids=(), songs=({**_atv("vid_b", "Night Market"), "title": _MARKUP_TITLE},)
+    )
+
+    result = CliRunner().invoke(app, ["canonicalize"], env={"COLUMNS": "400"})
+
+    assert result.exit_code == 0, result.output
+    assert _MARKUP_TITLE in result.output
+
+
+def test_canonicalize_apply_prints_markup_in_titles_literally(
+    fake_home: Path,
+    patch_sync_clients: FakeAccount,
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_canonical(fake_home, [("A", "B", False)], title=_MARKUP_TITLE)
+    patch_sync_clients.liked = ["A"]
+
+    result = CliRunner().invoke(app, ["canonicalize", "--apply"], input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert _MARKUP_TITLE in result.output
+    assert "Proceed?" in result.output  # reached the prompt

@@ -29,6 +29,11 @@ ALIGNMENT_ISSUE_TYPES = (
     ISSUE_UNBACKED_LM_ENTRY,
     ISSUE_METADATA_DRIFT,
 )
+ISSUE_CANONICAL_VERSION = "canonical_version"
+ISSUE_CANONICAL_AMBIGUOUS = "canonical_ambiguous"
+CANONICAL_ISSUE_TYPES = (ISSUE_CANONICAL_VERSION, ISSUE_CANONICAL_AMBIGUOUS)
+# ``Diagnosis.kind`` of a ``canonicalize`` report; ``compare-likes`` rows have ``None``.
+DIAGNOSIS_KIND_CANONICALIZE = "canonicalize"
 # The findings that pair an LL video A with the LM entry B rendering it.
 PAIR_ISSUE_TYPES = (ISSUE_RELINKED, ISSUE_RENDERED_AS_OTHER, ISSUE_SHADOW_DUPLICATE)
 
@@ -255,8 +260,14 @@ def create_alignment_diagnosis(
     return diagnosis
 
 
-def latest_diagnosis(session: Session) -> Diagnosis | None:
-    stmt = select(Diagnosis).order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc()).limit(1)
+def latest_diagnosis(session: Session, kind: str | None = None) -> Diagnosis | None:
+    """Newest diagnosis of ``kind``; the default ``None`` is a ``compare-likes`` run."""
+    stmt = (
+        select(Diagnosis)
+        .where(Diagnosis.kind == kind)
+        .order_by(Diagnosis.created_at.desc(), Diagnosis.id.desc())
+        .limit(1)
+    )
     return session.scalar(stmt)
 
 
@@ -264,8 +275,9 @@ def carry_over_skipped(session: Session, diagnosis: Diagnosis) -> int:
     """Re-apply earlier diagnoses' terminal ``'skipped'`` statuses to the
     matching findings of ``diagnosis``. Returns how many were carried.
 
-    Every ``compare-likes`` run writes fresh ``'open'`` items and ``sync``
-    only reads the latest diagnosis, so without this a ``'skipped'`` — set
+    Every ``compare-likes`` (or ``canonicalize``) run writes fresh ``'open'``
+    items and ``sync`` only reads the latest diagnosis, so without this a
+    ``'skipped'`` — set
     by ``sync`` on a cross-prop verify-miss, or by ``likesurgeon skip`` —
     would silently re-open on the next run and re-fire the same writes.
     A finding matches on ``(issue_type, source_track_id, related_track_id)``,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from likesurgeon.snapshot import create_snapshot, get_snapshot_items
+from likesurgeon.snapshot import create_snapshot, get_snapshot_items, upsert_ytmusic_track
 
 
 def _item(video_id: str, title: str, artists: list[str]) -> dict:
@@ -389,3 +389,15 @@ def test_latest_snapshots_for_source_returns_empty_when_no_snapshots(session) ->
     from likesurgeon.snapshot import latest_snapshots_for_source
 
     assert latest_snapshots_for_source(session, "youtube_liked_videos", limit=2) == []
+
+
+def test_upsert_ytmusic_track_creates_then_reuses_row(session: Session):
+    raw = _item("v9", "Lone Song", ["A"])
+    first = upsert_ytmusic_track(session, raw)
+    again = upsert_ytmusic_track(session, raw)
+    assert first.source == "ytmusic_liked_songs"
+    assert first.video_id == "v9"
+    assert again.id == first.id
+
+    snap = create_snapshot(session, "ytmusic_liked_songs", [raw])
+    assert get_snapshot_items(session, snap.id)[0].track_id == first.id
