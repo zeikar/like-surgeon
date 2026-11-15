@@ -207,22 +207,23 @@ class _SequenceYTMusic:
         return outcome
 
     def get_account_info(self) -> Any:
-        if isinstance(self.account, Exception):
+        if isinstance(self.account, BaseException):
             raise self.account
         return self.account
 
 
 class _RefreshClient(YTMusicClient):
-    """Counts ``_build`` calls; every build hands out the same sequence fake.
-    The auth file is real (a refresh reads and may restore it)."""
+    """Every build hands out the same sequence fake; ``built_from`` records the
+    auth file each build used (None: the client's own). The auth file is real:
+    a refresh replaces it."""
 
     def __init__(self, fake: _SequenceYTMusic, auth_file: Path, **kwargs: Any) -> None:
         super().__init__(browser_path=auth_file, **kwargs)
         self.fake = fake
-        self.builds = 0
+        self.built_from: list[Path | None] = []
 
-    def _build(self) -> Any:
-        self.builds += 1
+    def _build(self, path: Path | None = None) -> Any:
+        self.built_from.append(path)
         return self.fake
 
 
@@ -237,6 +238,11 @@ def auth_file(tmp_path: Path) -> Path:
     path = tmp_path / "browser.json"
     write_private_text(path, _OLD_COOKIES)
     return path
+
+
+def _only_auth_file_left(auth_file: Path) -> bool:
+    """No refresh candidate left behind beside the auth file."""
+    return [p.name for p in auth_file.parent.iterdir()] == [auth_file.name]
 
 
 @pytest.fixture
@@ -269,20 +275,71 @@ def test_fetch_liked_songs_refreshes_cookies_and_retries_once(
     client = _refresh_client(fake, auth_file, on_refresh=refreshed.append)
 
     assert client.fetch_liked_songs() == [{"videoId": "v1"}]
-    assert extractions == [("chrome", auth_file)]
+    [(browser, candidate)] = extractions
+    assert browser == "chrome"
+    # Extracted beside browser.json and checked there before replacing it.
+    assert candidate.parent == auth_file.parent and candidate != auth_file
+    assert client.built_from == [None, candidate, None]
     assert refreshed == ["chrome"]
     assert fake.calls == 2
     assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+    if sys.platform != "win32":
+        assert auth_file.stat().st_mode & 0o777 == 0o600
+    assert _only_auth_file_left(auth_file)
 
 
-def test_fetch_liked_songs_falls_back_to_account_name_without_handle(
+_NO_HANDLE = {"accountName": "Me", "channelHandle": None, "accountPhotoUrl": "https://yt3/me"}
+
+
+def test_fetch_liked_songs_without_handle_matches_name_and_photo(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=_NO_HANDLE)
+    client = _RefreshClient(
+        fake, auth_file, refresh_browser="chrome", refresh_account="Me|https://yt3/me"
+    )
+    assert client.fetch_liked_songs() == []
+    assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    ["Me|https://yt3/other-me", "Me"],
+    ids=["same-name-other-photo", "name-only-from-older-version"],
+)
+def test_fetch_liked_songs_without_handle_same_name_is_not_enough(
+    extractions: list[tuple[str, Path]], auth_file: Path, recorded: str
+) -> None:
+    """Another account with the same display name must not pass."""
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=_NO_HANDLE)
+    client = _RefreshClient(fake, auth_file, refresh_browser="chrome", refresh_account=recorded)
+    with pytest.raises(UnexpectedResponseError, match="re-run that command"):
+        client.fetch_liked_songs()
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert fake.calls == 1
+
+
+def test_fetch_liked_songs_without_handle_or_photo_is_not_refreshed(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:
     fake = _SequenceYTMusic(
         [_STALE, {"tracks": []}], account={"accountName": "Me", "channelHandle": None}
     )
     client = _RefreshClient(fake, auth_file, refresh_browser="chrome", refresh_account="Me")
-    assert client.fetch_liked_songs() == []
+    with pytest.raises(UnexpectedResponseError, match="no channel handle"):
+        client.fetch_liked_songs()
+    assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert _only_auth_file_left(auth_file)
+
+
+def test_account_identity_without_handle_or_photo_raises() -> None:
+    """`auth ytmusic --from-browser` then records no browser: refresh is off."""
+    client = _RefreshClient(
+        _SequenceYTMusic([], account={"accountName": "Me", "channelHandle": None}),
+        Path("/unused"),
+    )
+    with pytest.raises(UnexpectedResponseError, match="no channel handle"):
+        client.account_identity()
 
 
 @pytest.mark.parametrize(
@@ -333,7 +390,7 @@ def test_fetch_liked_songs_reshaped_response_is_not_refreshed(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode")
-def test_fetch_liked_songs_other_account_restores_old_cookies(
+def test_fetch_liked_songs_other_account_keeps_old_cookies(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:
     """The browser is now signed in to someone else: every later read would
@@ -349,11 +406,26 @@ def test_fetch_liked_songs_other_account_restores_old_cookies(
     assert "chrome is now signed in to @other, not @me" in message
     assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
     assert auth_file.stat().st_mode & 0o777 == 0o600
+    assert _only_auth_file_left(auth_file)
     assert refreshed == []
     assert fake.calls == 1
 
 
-def test_fetch_liked_songs_unreadable_account_restores_old_cookies(
+def test_fetch_liked_songs_interrupted_refresh_leaves_auth_file_untouched(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    """Ctrl-C between extraction and the account check: the unverified
+    cookies never reach browser.json."""
+    before = auth_file.read_bytes()
+    fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _refresh_client(fake, auth_file).fetch_liked_songs()
+    assert len(extractions) == 1
+    assert auth_file.read_bytes() == before
+    assert _only_auth_file_left(auth_file)
+
+
+def test_fetch_liked_songs_unreadable_account_keeps_old_cookies(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:
     fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=KeyError("accountName"))
@@ -393,6 +465,7 @@ def test_fetch_liked_songs_refresh_failure_raises_read_error(
     assert str(refresh_error) in message
     assert isinstance(exc_info.value.__cause__, UnexpectedResponseError)
     assert auth_file.read_text(encoding="utf-8") == _OLD_COOKIES
+    assert _only_auth_file_left(auth_file)
     assert refreshed == []
     assert fake.calls == 1
 
@@ -420,7 +493,7 @@ def test_fetch_liked_songs_retry_build_failure_is_a_read_error(
     client = _refresh_client(fake, auth_file)
     builds = iter([fake, fake])  # first read, account check; the retry build fails
 
-    def build() -> Any:
+    def build(path: Path | None = None) -> Any:
         try:
             return next(builds)
         except StopIteration:

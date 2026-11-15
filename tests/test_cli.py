@@ -1341,7 +1341,7 @@ def real_ytmusic_client(
             return {"accountName": "Me", "channelHandle": "@me"}
 
     class _AccountClient(YTMusicClient):
-        def _build(self) -> Any:
+        def _build(self, path: Path | None = None) -> Any:
             return _AccountYTMusic()
 
     extractions: list[str] = []

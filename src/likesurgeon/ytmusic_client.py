@@ -7,7 +7,10 @@ ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -249,21 +252,35 @@ def parse_artist_page(response: dict[str, Any]) -> tuple[list[str], str | None] 
 
 
 def _account_identity(client: YTMusic) -> str:
-    """See ``YTMusicClient.account_identity``. The handle is the stable id
-    ytmusicapi exposes; the display name is only a fallback, and two accounts
-    without a handle that share a display name can't be told apart."""
+    """See ``YTMusicClient.account_identity``.
+
+    The channel handle is the only unique id ytmusicapi exposes. Without one,
+    a display name alone would let another account with the same name pass,
+    so the name is paired with the profile photo URL (``name|photo_url``);
+    a changed photo then reads as another account, which only turns the
+    refresh off. Neither is guaranteed unique, so two handle-less accounts
+    with the same name and photo URL still pass; accepted by the maintainer
+    as a known limit over turning the refresh off for such accounts.
+    """
     try:
         info = client.get_account_info()
     except Exception as exc:  # noqa: BLE001 — system-boundary catch
         raise UnexpectedResponseError(
             f"couldn't confirm the signed-in YT Music account ({type(exc).__name__}: {exc})"
         ) from exc
-    identity = (
-        (info.get("channelHandle") or info.get("accountName")) if isinstance(info, dict) else None
+    if not isinstance(info, dict):
+        raise UnexpectedResponseError(
+            f"couldn't confirm the signed-in YT Music account (got a {type(info).__name__})"
+        )
+    handle, name, photo = (info.get(k) for k in ("channelHandle", "accountName", "accountPhotoUrl"))
+    if isinstance(handle, str) and handle:
+        return handle
+    if isinstance(name, str) and name and isinstance(photo, str) and photo:
+        return f"{name}|{photo}"
+    raise UnexpectedResponseError(
+        "couldn't confirm the signed-in YT Music account (no channel handle, "
+        "and no name and profile photo to use instead)"
     )
-    if not isinstance(identity, str) or not identity:
-        raise UnexpectedResponseError("couldn't confirm the signed-in YT Music account (no name)")
-    return identity
 
 
 class YTMusicClient:
@@ -292,19 +309,21 @@ class YTMusicClient:
         self._refresh_account = refresh_account
         self._on_refresh = on_refresh
 
-    def _build(self) -> YTMusic:
-        if self._browser_path is None or not self._browser_path.exists():
+    def _build(self, path: Path | None = None) -> YTMusic:
+        """A YTMusic on the auth file, or on ``path`` (a refresh's candidate)."""
+        path = path or self._browser_path
+        if path is None or not path.exists():
             raise AuthFileMissingError(
                 "No YouTube Music auth file found. "
                 "Run `likesurgeon auth ytmusic` and follow the printed instructions."
             )
         try:
-            return YTMusic(str(self._browser_path))
+            return YTMusic(str(path))
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             # A corrupt/partial browser.json is "no usable auth file" too;
             # the recovery (re-run auth) is the same as the missing case.
             raise AuthFileMissingError(
-                f"YouTube Music auth file {self._browser_path} is unusable "
+                f"YouTube Music auth file {path} is unusable "
                 f"({type(exc).__name__}: {exc}). Re-run `likesurgeon auth ytmusic`."
             ) from exc
 
@@ -388,51 +407,54 @@ class YTMusicClient:
             ) from exc
 
     def account_identity(self) -> str:
-        """The signed-in account's channel handle, or its name when it has no
-        handle. Raises ``AuthFileMissingError`` without a usable auth file and
-        ``UnexpectedResponseError`` when the account can't be read."""
+        """The signed-in account's channel handle, or ``name|photo_url`` when it
+        has none (see ``_account_identity``). Raises ``AuthFileMissingError``
+        without a usable auth file and ``UnexpectedResponseError`` when the
+        account can't be read."""
         return _account_identity(self._build())
 
     def _refresh_and_request(
         self, browser: str, account: str, target: Path, limit: int | None, failure: Exception
     ) -> Any:
-        """Rewrite the auth file ``target`` from ``browser`` and repeat the
-        request once.
+        """Re-extract cookies from ``browser`` into the auth file ``target`` and
+        repeat the request once.
 
-        The new cookies are kept only when they belong to ``account``: a
-        browser now signed in to another account would make every later
-        Liked songs read (and every sync LM check) describe that account. On
-        any refresh failure the previous auth file is put back and
-        ``UnexpectedResponseError`` raised with ``failure`` as cause.
+        The new cookies are written to a candidate file beside ``target`` and
+        moved over it only once they are confirmed to belong to ``account``: a
+        browser now signed in to another account would make every later Liked
+        songs read (and every sync LM check) describe that account. Any failure
+        or interrupt before that leaves ``target`` untouched; a failure raises
+        ``UnexpectedResponseError`` with ``failure`` as cause.
         """
+        candidate: Path | None = None
         try:
-            previous = target.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise UnexpectedResponseError(
-                f"{failure} (Couldn't refresh cookies from {browser}: {exc})"
-            ) from failure
-        try:
-            write_browser_json_from_browser(browser, target)
-            identity = self.account_identity()
+            fd, name = tempfile.mkstemp(
+                dir=str(target.parent), prefix=f".{target.stem}.", suffix=".candidate"
+            )
+            os.close(fd)
+            candidate = Path(name)
+            write_browser_json_from_browser(browser, candidate)
+            identity = _account_identity(self._build(candidate))
             if identity != account:
                 raise UnexpectedResponseError(
-                    f"{browser} is now signed in to {identity}, not {account}, the "
-                    "account `auth ytmusic --from-browser` recorded; kept the old cookies"
+                    f"{browser} is now signed in to {identity}, not {account}, the account "
+                    "`auth ytmusic --from-browser` recorded. If it is the same account (a new "
+                    "profile photo, or an identity recorded by an older version), re-run "
+                    "that command"
                 )
+            os.replace(candidate, target)
         # Extraction boundary: browser_cookie3 and the OS decrypt paths raise
         # anything, and the sync dispatcher only handles the two read-error types.
         except Exception as exc:  # noqa: BLE001
-            try:
-                write_private_text(target, previous)
-            except OSError as restore_exc:
-                raise UnexpectedResponseError(
-                    f"{failure} (Refreshing cookies from {browser} failed: {exc}. Restoring "
-                    f"{target} failed too ({restore_exc}), so it may hold another account's "
-                    "cookies: re-run `likesurgeon auth ytmusic --from-browser`.)"
-                ) from failure
             raise UnexpectedResponseError(
-                f"{failure} (Refreshing cookies from {browser} failed: {exc})"
+                f"{failure} (Refreshing cookies from {browser} failed, {target} unchanged: {exc})"
             ) from failure
+        finally:
+            if candidate is not None:
+                # Gone after the replace. Otherwise it's only a leftover temp
+                # file, and an error removing it mustn't hide the real outcome.
+                with contextlib.suppress(OSError):
+                    candidate.unlink(missing_ok=True)
         try:
             # A failing callback fails the read rather than being ignored: the
             # dispatcher then restores and stops, which is always safe.
