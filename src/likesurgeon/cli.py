@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from sqlalchemy.orm import sessionmaker
 
 from . import __version__
@@ -589,7 +590,7 @@ def snapshots() -> None:
     playlist_snapshots = len(all_rows) - len(rows)
 
     table = Table(title="Snapshots")
-    table.add_column("ID", justify="right")
+    table.add_column("ID", justify="right", min_width=2)
     table.add_column("Source")
     table.add_column("Created (UTC)")
     table.add_column("Items", justify="right")
@@ -641,23 +642,25 @@ def playlists(
         return
 
     table = Table(title=f"Playlist scan #{report.scan_id} ({when} UTC)")
-    table.add_column("ID", justify="right")
-    table.add_column("Playlist")
-    table.add_column("Own")
-    table.add_column("YT Music", justify="right")
-    table.add_column("Music %", justify="right")
-    table.add_column("Music", justify="right")
-    table.add_column("UGC", justify="right")
-    table.add_column("Other", justify="right")
-    table.add_column("YouTube", justify="right")
-    table.add_column("Dead", justify="right")
+    # Counts never wrap; the title (plain Text, so no markup to escape) takes what's
+    # left and is cut with an ellipsis, so a row stays one line at 80 columns.
+    table.add_column("ID", justify="right", no_wrap=True)
+    table.add_column("Playlist", max_width=24)
+    table.add_column("Own", no_wrap=True, min_width=5)
+    table.add_column("YTM", justify="right", no_wrap=True, min_width=3)
+    table.add_column("Music%", justify="right", no_wrap=True, min_width=6)
+    table.add_column("Music", justify="right", no_wrap=True, min_width=5)
+    table.add_column("UGC", justify="right", no_wrap=True, min_width=3)
+    table.add_column("Other", justify="right", no_wrap=True, min_width=5)
+    table.add_column("YT", justify="right", no_wrap=True, min_width=2)
+    table.add_column("Dead", justify="right", no_wrap=True, min_width=4)
     for r in report.rows:
         dead_cell = "-" if r.dead is None else str(r.dead)
         if r.unchecked:
             dead_cell += f" ({r.unchecked} unchecked)"
         table.add_row(
             str(r.ytmusic_snapshot_id),
-            escape(r.title),
+            Text(r.title, no_wrap=True, overflow="ellipsis"),
             "?" if r.owned is None else "own" if r.owned else "saved",
             str(r.ytmusic_count),
             "-" if r.music_share is None else f"{r.music_share:.0%}",
