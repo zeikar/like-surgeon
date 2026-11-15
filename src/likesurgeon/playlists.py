@@ -144,7 +144,9 @@ def playlist_report(session: Session) -> PlaylistReport | None:
         music, ugc = kinds.count("music"), kinds.count("ugc")
 
         youtube_count = dead = unchecked = None
-        if playlist.youtube_items is not None:
+        # Only owned playlists have a YouTube side; an older scan may hold one for a
+        # saved playlist, which must not resurface its dead items.
+        if playlist.youtube_items is not None and snap.playlist_owned is True:
             youtube_count = len(playlist.youtube_items)
             dead = unchecked = 0
             for i in playlist.youtube_items:

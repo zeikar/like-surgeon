@@ -447,6 +447,66 @@ def test_scan_playlists_backs_up_ordinary_playlists(
     assert "likesurgeon playlists" in out
 
 
+def test_scan_playlists_gives_saved_playlists_no_youtube_side(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    ytm.playlists["PLnight"]["owned"] = False
+    yt.playlist_errors = {}
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert ytm.playlist_reads == [["PLroad", "PLnight"]]
+    assert yt.playlist_reads == [["PLroad"]]
+    assert _playlist_state(fake_home) == (
+        1,
+        [
+            ("ytmusic_playlist", "PLroad", "Road Trip"),
+            ("ytmusic_playlist", "PLnight", "Late Night"),
+            ("youtube_playlist", "PLroad", "Road Trip"),
+        ],
+    )
+    assert "1 playlist(s) you don't own backed up without a YouTube check" in _out(result)
+
+
+def test_scan_playlists_treats_a_missing_owned_flag_as_not_owned(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    del ytm.playlists["PLnight"]["owned"]
+    ytm.playlists["PLroad"]["owned"] = None
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert yt.playlist_reads == []
+    assert "2 playlist(s) you don't own backed up" in _out(result)
+
+
+def test_scan_playlists_with_only_saved_playlists_skips_youtube(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    for p in ytm.playlists.values():
+        p["owned"] = False
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert yt.playlist_reads == []
+    assert "2 playlist(s) you don't own backed up" in _out(result)
+
+
 @pytest.mark.parametrize("library_ids", [[], ["LM", "SE", "LRSRmix"]])
 def test_scan_playlists_with_nothing_to_back_up_stores_an_empty_scan(
     fake_home: Path,
@@ -618,7 +678,12 @@ def test_scan_playlists_lists_playlists_youtube_cannot_read(
 
     ytm, yt = patch_playlist_clients
     ytm.library.append({"playlistId": "PLgym", "title": "Gym"})
-    ytm.playlists["PLgym"] = {"id": "PLgym", "title": "Gym", "tracks": [_ytm_track("v4")]}
+    ytm.playlists["PLgym"] = {
+        "id": "PLgym",
+        "title": "Gym",
+        "owned": True,
+        "tracks": [_ytm_track("v4")],
+    }
     yt.playlist_errors["PLgym"] = "HTTP 403: Forbidden"
 
     result = CliRunner().invoke(app, ["scan", "playlists"])
@@ -740,6 +805,35 @@ def test_playlists_says_youtube_coverage_is_absent_and_suggests_auth(
 
     assert "no YouTube coverage" in out
     assert "likesurgeon auth youtube" in out
+
+
+def test_playlists_shows_saved_rows_without_a_coverage_hint(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    ytm, yt = patch_playlist_clients
+    ytm.playlists["PLnight"]["owned"] = False
+    yt.playlist_errors = {}
+    _scan_playlists(patch_playlist_clients)
+
+    result = _playlists_cmd()
+
+    assert "2 Late Night saved 1 100% 1 0 0 - -" in _cells(result)
+    assert "no YouTube coverage" not in _out(result)
+
+
+def test_playlists_with_only_saved_playlists_has_no_coverage_hint(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    for p in patch_playlist_clients[0].playlists.values():
+        p["owned"] = False
+    _scan_playlists(patch_playlist_clients)
+
+    out = _out(_playlists_cmd("--dead"))
+
+    assert "no YouTube coverage" not in out
+    assert "No dead items in this scan." in out
 
 
 def test_playlists_does_not_suggest_auth_when_youtube_is_authorized(
@@ -3460,6 +3554,60 @@ def test_repoint_playlists_without_a_scan_exits_one(
     assert patch_metadata_client.requested == []
 
 
+def _seed_old_scan_with_saved_youtube_side(home: Path) -> None:
+    """One owned playlist (YouTube side, no dead item) and one saved playlist that
+    still has a YouTube side with a dead item, as earlier scans stored."""
+    from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
+
+    def read(pid: str, owned: bool | None, youtube: list[dict]) -> PlaylistRead:
+        ytmusic = {"id": pid, "title": pid, "tracks": [_ytm_track("v1")]}
+        if owned is not None:
+            ytmusic["owned"] = owned
+        return PlaylistRead(pid, pid, ytmusic, youtube)
+
+    s = _open_db(home)
+    try:
+        create_playlist_scan(
+            s,
+            [
+                read("PLown", True, [_pl_yt("v1", 0, True)]),
+                read("PLsaved", False, [_pl_yt("v1", 0, True), _pl_yt("s2", 1, False, "deleted")]),
+                read("PLunknown", None, [_pl_yt("v1", 0, True), _pl_yt("u2", 1, False, "deleted")]),
+            ],
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def test_repoint_playlists_summary_ignores_youtube_sides_of_saved_playlists(
+    fake_home: Path,
+    patch_metadata_client: type[_FakeYouTubeMetadata],
+) -> None:
+    _seed_old_scan_with_saved_youtube_side(fake_home)
+
+    result = _repoint_playlists()
+
+    assert result.exit_code == 0, result.output
+    out = _cells(result)
+    assert "Own playlists with a YouTube side / own 1 / 1" in out
+    assert "Dead items on the YouTube side 0" in out
+
+
+def test_playlists_report_ignores_youtube_sides_of_playlists_not_owned(
+    fake_home: Path,
+) -> None:
+    _seed_old_scan_with_saved_youtube_side(fake_home)
+
+    result = _playlists_cmd("--dead")
+
+    out = _cells(result)
+    assert "PLsaved saved 1 100% 1 0 0 - -" in out
+    assert "PLunknown ? 1 100% 1 0 0 - -" in out
+    assert "Dead items" not in out
+    assert "no YouTube coverage" not in out
+
+
 def test_repoint_playlists_reports_pairs_and_writes_nothing(
     fake_home: Path,
     patch_metadata_client: type[_FakeYouTubeMetadata],
@@ -3475,7 +3623,7 @@ def test_repoint_playlists_reports_pairs_and_writes_nothing(
     assert patch_metadata_client.requested == [["A", "B"]]
     out = _cells(result)
     assert f"Playlist repoint report #{diag_id} saved" in out
-    assert "Playlists with a YouTube side / total 1 / 2" in out
+    assert "Own playlists with a YouTube side / own 1 / 2" in out
     assert "Dead items on the YouTube side 3" in out
     assert "playlist_relinked (open write-eligible / total) 1 / 1" in out
     assert "Dead items YT Music shows as themselves 1" in out

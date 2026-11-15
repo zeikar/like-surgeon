@@ -113,7 +113,7 @@ YouTube Data API default daily quota is **10,000 units**. A single full scan of 
 
 `repoint-playlists --apply` costs 50 units per `playlistItems.insert` and per `playlistItems.delete` (about 100 per item), plus 1 unit per page of 50 items for each read of a playlist's YouTube side: one baseline read per playlist, then one after the insert and one after the delete per item. Re-reads on a mismatch (15 s later), undo writes (about 50 each), the positional insert an automatically sorted playlist refuses (one per such playlist, 50) and YT Music reads (no quota) aren't in the plan's estimate. At 10,000 units a day that is roughly 90 items.
 
-`scan playlists` costs 1 unit per 50 items of each playlist (`playlistItems.list`; at least 1 per playlist tried, including playlists the Data API can't read, which fail with an error), plus 1 unit per 50 distinct videos for availability.
+`scan playlists` costs 1 unit per 50 items of each owned playlist (saved playlists get no YouTube read; `playlistItems.list`; at least 1 per playlist tried, including playlists the Data API can't read, which fail with an error), plus 1 unit per 50 distinct videos for availability.
 
 So you can comfortably re-scan dozens of times per day. If you hit the quota, the YouTube client surfaces a clean `quota_exceeded` reason rather than a traceback.
 
