@@ -9,6 +9,7 @@ Project-specific instructions for like-surgeon. The global ~/.claude/CLAUDE.md s
 - [docs/design/ll-lm-alignment.md](docs/design/ll-lm-alignment.md) — the LL→LM alignment spec (domain model, findings, actions)
 - [docs/design/canonicalize.md](docs/design/canonicalize.md) — the `canonicalize` spec (move a like to the version the artist page lists)
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — test strategy, fake/monkeypatch patterns, auth setup, debugging
+- [docs/design/playlist-repoint.md](docs/design/playlist-repoint.md) — the `repoint-playlists` spec (model, finding, action flow, outcomes, limits)
 - CLAUDE.md (this file) — conventions and gotchas that don't fit the above
 
 ## Domain model: LL is the store, LM renders it (read this first)
@@ -30,6 +31,17 @@ Spec: [docs/design/canonicalize.md](docs/design/canonicalize.md). Gotchas:
 - The sole title exception: B is the one ATV with an exact `title_key` match (±1 s) in A's artists' **Show-all** lists. Top songs only count A as listed, never supply a B. A's like is A's own (never inferred); alignment's same-recording title check only verifies pairs that order already fixed.
 - `--apply`: the planned `canonical_repoint` / `canonical_merge` is a forecast; B's live rating picks the flow. A restore stops the run (`CANONICALIZE_STOP`). Never `rate_song` here either.
 - `--apply --include-flagged` (opt-in) also takes a 0.5 `canonical_version` whose A appears once in the report's LM snapshot and has a version keyword; `flagged_keywords` derives that cause from the snapshot — never parse `reason`.
+
+## Playlist repoint (separate command)
+
+Spec: [docs/design/playlist-repoint.md](docs/design/playlist-repoint.md). Gotchas:
+
+- Reports are `Diagnosis.kind = 'playlists'` (`playlist_relinked`, built on a `playlist_scan_id`); `latest_diagnosis()` defaults to `kind IS NULL`, so `sync` and `doctor` never see them. `--apply` exits 1 when a newer playlist scan exists than the report's.
+- Never delete A's item before both sides confirm B at its position. Never remove B unless A's item is known to be in place, so not after an unconfirmed delete (it may still land; report `delete_unconfirmed` and stop) and not when A can't be put back (`left_removed`). A 2xx insert that isn't listed is not skipped: B goes to `left_inserted`, the item stays open and the run stops.
+- Only an applied `playlist_check` or `playlist_rollback_verify` settles an action. `unsettled_playlist_actions` lists the rest, and its warning is retired only by newer snapshots of that playlist on both sides.
+- `playlist_*` rows stay out of `_WRITE_KINDS` and `_SETTLING_KINDS`: they never block `sync` or feed the stranded-likes list. Never rate or touch likes here.
+- A playlist whose live state differs from the scan gets no writes (items stay `open`, other playlists continue); an unreadable side, an undo or quota exhaustion stops the run. A wrong B that YT Music renders as itself passes every check, so the same-recording check and the report review are the guard.
+- Quota: about 100 units per item (insert and delete, 50 each) plus the playlist reads; undo calls and re-reads aren't estimated. Exits 1 on quota exhaustion.
 
 ## Releases
 
