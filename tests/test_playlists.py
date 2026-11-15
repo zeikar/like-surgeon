@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from likesurgeon.models import Snapshot
-from likesurgeon.playlists import is_backed_up, music_kind, playlist_report
+from likesurgeon.playlists import is_backed_up, load_scan, music_kind, playlist_report
 from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
 
 
@@ -153,3 +153,31 @@ def test_report_counts_dead_and_unchecked_with_dead_items(session: Session):
         ("Second", 1, "v4", "Y v4", "private"),
         ("Second", 2, "v5", "Y v5", "deleted"),
     ]
+
+
+def test_load_scan_none_without_scan(session: Session):
+    assert load_scan(session) is None
+
+
+def test_load_scan_pairs_each_ytmusic_side_with_its_youtube_side(session: Session):
+    older = create_playlist_scan(
+        session,
+        [
+            _read("PLa", "A", [_track("v2", ATV), _track("v1", ATV)], [_yt("v2", True)]),
+            _read("PLb", "B", [_track("v3", ATV)]),
+        ],
+    )
+    create_playlist_scan(session, [_read("PLnew", "New", [])])
+
+    loaded = load_scan(session, older.id)
+    assert loaded.scan.id == older.id
+    first, second = loaded.playlists
+    assert (first.ytmusic.source, first.ytmusic.playlist_id) == ("ytmusic_playlist", "PLa")
+    assert [i.video_id for i in first.ytmusic_items] == ["v2", "v1"]
+    assert (first.youtube.source, first.youtube.playlist_id) == ("youtube_playlist", "PLa")
+    assert [i.video_id for i in first.youtube_items] == ["v2"]
+    assert second.ytmusic.playlist_id == "PLb"
+    assert (second.youtube, second.youtube_items) == (None, None)
+
+    assert [p.ytmusic.playlist_id for p in load_scan(session).playlists] == ["PLnew"]
+    assert load_scan(session, older.id + 100) is None
