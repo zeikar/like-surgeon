@@ -17,7 +17,13 @@ from sqlalchemy.orm import Session
 from likesurgeon.db import make_session_factory
 from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS, ISSUE_PLAYLIST_RELINKED
 from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt
-from likesurgeon.playlist_dispatch import PLAYLIST_STOP, PlaylistExecResult, execute
+from likesurgeon.playlist_dispatch import (
+    MANUAL_SORT_REJECTED,
+    PLAYLIST_STOP,
+    PlaylistExecResult,
+    _only_change,
+    execute,
+)
 from likesurgeon.playlist_repoint import PlaylistAction, PlaylistState
 from likesurgeon.sync_dispatch import QUOTA_REJECTED
 from likesurgeon.youtube_client import YouTubeWriteError
@@ -887,3 +893,281 @@ def test_each_write_row_is_on_disk_before_the_next_wait(
 
     assert committed_at_waits[0][-1] == ("playlist_insert", "applied")
     assert committed_at_waits[1][-1] == ("playlist_delete", "applied")
+
+
+# ---------------------------------------------------------------------------
+# automatically sorted playlists
+# ---------------------------------------------------------------------------
+
+_SORTED = ("T PL1",)
+
+
+@pytest.mark.parametrize("at", [None, 1], ids=["sorted", "positional"])
+def test_only_change_rejects_any_other_change(at: int | None) -> None:
+    rest = ("a", "b", "c")
+    assert _only_change(("a", "x", "b", "c"), rest, "x", at) == 1
+    assert _only_change(("b", "x", "a", "c"), rest, "x", at) is None  # another item moved
+    assert _only_change(("a", "x", "b"), rest, "x", at) is None  # another item gone
+    assert _only_change(("a", "x", "b", "c", "d"), rest, "x", at) is None  # another added
+    assert _only_change(("a", "y", "b", "c"), rest, "x", at) is None  # not x
+    assert _only_change(rest, rest, "x", at) is None  # x missing
+
+
+def test_only_change_holds_x_where_a_positional_playlist_wants_it() -> None:
+    rest = ("a", "b", "c")
+    assert _only_change(("a", "b", "x", "c"), rest, "x") == 2
+    assert _only_change(("a", "b", "x", "c"), rest, "x", 1) is None
+    # One more of an x that is already there (YT Music's B), on either side of it.
+    assert _only_change(("a", "b", "b", "c"), rest, "b", 1) == 1
+    assert _only_change(("a", "b", "c", "b"), rest, "b", 1) is None
+    assert _only_change(("a", "b", "c", "b"), rest, "b") == 3
+
+
+def _sorted_playlist(rule: str) -> FakePlaylistAccount:
+    acct = FakePlaylistAccount(
+        {"PL1": [("i0", "v0"), ("i1", "A1"), ("i2", "v2")]}, renders={"A1": "B1"}
+    )
+    acct.auto_sorted = {"PL1": rule}
+    return acct
+
+
+_REFUSED_THEN_INSERTED = [
+    ("playlist_precheck", "applied"),
+    ("playlist_insert", "failed"),
+    ("playlist_insert", "applied"),
+]
+
+
+@pytest.mark.parametrize(
+    ("rule", "after"),
+    [
+        ("top", [("new1", "B1"), ("i0", "v0"), ("i2", "v2")]),
+        ("end", [("i0", "v0"), ("i2", "v2"), ("new1", "B1")]),
+    ],
+)
+def test_a_sorted_playlist_refusing_the_position_gets_b_where_its_order_puts_it(
+    session: Session, rule: str, after: list
+) -> None:
+    acct = _sorted_playlist(rule)
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=1, failed=0, skipped=0, reordered=1, sorted_playlists=_SORTED
+    )
+    assert acct.write_calls == [
+        ("insert", "PL1", "B1", "1"),  # refused: the playlist is sorted automatically
+        ("insert", "PL1", "B1"),
+        ("delete", "i1"),
+    ]
+    assert acct.playlists["PL1"] == after
+    rows = _attempts(session, action.item_id)
+    assert [(r.kind, r.status) for r in rows] == [*_REFUSED_THEN_INSERTED, *_WRITES_AND_CHECKS[1:]]
+    assert rows[1].reason.startswith(MANUAL_SORT_REJECTED)
+    assert "manual sorting" in rows[1].reason
+    assert "sort order" in rows[2].reason
+    assert _status(session, action) == "applied"
+
+
+@pytest.mark.parametrize(
+    ("rule", "after"),
+    [
+        ("top", ["B2", "B1", "D", "v2", "v4"]),
+        # Oldest first: B1 lands after A2, so A2's and B2's indices drop by one.
+        ("end", ["D", "v2", "v4", "B1", "B2"]),
+    ],
+)
+def test_a_later_action_in_a_sorted_playlist_inserts_without_a_position(
+    session: Session, rule: str, after: list[str]
+) -> None:
+    acct = FakePlaylistAccount(
+        {"PL1": [("i0", "D"), ("i1", "A1"), ("i2", "v2"), ("i3", "A2"), ("i4", "v4")]},
+        renders={"D": None, "A1": "B1", "A2": "B2"},
+    )
+    acct.auto_sorted = {"PL1": rule}
+    diag = _diagnosis(session)
+    first, second = _action(session, diag, acct, "PL1", 1), _action(session, diag, acct, "PL1", 3)
+    states = _states(acct)
+    session.commit()
+
+    res = execute(session, [first, second], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=2, failed=0, skipped=0, reordered=2, sorted_playlists=_SORTED
+    )
+    assert acct.write_calls == [
+        ("insert", "PL1", "B1", "1"),
+        ("insert", "PL1", "B1"),
+        ("delete", "i1"),
+        ("insert", "PL1", "B2"),  # straight without a position
+        ("delete", "i3"),
+    ]
+    assert [v for _, v in acct.playlists["PL1"]] == after
+    assert acct.ytmusic("PL1") == [v for v in after if v != "D"]
+    assert _steps(session, second.item_id) == _WRITES_AND_CHECKS
+    assert (acct.youtube_reads, acct.ytm_reads) == (5, 5)
+
+
+def test_a_sorted_playlist_and_a_positional_one_in_the_same_run(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.auto_sorted = {"PL2": "top"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=3, failed=0, skipped=0, reordered=1, sorted_playlists=("T PL2",)
+    )
+    assert acct.playlists["PL1"] == [("i0", "v0"), ("new1", "B1"), ("new2", "B2")]
+    assert [v for _, v in acct.playlists["PL2"]] == ["B3", "w0"]
+
+
+def test_b_not_shown_by_ytmusic_in_a_sorted_playlist_is_removed(session: Session) -> None:
+    acct = _sorted_playlist("end")
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    unchanged = list(states["PL1"].ytmusic)
+    acct.ytm_reads_returning = {2: unchanged, 3: unchanged}
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0, failed=0, skipped=1, aborted=PLAYLIST_STOP, sorted_playlists=_SORTED
+    )
+    assert _steps(session, action.item_id) == [
+        *_REFUSED_THEN_INSERTED,
+        ("playlist_insert_verify", "applied"),
+        ("playlist_ytm_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.playlists["PL1"] == list(states["PL1"].youtube)
+
+
+def test_another_item_moved_in_a_sorted_playlist_fails_the_check(session: Session) -> None:
+    acct = _sorted_playlist("end")
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    insert = acct.insert_playlist_item
+
+    def insert_and_the_sort_moves_another(
+        playlist_id: str, video_id: str, position: int | None = None
+    ) -> str:
+        item_id = insert(playlist_id, video_id, position)
+        items = acct.playlists[playlist_id]
+        items[0], items[2] = items[2], items[0]
+        return item_id
+
+    acct.insert_playlist_item = insert_and_the_sort_moves_another  # type: ignore[method-assign]
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res.aborted == PLAYLIST_STOP
+    assert ("delete", "i1") not in acct.write_calls  # A is never deleted
+    assert ("delete", "new1") in acct.write_calls  # B removed again
+    rows = _attempts(session, action.item_id)
+    assert (rows[3].kind, rows[3].status) == ("playlist_insert_verify", "failed")
+    assert "position 1 holds ('i2', 'v2')" in rows[3].reason
+
+
+def test_an_errored_insert_in_a_sorted_playlist_landing_anywhere_is_removed_and_the_run_goes_on(
+    session: Session,
+) -> None:
+    acct, actions, states = _prepared(session)
+    acct.auto_sorted = {"PL1": "end"}
+    acct.insert_errors_after_landing = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=2, failed=1, skipped=0, reordered=1, sorted_playlists=_SORTED
+    )
+    assert _steps(session, actions[0].item_id) == [
+        *_REFUSED_THEN_INSERTED[:2],
+        ("playlist_insert", "failed"),  # landed, then errored
+        ("playlist_insert_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.write_calls[:3] == [
+        ("insert", "PL1", "B1", "1"),
+        ("insert", "PL1", "B1"),
+        ("delete", "new1"),
+    ]
+    assert [v for _, v in acct.playlists["PL1"]] == ["v0", "A1", "B2"]
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        lambda acct: acct.delete_does_not_land.add("i1"),
+        lambda acct: acct.youtube_read_errors.update(
+            {3: YouTubeWriteError("PL1", "playlist_read", "HTTP 500: boom")}
+        ),
+    ],
+    ids=["accepted", "unreadable"],
+)
+def test_an_unconfirmed_delete_in_a_sorted_playlist_undoes_nothing(session: Session, knob) -> None:
+    acct = _sorted_playlist("end")
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    knob(acct)
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res.delete_unconfirmed == (("T PL1", 2, "A1", "B1"),)
+    assert res.aborted is not None
+    assert acct.write_calls == [
+        ("insert", "PL1", "B1", "1"),
+        ("insert", "PL1", "B1"),
+        ("delete", "i1"),
+    ]
+    assert ("new1", "B1") in acct.playlists["PL1"]
+    assert _steps(session, action.item_id)[-1] == ("playlist_delete_verify", "failed")
+
+
+def test_ytmusic_off_after_the_delete_in_a_sorted_playlist_puts_a_back_where_it_sorts(
+    session: Session,
+) -> None:
+    acct = _sorted_playlist("end")
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    acct.ytm_reads_returning = {3: ["v0", "v2"], 4: ["v0", "v2"]}  # the check and its re-read
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert (res.skipped, res.restored, res.reordered, res.aborted) == (1, 1, 0, PLAYLIST_STOP)
+    assert acct.write_calls == [
+        ("insert", "PL1", "B1", "1"),
+        ("insert", "PL1", "B1"),
+        ("delete", "i1"),
+        ("insert", "PL1", "A1"),  # straight without a position
+        ("delete", "new1"),  # B removed once A is confirmed back
+    ]
+    assert acct.playlists["PL1"] == [("i0", "v0"), ("i2", "v2"), ("new2", "A1")]
+    assert _steps(session, action.item_id)[-6:] == [
+        ("playlist_delete_verify", "applied"),
+        ("playlist_check", "failed"),
+        *_RESTORE,
+        *_ROLLBACK,
+    ]
+    assert _status(session, action) == "skipped"
+
+
+def test_an_a_that_cannot_be_put_back_in_a_sorted_playlist_keeps_b(session: Session) -> None:
+    acct = _sorted_playlist("end")
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    acct.ytm_reads_returning = {3: ["v0", "v2"], 4: ["v0", "v2"]}
+    acct.insert_errors = {"A1"}
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res.left_removed == (("T PL1", 2, "A1"),)
+    assert ("delete", "new1") not in acct.write_calls
+    assert acct.playlists["PL1"] == [("i0", "v0"), ("i2", "v2"), ("new1", "B1")]

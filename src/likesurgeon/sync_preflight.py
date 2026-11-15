@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import Diagnosis, DiagnosisItem, Snapshot, SnapshotItem, SyncAttempt, Track
+from .playlist_dispatch import MANUAL_SORT_REJECTED
 from .snapshot import (
     YOUTUBE_LIKED_VIDEOS,
     YOUTUBE_PLAYLIST,
@@ -163,7 +164,8 @@ def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, st
     Per item, in row order, only an applied ``playlist_check`` or
     ``playlist_rollback_verify`` settles it. An item is listed when, after its
     last settling row, a write row was sent (any ``_PLAYLIST_WRITE_KINDS`` row
-    but a quota-rejected one, ``playlist_interrupted`` included). Prechecks,
+    but one refused outright — by the quota, or an automatically sorted
+    playlist refusing a position — ``playlist_interrupted`` included). Prechecks,
     verifies and reads change nothing, so they never settle. An action is
     dropped once a YT Music and a YouTube scan of the same playlist are both
     newer than its last write row: the next report shows what the playlist holds.
@@ -182,7 +184,9 @@ def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, st
     ):
         if (kind, status) in _PLAYLIST_SETTLING:
             last_write[item_id] = None
-        elif kind in _PLAYLIST_WRITE_KINDS and not (reason or "").startswith(QUOTA_REJECTED):
+        elif kind in _PLAYLIST_WRITE_KINDS and not (reason or "").startswith(
+            (QUOTA_REJECTED, MANUAL_SORT_REJECTED)
+        ):
             last_write[item_id] = at
     listed: list[tuple[str, int, str, str]] = []
     for item_id, at in last_write.items():

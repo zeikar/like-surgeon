@@ -406,6 +406,7 @@ def _summary_quota(n_items: int, n_actions: int) -> str:
     text = summarize(actions, {"PLa": state})
     assert f"Actions: {n_actions}" in text
     assert "Playlists: 1" in text
+    assert "automatically sorted playlist" in text and "50 units" in text
     return text
 
 

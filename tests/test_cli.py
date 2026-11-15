@@ -3610,7 +3610,9 @@ class _FakePlaylistYouTube:
     def has_write_scope(self) -> bool:
         return type(self).has_write_scope_return
 
-    def insert_playlist_item(self, playlist_id: str, video_id: str, position: int) -> str:
+    def insert_playlist_item(
+        self, playlist_id: str, video_id: str, position: int | None = None
+    ) -> str:
         return type(self).account.insert_playlist_item(playlist_id, video_id, position)
 
     def delete_playlist_item(self, item_id: str) -> None:
@@ -3829,6 +3831,23 @@ def test_repoint_playlists_apply_replaces_a_with_b(
     assert "quota" in out.lower()
     assert "Playlist repoint result: applied=1 failed=0 skipped=0 restored=0" in out
     assert "run likesurgeon scan playlists and likesurgeon repoint-playlists again" in out
+
+
+def test_repoint_playlists_apply_names_automatically_sorted_playlists(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _one_pair(fake_home)
+    account.auto_sorted = {"PLmix": "end"}
+
+    result = _apply("--yes")
+
+    assert result.exit_code == 0, result.output
+    assert [v for _, v in account.playlists["PLmix"]] == ["v1", "v3", "B"]
+    assert [st for *_, st in _playlist_findings(fake_home)] == ["applied"]
+    out = _out(result)
+    assert "applied=1 failed=0" in out
+    assert "1 repoint(s) in automatically sorted playlists" in out
+    assert "sort order puts it (not A's old position): [Mix] PLmix" in out
 
 
 def test_repoint_playlists_apply_limit_takes_the_smallest_playlist_first(

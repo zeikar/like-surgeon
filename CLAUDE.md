@@ -37,12 +37,13 @@ Spec: [docs/design/canonicalize.md](docs/design/canonicalize.md). Gotchas:
 Spec: [docs/design/playlist-repoint.md](docs/design/playlist-repoint.md). Gotchas:
 
 - Reports are `Diagnosis.kind = 'playlists'` (`playlist_relinked`, built on a `playlist_scan_id`); `latest_diagnosis()` defaults to `kind IS NULL`, so `sync` and `doctor` never see them. `--apply` exits 1 when a newer playlist scan exists than the report's.
-- Never delete A's item before both sides confirm B at its position. Never remove B unless A's item is known to be in place, so not after an unconfirmed delete (it may still land; report `delete_unconfirmed` and stop) and not when A can't be put back (`left_removed`). An insert that isn't listed, 2xx or errored, may still land and is not skipped: B goes to `left_inserted`, the item stays open and the run stops.
+- Never delete A's item before both sides confirm B at its position (anywhere in an automatically sorted playlist). Never remove B unless A's item is known to be in place, so not after an unconfirmed delete (it may still land; report `delete_unconfirmed` and stop) and not when A can't be put back (`left_removed`). An insert that isn't listed, 2xx or errored, may still land and is not skipped: B goes to `left_inserted`, the item stays open and the run stops.
 - Playlist skips carry over per playlist (`carry_over_skipped` also keys on A's playlist id).
 - Only an applied `playlist_check` or `playlist_rollback_verify` settles an action. `unsettled_playlist_actions` lists the rest, and its warning is retired only by newer snapshots of that playlist on both sides.
 - `playlist_*` rows stay out of `_WRITE_KINDS` and `_SETTLING_KINDS`: they never block `sync` or feed the stranded-likes list. Never rate or touch likes here.
 - A playlist whose live state differs from the scan gets no writes (items stay `open`, other playlists continue); an unreadable side, an undo or quota exhaustion stops the run. A wrong B that YT Music renders as itself passes every check, so the same-recording check and the report review are the guard.
-- Quota: about 100 units per item (insert and delete, 50 each) plus the playlist reads; undo calls and re-reads aren't estimated. Exits 1 on quota exhaustion.
+- Automatically sorted playlists: a positional insert gets HTTP 400 `manualSortRequired` (`PlaylistManualSortRequired`). The dispatcher records that row as `MANUAL_SORT_REJECTED` (not sent, like `QUOTA_REJECTED`, so `unsettled_playlist_actions` ignores it), switches the playlist to `sorted` for the run and inserts without a position. Every check except B's removal goes through `_only_change` (one moving element, everything else unchanged), with an index in a positional playlist and anywhere in a sorted one. Don't add per-mode comparisons. Applied repoints shift later actions' indices (`moves`, identity when positional); the precheck still requires A and B at the shifted indices.
+- Quota: about 100 units per item (insert and delete, 50 each) plus the playlist reads; undo calls, re-reads and the one refused insert per sorted playlist aren't estimated. Exits 1 on quota exhaustion.
 
 ## Releases
 

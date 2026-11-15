@@ -12,6 +12,7 @@ from google.auth.exceptions import RefreshError
 from likesurgeon.youtube_client import (
     AuthorizationRequiredError,
     ClientSecretsMissingError,
+    PlaylistManualSortRequired,
     YouTubeClient,
     YouTubeQuotaExceededError,
     YouTubeWriteError,
@@ -1748,6 +1749,40 @@ def test_insert_playlist_item_sends_one_insert_and_returns_new_item_id():
             },
         }
     ]
+
+
+def test_insert_playlist_item_without_a_position_omits_it():
+    c = _FakeClient([])
+    assert c.insert_playlist_item("PL_x", "vidB") == "PLI_new"
+    assert "position" not in c._fake_pi.insert_calls[0]["body"]["snippet"]
+
+
+_MANUAL_SORT = "Playlist should use manual sorting to support position."
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(400, _MANUAL_SORT, reason="manualSortRequired"),
+        _http_error(400, _MANUAL_SORT),  # no reason in the body: the message decides
+    ],
+    ids=["reason", "message"],
+)
+def test_insert_playlist_item_into_an_automatically_sorted_playlist_is_its_own_error(error):
+    c = _FakeClient([])
+    c._fake_pi.write_error = error
+    with pytest.raises(PlaylistManualSortRequired) as exc_info:
+        c.insert_playlist_item("PL_x", "vidB", 3)
+    assert "HTTP 400" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_insert_playlist_item_other_400_is_a_plain_write_error():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(400, "Bad request.", reason="invalidValue")
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.insert_playlist_item("PL_x", "vidB", 3)
+    assert not isinstance(exc_info.value, PlaylistManualSortRequired)
 
 
 def test_insert_playlist_item_http_error_has_status_and_reason_but_no_url():

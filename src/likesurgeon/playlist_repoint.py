@@ -263,7 +263,8 @@ def summarize(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistSt
     """Human-readable plan summary with the clean-path quota estimate.
 
     Each action is an insert and a delete plus a read after each; each playlist
-    is read once as its baseline. Re-reads and undo calls aren't estimated.
+    is read once as its baseline. Re-reads, undo calls and the positional
+    insert an automatically sorted playlist refuses aren't estimated.
     """
     quota = 0
     for playlist_id in {a.playlist_id for a in actions}:
@@ -276,5 +277,7 @@ def summarize(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistSt
         f"  Actions: {len(actions)}",
         f"  Playlists: {len({a.playlist_id for a in actions})}",
         *quota_lines(quota),
+        "  An automatically sorted playlist refuses the first insert with a position: "
+        "one more insert (50 units) per such playlist, not in the estimate",
     ]
     return "\n".join(lines)

@@ -76,6 +76,13 @@ class YouTubeQuotaExceededError(YouTubeWriteError):
     re-like of a video it unliked)."""
 
 
+class PlaylistManualSortRequired(YouTubeWriteError):
+    """``playlistItems.insert`` with a position was refused (HTTP 400
+    ``manualSortRequired``) because the playlist is sorted automatically.
+    Nothing was added; an insert without a position is accepted and lands
+    where the playlist's sort order puts it."""
+
+
 @dataclass(frozen=True)
 class VideoStatus:
     """Result of a single video's availability check.
@@ -131,14 +138,21 @@ _RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
 
 def _error_reasons_403(exc: Any) -> set[str]:
-    """Extract ``error.errors[].reason`` values from a 403's JSON body.
+    """``_error_reasons`` of a 403; empty for any other status."""
+    if getattr(getattr(exc, "resp", None), "status", None) != 403:
+        return set()
+    return _error_reasons(exc)
+
+
+def _error_reasons(exc: Any) -> set[str]:
+    """Extract ``error.errors[].reason`` values from an HttpError's JSON body.
 
     The HTTP-level `e.resp.reason` is just "Forbidden" for any 403, so we
     parse `e.content` (bytes) instead — the body's `error.errors[].reason`
     field is what carries `quotaExceeded` / `dailyLimitExceeded` /
     `rateLimitExceeded`.
 
-    Defensive at every shape boundary: non-403 responses, missing bodies,
+    Defensive at every shape boundary: missing bodies,
     non-UTF-8 bytes, malformed JSON, or any payload whose shape doesn't
     precisely match `{"error": {"errors": [{"reason": ...}, ...]}}` all
     return an empty set rather than raising. We'd rather mis-classify an
@@ -148,8 +162,6 @@ def _error_reasons_403(exc: Any) -> set[str]:
     """
     import json
 
-    if getattr(getattr(exc, "resp", None), "status", None) != 403:
-        return set()
     content = getattr(exc, "content", None)
     if not content:
         return set()
@@ -176,6 +188,17 @@ def _is_quota_exceeded(exc: Any) -> bool:
 def _is_rate_limited(exc: Any) -> bool:
     """403 short-window throttling — retryable like a 429."""
     return bool(_error_reasons_403(exc) & _RATE_LIMIT_REASONS)
+
+
+def _is_manual_sort_required(exc: Any) -> bool:
+    """A 400 refusing a position because the playlist is sorted automatically.
+    Seen live as ``Playlist should use manual sorting to support position.``;
+    the message is the fallback when the body carries no reason."""
+    if getattr(getattr(exc, "resp", None), "status", None) != 400:
+        return False
+    return "manualSortRequired" in _error_reasons(exc) or (
+        "manual sorting" in str(getattr(exc, "reason", "")).lower()
+    )
 
 
 def _classify_status(
@@ -588,23 +611,31 @@ class YouTubeClient:
             message = f"HTTP {exc.status_code}: {exc.reason}"
             if _is_quota_exceeded(exc):
                 raise YouTubeQuotaExceededError(subject, op, message) from exc
+            if _is_manual_sort_required(exc):
+                raise PlaylistManualSortRequired(subject, op, message) from exc
             raise YouTubeWriteError(subject, op, message) from exc
         except Exception as exc:  # noqa: BLE001 — system-boundary catch
             raise YouTubeWriteError(subject, op, str(exc)) from exc
 
-    def insert_playlist_item(self, playlist_id: str, video_id: str, position: int) -> str:
+    def insert_playlist_item(
+        self, playlist_id: str, video_id: str, position: int | None = None
+    ) -> str:
         """Insert ``video_id`` at ``position`` via ``playlistItems.insert`` (50 units).
+
+        Without a position the item lands where YouTube puts it: at the end,
+        or where an automatically sorted playlist's sort order says. Such a
+        playlist refuses a position (``PlaylistManualSortRequired``).
 
         Returns the new playlist item id, which the caller needs to remove the
         item again.
         """
-        body = {
-            "snippet": {
-                "playlistId": playlist_id,
-                "position": position,
-                "resourceId": {"kind": "youtube#video", "videoId": video_id},
-            }
+        snippet: dict[str, Any] = {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
         }
+        if position is not None:
+            snippet["position"] = position
+        body = {"snippet": snippet}
         response = self._playlist_call(
             video_id,
             "playlist_insert",

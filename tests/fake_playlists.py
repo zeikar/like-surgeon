@@ -5,6 +5,11 @@ YouTube side, ``(playlist item id, video id)`` in order, and the YT Music side
 is derived from it on every read — each item shows as
 ``renders.get(video, video)``, or not at all when that is ``None``. Inserting
 a blocked A again therefore shows its B in that slot, as seen live.
+
+A playlist in ``auto_sorted`` is sorted automatically: like the live API, it
+refuses an insert with a position (HTTP 400, ``PlaylistManualSortRequired``)
+and puts an insert without one where its rule says, ``"top"`` (newest first)
+or ``"end"`` (oldest first). A manually sorted playlist appends it.
 """
 
 from __future__ import annotations
@@ -12,7 +17,11 @@ from __future__ import annotations
 from itertools import count
 from typing import Any
 
-from likesurgeon.youtube_client import YouTubeQuotaExceededError, YouTubeWriteError
+from likesurgeon.youtube_client import (
+    PlaylistManualSortRequired,
+    YouTubeQuotaExceededError,
+    YouTubeWriteError,
+)
 
 
 class FakePlaylistAccount:
@@ -29,6 +38,7 @@ class FakePlaylistAccount:
         self.insert_errors: set[str] = set()  # can't be inserted: raises, nothing lands
         self.insert_errors_after_landing: set[str] = set()  # lands, then raises
         self.insert_lands_at_end: set[str] = set()  # position ignored
+        self.auto_sorted: dict[str, str] = {}  # playlist id -> "top" | "end"
         self.delete_does_not_land: set[str] = set()  # returns OK, changes nothing
         self.delete_errors: set[str] = set()  # raises, nothing lands
         self.delete_errors_after_landing: set[str] = set()  # lands, then raises
@@ -73,15 +83,32 @@ class FakePlaylistAccount:
 
     # --- YouTubeClient surface -------------------------------------------
 
-    def insert_playlist_item(self, playlist_id: str, video_id: str, position: int) -> str:
+    def insert_playlist_item(
+        self, playlist_id: str, video_id: str, position: int | None = None
+    ) -> str:
         self._youtube_call(video_id, "playlist_insert")  # quota-rejected: not recorded as sent
-        self.write_calls.append(("insert", playlist_id, video_id, str(position)))
+        # An insert without a position is recorded without one.
+        self.write_calls.append(
+            ("insert", playlist_id, video_id)
+            if position is None
+            else ("insert", playlist_id, video_id, str(position))
+        )
+        rule = self.auto_sorted.get(playlist_id)
+        if rule is not None and position is not None:
+            raise PlaylistManualSortRequired(
+                video_id,
+                "playlist_insert",
+                "HTTP 400: Playlist should use manual sorting to support position.",
+            )
         if video_id in self.insert_errors:
             raise YouTubeWriteError(video_id, "playlist_insert", "HTTP 403: forbidden")
         item_id = f"new{next(self._new_ids)}"
         if video_id not in self.insert_does_not_land:
             items = self.playlists[playlist_id]
-            at = len(items) if video_id in self.insert_lands_at_end else position
+            if video_id in self.insert_lands_at_end or (position is None and rule != "top"):
+                at = len(items)
+            else:
+                at = 0 if position is None else position
             items.insert(at, (item_id, video_id))
         if video_id in self.insert_errors_after_landing:
             raise YouTubeWriteError(video_id, "playlist_insert", "timed out")

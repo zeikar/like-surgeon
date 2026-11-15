@@ -1516,6 +1516,12 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
             "the playlist as expected, so the change was reverted and the finding marked "
             f"'skipped'. See [cyan]likesurgeon issues --type {ISSUE_PLAYLIST_RELINKED}[/cyan]."
         )
+    if result.reordered:
+        console.print(
+            f"[yellow]{result.reordered} repoint(s) in automatically sorted playlists:[/yellow] "
+            "B went where each playlist's sort order puts it (not A's old position): "
+            + ", ".join(escape(t) for t in result.sorted_playlists)
+        )
     if result.stale_playlists:
         title = {a.playlist_id: a.playlist_title for a in actions}
         console.print(
@@ -1537,20 +1543,20 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
     # Each independent of ``aborted``: a delete can go unconfirmed on a read error too.
     if result.left_inserted:
         console.print(
-            "[bold red]A repoint inserted B and it may still be in the playlist next to A; "
-            "remove it by hand:[/bold red] "
+            "[bold red]A repoint inserted B and it may still be in the playlist (next to A, "
+            "or where an automatically sorted playlist puts it); remove it by hand:[/bold red] "
             + "; ".join(f"{escape(t)} position {pos}: {b}" for t, pos, b in result.left_inserted)
         )
     if result.left_removed:
         console.print(
-            "[bold red]A repoint deleted A and it may not be back (B stays in its slot); "
+            "[bold red]A repoint deleted A and it may not be back (B stays in); "
             "add A back by hand at its position:[/bold red] "
             + "; ".join(f"{escape(t)} position {pos}: {a}" for t, pos, a in result.left_removed)
         )
     if result.delete_unconfirmed:
         console.print(
             "[bold red]A's delete was sent but couldn't be confirmed, so nothing was undone "
-            "and B was kept at A's position:[/bold red] "
+            "and B was kept:[/bold red] "
             + "; ".join(
                 f"{escape(t)} position {pos}: {a} (kept {b})"
                 for t, pos, a, b in result.delete_unconfirmed

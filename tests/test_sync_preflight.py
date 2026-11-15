@@ -15,6 +15,7 @@ from likesurgeon.models import (
     SyncAttempt,
     Track,
 )
+from likesurgeon.playlist_dispatch import MANUAL_SORT_REJECTED
 from likesurgeon.snapshot import create_snapshot
 from likesurgeon.sync_dispatch import QUOTA_REJECTED
 from likesurgeon.sync_preflight import (
@@ -632,6 +633,12 @@ CLEAN = [
         [*CLEAN[:3], ("playlist_rollback", "failed")],
         [*CLEAN[:3], ("playlist_rollback", "failed", f"{QUOTA_REJECTED}: x")],
         [("playlist_precheck", "applied"), ("playlist_insert", "failed", "boom")],
+        # the unpositioned insert sent after an automatically sorted playlist refused a position
+        [
+            ("playlist_precheck", "applied"),
+            ("playlist_insert", "failed", f"{MANUAL_SORT_REJECTED}: x"),
+            ("playlist_insert", "applied"),
+        ],
         # B removed but never confirmed gone
         [*CLEAN[:3], ("playlist_rollback", "applied"), ("playlist_rollback_verify", "failed")],
     ],
@@ -655,6 +662,12 @@ def test_unsettled_playlist_action_is_listed(session: Session, rows: list) -> No
         ],
         [*CLEAN[:3], ("playlist_rollback", "applied"), ("playlist_rollback_verify", "applied")],
         [("playlist_precheck", "applied"), ("playlist_insert", "failed", f"{QUOTA_REJECTED}: x")],
+        # refused a position (sorted playlist), then the retry hit the quota: nothing sent
+        [
+            ("playlist_precheck", "applied"),
+            ("playlist_insert", "failed", f"{MANUAL_SORT_REJECTED}: x"),
+            ("playlist_insert", "failed", f"{QUOTA_REJECTED}: x"),
+        ],
         [("playlist_precheck", "failed")],
         # an errored delete that landed passes both checks: still settled
         [*CLEAN[:4], ("playlist_delete", "failed", "boom"), *CLEAN[5:]],
