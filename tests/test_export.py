@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from likesurgeon.export import export_snapshot_json
-from likesurgeon.snapshot import create_snapshot
+from likesurgeon.snapshot import PlaylistRead, create_playlist_scan, create_snapshot
 
 
 def _item(video_id: str, title: str, artists: list[str]) -> dict:
@@ -71,3 +71,42 @@ def test_export_youtube_snapshot_keeps_dict_thumbnails(session: Session):
     payload = json.loads(export_snapshot_json(session, snap.id))
     assert payload["tracks"][0]["video_id"] == "v1"
     assert payload["tracks"][0]["thumbnails"] == thumbs
+
+
+def test_export_empty_playlist_keeps_its_identity_and_header(session: Session):
+    create_playlist_scan(
+        session,
+        [
+            PlaylistRead(
+                "PLempty",
+                "Empty One",
+                {
+                    "id": "PLempty",
+                    "title": "Empty One",
+                    "description": "nothing yet",
+                    "owned": True,
+                    "tracks": [],
+                },
+                None,
+            )
+        ],
+    )
+    session.commit()
+
+    payload = json.loads(export_snapshot_json(session, 1))
+    assert payload["tracks"] == []
+    snap = payload["snapshot"]
+    assert (snap["playlist_id"], snap["playlist_title"], snap["playlist_owned"]) == (
+        "PLempty",
+        "Empty One",
+        True,
+    )
+    assert snap["playlist_header"]["description"] == "nothing yet"
+
+
+def test_export_likes_snapshot_has_no_playlist_fields(session: Session):
+    snap = create_snapshot(session, "ytmusic_liked_songs", [])
+    session.commit()
+
+    keys = set(json.loads(export_snapshot_json(session, snap.id))["snapshot"])
+    assert keys == {"id", "source", "created_at", "raw_count"}

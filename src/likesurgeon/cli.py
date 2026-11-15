@@ -44,6 +44,7 @@ from .pipeline import MissingSnapshotsError, compare_and_persist
 from .playlists import is_backed_up, playlist_report
 from .snapshot import (
     PlaylistRead,
+    add_youtube_playlist_snapshot,
     create_playlist_scan,
     create_snapshot,
     get_snapshot_items,
@@ -497,20 +498,24 @@ def scan_playlists() -> None:
             code=2,
         )
 
-    # YouTube is only asked for playlists YT Music backed up: a report row needs both.
+    # Committed before any YouTube call: that stage is advisory and can be long or
+    # interrupted, and must not cost the backup already read.
     read_ids = [playlist_id for playlist_id in titles if playlist_id in results]
-    youtube_items = _youtube_playlist_items(cfg, read_ids, titles)
-    reads = [
-        PlaylistRead(pid, titles[pid], results[pid], youtube_items.get(pid)) for pid in read_ids
-    ]
+    reads = [PlaylistRead(pid, titles[pid], results[pid], None) for pid in read_ids]
     with session_scope(factory) as session:
-        scan = create_playlist_scan(session, reads)
-        tracks = sum(len(r.ytmusic["tracks"]) for r in reads)
-        console.print(
-            f"[green]✓[/green] Playlist scan [bold]#{scan.id}[/bold] stored "
-            f"({len(reads)} playlists, {tracks} tracks; {skipped}). "
-            "Run [cyan]likesurgeon playlists[/cyan] for the report."
-        )
+        scan_id = create_playlist_scan(session, reads).id
+
+    # YouTube is only asked for playlists YT Music backed up: a report row needs both.
+    youtube_items = _youtube_playlist_items(cfg, read_ids, titles)
+    with session_scope(factory) as session:
+        for pid, items in youtube_items.items():
+            add_youtube_playlist_snapshot(session, scan_id, pid, titles[pid], items)
+    tracks = sum(len(r.ytmusic["tracks"]) for r in reads)
+    console.print(
+        f"[green]✓[/green] Playlist scan [bold]#{scan_id}[/bold] stored "
+        f"({len(reads)} playlists, {tracks} tracks; {skipped}). "
+        "Run [cyan]likesurgeon playlists[/cyan] for the report."
+    )
 
 
 def _youtube_playlist_items(

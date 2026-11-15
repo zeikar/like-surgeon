@@ -434,8 +434,8 @@ def test_scan_playlists_backs_up_ordinary_playlists(
         1,
         [
             ("ytmusic_playlist", "PLroad", "Road Trip"),
-            ("youtube_playlist", "PLroad", "Road Trip"),
             ("ytmusic_playlist", "PLnight", "Late Night"),
+            ("youtube_playlist", "PLroad", "Road Trip"),
         ],
     )
     out = _out(result)
@@ -588,6 +588,27 @@ def test_scan_playlists_survives_a_youtube_read_failure(
     ]
 
 
+def test_scan_playlists_keeps_the_ytmusic_backup_when_the_youtube_stage_is_interrupted(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    _, yt = patch_playlist_clients
+    yt.playlists_error = KeyboardInterrupt()
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code != 0
+    assert _playlist_state(fake_home) == (
+        1,
+        [
+            ("ytmusic_playlist", "PLroad", "Road Trip"),
+            ("ytmusic_playlist", "PLnight", "Late Night"),
+        ],
+    )
+
+
 def test_scan_playlists_lists_playlists_youtube_cannot_read(
     fake_home: Path,
     patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
@@ -702,7 +723,7 @@ def test_playlists_lists_one_row_per_playlist(
     # id, title, own, YT Music count, music %, music / UGC / other, YouTube count, dead
     assert "1 [Live] Road Trip own 2 50% 1 1 0 3 0" in out
     # PLnight has no YouTube side: placeholders, not zeros.
-    assert "3 Late Night own 1 100% 1 0 0 - -" in out
+    assert "2 Late Night own 1 100% 1 0 0 - -" in out
     assert "dead items" not in out
     assert "auth youtube" not in out  # one playlist has a YouTube side
 

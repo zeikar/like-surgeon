@@ -303,15 +303,31 @@ def create_playlist_scan(session: Session, reads: Iterable[PlaylistRead]) -> Pla
             {k: v for k, v in read.ytmusic.items() if k not in _HEADER_EXCLUDED},
             ensure_ascii=False,
         )
-        sides = [ytm]
+        ytm.playlist_scan_id = scan.id
+        ytm.playlist_id = read.playlist_id
+        ytm.playlist_title = read.title
         if read.youtube_items is not None:
-            sides.append(create_snapshot(session, YOUTUBE_PLAYLIST, read.youtube_items))
-        for snap in sides:
-            snap.playlist_scan_id = scan.id
-            snap.playlist_id = read.playlist_id
-            snap.playlist_title = read.title
+            add_youtube_playlist_snapshot(
+                session, scan.id, read.playlist_id, read.title, read.youtube_items
+            )
     session.flush()
     return scan
+
+
+def add_youtube_playlist_snapshot(
+    session: Session,
+    scan_id: int,
+    playlist_id: str,
+    title: str,
+    items: Iterable[dict[str, Any]],
+) -> Snapshot:
+    """Attach a ``youtube_playlist`` snapshot to an existing scan, so the YT Music
+    backup can be committed before the advisory YouTube read."""
+    snap = create_snapshot(session, YOUTUBE_PLAYLIST, items)
+    snap.playlist_scan_id = scan_id
+    snap.playlist_id = playlist_id
+    snap.playlist_title = title
+    return snap
 
 
 def list_snapshots(session: Session) -> list[Snapshot]:
