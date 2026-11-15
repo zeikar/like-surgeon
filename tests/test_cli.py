@@ -58,10 +58,19 @@ class _FakeYouTubeClient:
     # Defaults to the one item fetch_liked_videos returns, i.e. nothing hidden.
     likes_item_count: int = 1
     likes_item_count_error: Exception | None = None
+    # `scan playlists`: items per playlist id, per-playlist errors, an error
+    # fetch_playlists raises, and the ids each call received.
+    constructed: bool = False
+    playlists: dict[str, list[dict[str, Any]]] = {}
+    playlist_errors: dict[str, str] = {}
+    playlists_error: Exception | None = None
+    playlist_reads: list[list[str]] = []
+    status_reads: list[list[str]] = []
+    statuses_error: Exception | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         # Accept and ignore client_secrets_path / token_path / etc.
-        pass
+        type(self).constructed = True
 
     def fetch_liked_videos(self, limit: int | None = None) -> list[dict[str, Any]]:
         type(self).fetch_limit = limit
@@ -82,7 +91,20 @@ class _FakeYouTubeClient:
     ) -> dict[str, VideoStatus]:
         type(self).last_user_region = user_region
         type(self).fetch_called = True
+        type(self).status_reads.append(list(video_ids))
+        if type(self).statuses_error is not None:
+            raise type(self).statuses_error
         return {vid: VideoStatus(is_available=True, reason=None) for vid in video_ids}
+
+    def fetch_playlists(
+        self, playlist_ids: list[str]
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+        type(self).playlist_reads.append(list(playlist_ids))
+        if type(self).playlists_error is not None:
+            raise type(self).playlists_error
+        errors = {i: m for i, m in type(self).playlist_errors.items() if i in playlist_ids}
+        results = {i: type(self).playlists[i] for i in playlist_ids if i not in errors}
+        return results, errors
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +115,18 @@ def _reset_fake_client() -> Iterable[None]:
     _FakeYouTubeClient.fetch_limit = "<unset-sentinel>"
     _FakeYouTubeClient.likes_item_count = 1
     _FakeYouTubeClient.likes_item_count_error = None
+    _FakeYouTubeClient.constructed = False
+    _FakeYouTubeClient.playlists = {}
+    _FakeYouTubeClient.playlist_errors = {}
+    _FakeYouTubeClient.playlists_error = None
+    _FakeYouTubeClient.playlist_reads = []
+    _FakeYouTubeClient.status_reads = []
+    _FakeYouTubeClient.statuses_error = None
+    _FakeYTMusicPlaylists.library = []
+    _FakeYTMusicPlaylists.library_error = None
+    _FakeYTMusicPlaylists.playlists = {}
+    _FakeYTMusicPlaylists.playlist_errors = {}
+    _FakeYTMusicPlaylists.playlist_reads = []
     yield
 
 
@@ -264,6 +298,345 @@ def test_scan_commands_reject_limit(
     assert result.exit_code == 2, result.output
     assert "No such option" in result.output
     assert patch_youtube_client.fetch_called is False
+
+
+class _FakeYTMusicPlaylists:
+    """``YTMusicClient`` for `scan playlists`: class-level library entries and
+    ``get_playlist`` dicts by id; records the ids each ``fetch_playlists`` got."""
+
+    library: list[dict[str, Any]] = []
+    library_error: Exception | None = None
+    playlists: dict[str, dict[str, Any]] = {}
+    playlist_errors: dict[str, str] = {}
+    playlist_reads: list[list[str]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
+    def fetch_library_playlists(self) -> list[dict[str, Any]]:
+        if type(self).library_error is not None:
+            raise type(self).library_error
+        return [dict(p) for p in type(self).library]
+
+    def fetch_playlists(self, playlist_ids: Iterable[str]) -> tuple[dict, dict]:
+        ids = list(playlist_ids)
+        type(self).playlist_reads.append(ids)
+        errors = {i: m for i, m in type(self).playlist_errors.items() if i in ids}
+        results = {i: type(self).playlists[i] for i in ids if i not in errors}
+        return results, errors
+
+
+def _ytm_track(video_id: str) -> dict[str, Any]:
+    return {
+        "videoId": video_id,
+        "title": f"Track {video_id}",
+        "artists": [{"name": "Invented Artist"}],
+        "videoType": "MUSIC_VIDEO_TYPE_ATV",
+    }
+
+
+def _yt_item(video_id: str) -> dict[str, Any]:
+    return {
+        "snippet": {
+            "title": f"Track {video_id}",
+            "channelTitle": "Invented Channel",
+            "resourceId": {"videoId": video_id},
+        },
+        "contentDetails": {"videoId": video_id},
+    }
+
+
+@pytest.fixture
+def patch_playlist_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]]:
+    """Default data: a library with the generated/system ids `LM`, `SE`, an
+    `LRSR…` and an `LRYR…` (all skipped) plus two ordinary playlists. `PLroad`
+    reads on both sides (its YouTube copy repeats `v1`); YouTube can't see
+    `PLnight`."""
+    import likesurgeon.cli as _cli_mod
+
+    ytm, yt = _FakeYTMusicPlaylists, _FakeYouTubeClient
+    ytm.library = [
+        {"playlistId": "LM", "title": "Liked Music"},
+        {"playlistId": "SE", "title": "Episodes for Later"},
+        {"playlistId": "LRSRmix", "title": "Supermix"},
+        {"playlistId": "LRYRmix", "title": "Replay Mix"},
+        {"playlistId": "PLroad", "title": "Road Trip"},
+        {"playlistId": "PLnight", "title": "Late Night"},
+    ]
+    ytm.playlists = {
+        "PLroad": {
+            "id": "PLroad",
+            "title": "Road Trip",
+            "owned": True,
+            "tracks": [
+                _ytm_track("v1"),
+                _ytm_track("v2"),
+            ],
+        },
+        "PLnight": {
+            "id": "PLnight",
+            "title": "Late Night",
+            "owned": True,
+            "tracks": [
+                _ytm_track("v3"),
+            ],
+        },
+    }
+    yt.playlists = {"PLroad": [_yt_item("v1"), _yt_item("v2"), _yt_item("v1")]}
+    yt.playlist_errors = {"PLnight": "HTTP 404: Not Found"}
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", ytm)
+    monkeypatch.setattr(_yt_mod, "YouTubeClient", yt)
+    return ytm, yt
+
+
+def _playlist_state(home: Path) -> tuple[int, list[tuple[str, str, str]]]:
+    """(PlaylistScan count, every playlist snapshot as (source, id, title))."""
+    from sqlalchemy import func, select
+
+    from likesurgeon.models import PlaylistScan, Snapshot
+
+    s = _open_db(home)
+    try:
+        scans = s.scalar(select(func.count()).select_from(PlaylistScan))
+        snaps = [
+            (snap.source, snap.playlist_id, snap.playlist_title)
+            for snap in s.scalars(
+                select(Snapshot).where(Snapshot.playlist_scan_id.is_not(None)).order_by(Snapshot.id)
+            )
+        ]
+        return scans, snaps
+    finally:
+        s.close()
+
+
+def test_scan_playlists_backs_up_ordinary_playlists(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+
+    (fake_home / "config.json").write_text(json.dumps({"region": "KR"}))
+    ytm, yt = patch_playlist_clients
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert ytm.playlist_reads == [["PLroad", "PLnight"]]
+    assert yt.playlist_reads == [["PLroad", "PLnight"]]
+    assert yt.status_reads == [["v1", "v2"]]
+    assert yt.last_user_region == "KR"
+    assert _playlist_state(fake_home) == (
+        1,
+        [
+            ("ytmusic_playlist", "PLroad", "Road Trip"),
+            ("youtube_playlist", "PLroad", "Road Trip"),
+            ("ytmusic_playlist", "PLnight", "Late Night"),
+        ],
+    )
+    out = _out(result)
+    assert "Playlist scan #1 stored" in out
+    assert "2 playlists" in out
+    assert "3 tracks" in out
+    assert "4 generated or system playlists skipped" in out
+    assert "likesurgeon playlists" in out
+
+
+@pytest.mark.parametrize("library_ids", [[], ["LM", "SE", "LRSRmix"]])
+def test_scan_playlists_with_nothing_to_back_up_stores_an_empty_scan(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+    library_ids: list[str],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    ytm.library = [{"playlistId": i, "title": i} for i in library_ids]
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert _playlist_state(fake_home) == (1, [])
+    assert "No playlists to back up" in _out(result)
+    assert yt.constructed is False
+
+
+def test_scan_playlists_fails_when_the_library_read_fails(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    ytm, yt = patch_playlist_clients
+    ytm.library_error = UnexpectedResponseError("library page [changed]")
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 2, result.output
+    assert "library page [changed]" in _out(result)
+    assert _playlist_state(fake_home) == (0, [])
+    assert yt.constructed is False
+
+
+def test_scan_playlists_fails_when_every_playlist_is_unreadable(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    ytm.playlist_errors = {"PLroad": "KeyError: 'contents'", "PLnight": "KeyError: 'contents'"}
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 2, result.output
+    out = _out(result)
+    assert "Road Trip" in out and "Late Night" in out
+    assert "Could not read any of the 2 playlists" in out
+    assert _playlist_state(fake_home) == (0, [])
+    assert yt.constructed is False
+
+
+def test_scan_playlists_warns_about_one_unreadable_playlist_and_stores_the_rest(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    ytm.library[5]["title"] = "Late [bold]Night"
+    ytm.playlist_errors = {"PLnight": "KeyError: 'contents'"}
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "Late [bold]Night" in out
+    assert "KeyError: 'contents'" in out
+    # YouTube is only asked for what YT Music backed up.
+    assert yt.playlist_reads == [["PLroad"]]
+    assert _playlist_state(fake_home) == (
+        1,
+        [
+            ("ytmusic_playlist", "PLroad", "Road Trip"),
+            ("youtube_playlist", "PLroad", "Road Trip"),
+        ],
+    )
+
+
+def test_scan_playlists_falls_back_to_the_id_for_an_untitled_playlist(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, _ = patch_playlist_clients
+    del ytm.library[4]["title"]
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert ("ytmusic_playlist", "PLroad", "PLroad") in _playlist_state(fake_home)[1]
+
+
+@pytest.mark.parametrize("error_name", ["AuthorizationRequiredError", "ClientSecretsMissingError"])
+def test_scan_playlists_without_youtube_auth_stores_the_ytmusic_side(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+    error_name: str,
+) -> None:
+    from likesurgeon.cli import app
+
+    _, yt = patch_playlist_clients
+    yt.playlists_error = getattr(_yt_mod, error_name)("no token")
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert "auth youtube" in _out(result)
+    assert yt.status_reads == []
+    assert _playlist_state(fake_home) == (
+        1,
+        [
+            ("ytmusic_playlist", "PLroad", "Road Trip"),
+            ("ytmusic_playlist", "PLnight", "Late Night"),
+        ],
+    )
+
+
+def test_scan_playlists_survives_a_youtube_read_failure(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    _, yt = patch_playlist_clients
+    yt.playlists_error = RuntimeError("transport [down]")
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert "RuntimeError: transport [down]" in _out(result)
+    assert [src for src, _, _ in _playlist_state(fake_home)[1]] == [
+        "ytmusic_playlist",
+        "ytmusic_playlist",
+    ]
+
+
+def test_scan_playlists_lists_playlists_youtube_cannot_read(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    ytm, yt = patch_playlist_clients
+    ytm.library.append({"playlistId": "PLgym", "title": "Gym"})
+    ytm.playlists["PLgym"] = {"id": "PLgym", "title": "Gym", "tracks": [_ytm_track("v4")]}
+    yt.playlist_errors["PLgym"] = "HTTP 403: Forbidden"
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "2 playlist(s) couldn't be read through the YouTube Data API" in out
+    assert "Late Night: HTTP 404: Not Found" in out
+    assert "Gym: HTTP 403: Forbidden" in out
+    youtube_ids = [
+        pid for src, pid, _ in _playlist_state(fake_home)[1] if src == "youtube_playlist"
+    ]
+    assert youtube_ids == ["PLroad"]
+
+
+def test_scan_playlists_stores_youtube_items_unchecked_when_the_status_read_fails(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from sqlalchemy import select
+
+    from likesurgeon.cli import app
+    from likesurgeon.models import Snapshot, SnapshotItem
+
+    _, yt = patch_playlist_clients
+    yt.statuses_error = RuntimeError("quota")
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+
+    assert result.exit_code == 0, result.output
+    assert "RuntimeError: quota" in _out(result)
+    s = _open_db(fake_home)
+    try:
+        availability = s.scalars(
+            select(SnapshotItem.is_available)
+            .join(Snapshot, SnapshotItem.snapshot_id == Snapshot.id)
+            .where(Snapshot.source == "youtube_playlist")
+        ).all()
+    finally:
+        s.close()
+    assert availability == [None, None, None]
 
 
 def test_config_load_propagates_invalid_region_in_json(

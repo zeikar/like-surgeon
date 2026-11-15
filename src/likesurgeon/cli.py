@@ -40,7 +40,10 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .pipeline import MissingSnapshotsError, compare_and_persist
+from .playlists import is_backed_up
 from .snapshot import (
+    PlaylistRead,
+    create_playlist_scan,
     create_snapshot,
     get_snapshot_items,
     list_snapshots,
@@ -82,7 +85,9 @@ app = typer.Typer(
     add_completion=False,
 )
 auth_app = typer.Typer(help="Set up authentication with music providers.", no_args_is_help=True)
-scan_app = typer.Typer(help="Scan music providers for liked songs.", no_args_is_help=True)
+scan_app = typer.Typer(
+    help="Scan music providers for liked songs and playlists.", no_args_is_help=True
+)
 app.add_typer(auth_app, name="auth")
 app.add_typer(scan_app, name="scan")
 
@@ -403,13 +408,7 @@ def scan_youtube_likes(
     except HttpError as e:
         _fail(f"YouTube API error while fetching liked videos: {e}", code=1)
 
-    video_ids: list[str] = []
-    for it in items:
-        snippet = it.get("snippet") or {}
-        content = it.get("contentDetails") or {}
-        vid = content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
-        if vid:
-            video_ids.append(vid)
+    video_ids = [vid for vid in map(_playlist_item_video_id, items) if vid]
 
     statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
@@ -441,6 +440,141 @@ def scan_youtube_likes(
             "https://github.com/zeikar/like-surgeon/blob/main/docs/notes/hidden-likes.md "
             "to find and re-like them."
         )
+
+
+def _playlist_item_video_id(item: dict[str, Any]) -> str | None:
+    """The video id of a raw ``playlistItems.list`` entry."""
+    snippet = item.get("snippet") or {}
+    content = item.get("contentDetails") or {}
+    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+
+
+@scan_app.command("playlists")
+def scan_playlists() -> None:
+    """Back up every library playlist from YT Music, with dead items from YouTube.
+
+    Read-only: nothing is written to YouTube or YT Music. Generated and system
+    playlists (liked songs, episodes, mixes) are skipped. The YouTube side is
+    advisory: without YouTube auth, or on a YouTube error, the YT Music backup
+    is still stored and the affected playlists get no dead-item data.
+    """
+    cfg, factory = _bootstrap()
+    client = _ytmusic_client(cfg)
+    console.print("[dim]Reading the YT Music library…[/dim]")
+    try:
+        library = client.fetch_library_playlists()
+    except (AuthFileMissingError, UnexpectedResponseError) as e:
+        _fail(escape(str(e)), code=2)
+
+    titles = {
+        p["playlistId"]: str(p.get("title") or p["playlistId"])
+        for p in library
+        if is_backed_up(p["playlistId"])
+    }
+    skipped = f"{len(library) - len(titles)} generated or system playlists skipped"
+    if not titles:
+        # Still stored: the report shows the latest scan, so playlists that are
+        # gone from the library must drop out of it.
+        with session_scope(factory) as session:
+            scan = create_playlist_scan(session, [])
+            console.print(
+                f"[green]✓[/green] No playlists to back up ({skipped}); "
+                f"empty playlist scan [bold]#{scan.id}[/bold] stored."
+            )
+        return
+
+    console.print(f"[dim]Reading {len(titles)} playlists from YT Music…[/dim]")
+    results, errors = client.fetch_playlists(titles)
+    for playlist_id, message in errors.items():
+        console.print(
+            f"[yellow]⚠[/yellow] Could not read {escape(titles[playlist_id])} "
+            f"from YT Music: {escape(message)}"
+        )
+    if not results:
+        _fail(
+            f"Could not read any of the {len(titles)} playlists from YT Music; nothing stored.",
+            code=2,
+        )
+
+    # YouTube is only asked for playlists YT Music backed up: a report row needs both.
+    read_ids = [playlist_id for playlist_id in titles if playlist_id in results]
+    youtube_items = _youtube_playlist_items(cfg, read_ids, titles)
+    reads = [
+        PlaylistRead(pid, titles[pid], results[pid], youtube_items.get(pid)) for pid in read_ids
+    ]
+    with session_scope(factory) as session:
+        scan = create_playlist_scan(session, reads)
+        tracks = sum(len(r.ytmusic["tracks"]) for r in reads)
+        console.print(
+            f"[green]✓[/green] Playlist scan [bold]#{scan.id}[/bold] stored "
+            f"({len(reads)} playlists, {tracks} tracks; {skipped}). "
+            "Run [cyan]likesurgeon playlists[/cyan] for the report."
+        )
+
+
+def _youtube_playlist_items(
+    cfg: Config, playlist_ids: list[str], titles: dict[str, str]
+) -> dict[str, list[dict[str, Any]]]:
+    """YouTube items per playlist id, availability attached. Advisory: every
+    failure is printed, and the playlists it affects are left out (or, if only
+    the availability read fails, stored unchecked)."""
+    from .youtube_client import (
+        AuthorizationRequiredError,
+        ClientSecretsMissingError,
+        YouTubeClient,
+        attach_video_statuses,
+    )
+
+    console.print(f"[dim]Reading {len(playlist_ids)} playlists from YouTube…[/dim]")
+    client = YouTubeClient(
+        client_secrets_path=cfg.youtube_oauth_client_path,
+        token_path=cfg.youtube_token_path,
+    )
+    try:
+        results, errors = client.fetch_playlists(playlist_ids)
+    except (ClientSecretsMissingError, AuthorizationRequiredError) as e:
+        console.print(
+            "[dim]No dead-item data (needs [cyan]likesurgeon auth youtube[/cyan]): "
+            f"{escape(str(e))}[/dim]"
+        )
+        return {}
+    except Exception as e:  # noqa: BLE001 — advisory; never lose the YT Music backup
+        console.print(
+            f"[yellow]⚠[/yellow] YouTube read failed ({type(e).__name__}: {escape(str(e))}); "
+            "no dead-item data this scan."
+        )
+        return {}
+
+    if errors:
+        console.print(
+            f"[yellow]⚠[/yellow] {len(errors)} playlist(s) couldn't be read through the "
+            "YouTube Data API (a 404 is expected for playlists it can't see); "
+            "no dead-item data for them:"
+        )
+        for playlist_id, message in errors.items():
+            console.print(f"  {escape(titles[playlist_id])}: {escape(message)}")
+
+    video_ids = list(
+        dict.fromkeys(
+            vid for items in results.values() for vid in map(_playlist_item_video_id, items) if vid
+        )
+    )
+    if cfg.region is None and video_ids:
+        console.print(
+            "[dim]No region configured — region-blocked items won't count as dead. Set "
+            "[cyan]region[/cyan] in [cyan]~/.like-surgeon/config.json[/cyan].[/dim]"
+        )
+    try:
+        statuses = client.fetch_video_statuses(video_ids, user_region=cfg.region)
+    except Exception as e:  # noqa: BLE001 — advisory; items without a status store as unchecked
+        console.print(
+            f"[yellow]⚠[/yellow] Could not check video availability "
+            f"({type(e).__name__}: {escape(str(e))}); YouTube items stored unchecked."
+        )
+        return results
+    for items in results.values():
+        attach_video_statuses(items, statuses)
+    return results
 
 
 @app.command()
