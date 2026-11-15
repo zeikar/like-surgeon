@@ -455,7 +455,8 @@ def scan_playlists() -> None:
     """Back up every library playlist from YT Music, with dead items from YouTube.
 
     Read-only: nothing is written to YouTube or YT Music. Generated and system
-    playlists (liked songs, episodes, mixes) are skipped. The YouTube side is
+    playlists (liked songs, episodes, mixes) are skipped. Only playlists you own
+    get a YouTube side (saved ones are backed up from YT Music only). It is
     advisory: without YouTube auth, or on a YouTube error, the YT Music backup
     is still stored and the affected playlists get no dead-item data.
     """
@@ -504,8 +505,15 @@ def scan_playlists() -> None:
     with session_scope(factory) as session:
         scan_id = create_playlist_scan(session, reads).id
 
-    # YouTube is only asked for playlists YT Music backed up: a report row needs both.
-    youtube_items = _youtube_playlist_items(cfg, read_ids, titles)
+    # YouTube is only asked for playlists the user owns: a saved playlist is the
+    # owner's to change, so it gets the backup but no dead-item check or quota.
+    own_ids = [pid for pid in read_ids if results[pid].get("owned") is True]
+    saved = len(read_ids) - len(own_ids)
+    if saved:
+        console.print(
+            f"[dim]{saved} playlist(s) you don't own backed up without a YouTube check.[/dim]"
+        )
+    youtube_items = _youtube_playlist_items(cfg, own_ids, titles) if own_ids else {}
     with session_scope(factory) as session:
         for pid, items in youtube_items.items():
             add_youtube_playlist_snapshot(session, scan_id, pid, titles[pid], items)
@@ -676,7 +684,9 @@ def playlists(
         )
     console.print(table)
 
-    no_youtube = all(r.youtube_count is None for r in report.rows)
+    # Saved playlists never get a YouTube side, so they don't count as missing coverage.
+    own_rows = [r for r in report.rows if r.owned is True]
+    no_youtube = bool(own_rows) and all(r.youtube_count is None for r in own_rows)
     if no_youtube:
         hint = ""
         if not cfg.youtube_token_path.exists():
@@ -1370,9 +1380,11 @@ def repoint_playlists_cmd(
         diag, carried = persist_report(session, scan.scan.id, found.pairs, metadata)
         diag_id = diag.id
         rows = _finding_rows(session, diagnosis_items(session, diag.id))
-        with_youtube = sum(p.youtube_items is not None for p in scan.playlists)
-        dead = sum(it.is_available is False for p in scan.playlists for it in p.youtube_items or ())
-        playlist_count = len(scan.playlists)
+        # Scans made before saved playlists lost their YouTube side may still hold one.
+        own = [p for p in scan.playlists if p.ytmusic.playlist_owned is True]
+        with_youtube = sum(p.youtube_items is not None for p in own)
+        dead = sum(it.is_available is False for p in own for it in p.youtube_items or ())
+        own_count = len(own)
 
     for warning in warnings:
         console.print(warning)
@@ -1384,7 +1396,7 @@ def repoint_playlists_cmd(
     table = Table(title="repoint-playlists summary")
     table.add_column("Bucket")
     table.add_column("Count", justify="right")
-    table.add_row("Playlists with a YouTube side / total", f"{with_youtube} / {playlist_count}")
+    table.add_row("Own playlists with a YouTube side / own", f"{with_youtube} / {own_count}")
     table.add_row("Dead items on the YouTube side", str(dead))
     table.add_row(
         f"{ISSUE_PLAYLIST_RELINKED} (open write-eligible / total)", f"{eligible} / {len(rows)}"

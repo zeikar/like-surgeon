@@ -14,7 +14,7 @@ A repoint is not a new item replacing an old one in the store's eyes: A's item i
 
 Confidence 1.0 is write-eligible; 0.5 is report-only, and the reason says which cause (`report_only_cause`, first match wins):
 
-- ownership of the playlist unknown, or a saved (not owned) playlist
+- ownership of the playlist unknown, or a saved (not owned) playlist (such a playlist has no YouTube side in new scans, so this only occurs on older ones)
 - B is also on the playlist's YouTube side (YT Music shows B twice)
 - YT Music shows B other than once
 - no `videos.list` metadata for A, or for B
@@ -132,7 +132,7 @@ The first real `--apply` (2026-11-15) worked on a manually sorted playlist. On a
 8. **Order**: playlists with the fewest items first, then by position. Alternative: a `--playlist` filter.
 9. **Automatically sorted playlists**: handled without a flag. B goes where the sort order puts it, the checks accept it anywhere with everything else unchanged, and the run names those playlists. Alternatives: skip them (report-only), or have the user switch them to manual sorting first (that changes how their playlist orders new items).
 
-Out of scope: a playable A shown as another video (the user added that video on purpose), saved playlists (findings are stored report-only), any change to likes.
+Out of scope: a playable A shown as another video (the user added that video on purpose), saved playlists (the scan gives them no YouTube side, so they produce no findings), any change to likes.
 
 ## Known limits
 
