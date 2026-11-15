@@ -238,7 +238,8 @@ class DiagnosisItem(Base):
 
 
 class SyncAttempt(Base):
-    """One row per ``sync`` / ``canonicalize --apply`` API call, LM check, or skip decision.
+    """One row per ``sync`` / ``canonicalize --apply`` / playlist repoint API call,
+    check, or skip decision.
 
     ``kind`` names the step: ``repoint_precheck_a``,
     ``repoint_precheck_b``, ``repoint_like``, ``repoint_verify``,
@@ -255,9 +256,15 @@ class SyncAttempt(Base):
     ``lm_check`` / ``restore_*`` rows; or the action kind
     (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
     action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
-    authoritative list. Rows written before the LL → LM alignment redesign may
-    carry legacy kinds (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``,
-    ``yt_relike_*``, ``ytm_dedupe``). ``status`` is one of ``applied``,
+    authoritative list. Playlist repoints (``playlist_dispatch.py``) write
+    ``playlist_precheck``, ``playlist_insert``, ``playlist_insert_verify``,
+    ``playlist_ytm_verify``, ``playlist_delete``, ``playlist_delete_verify``,
+    ``playlist_check``, ``playlist_rollback``, ``playlist_rollback_verify``,
+    ``playlist_restore``, ``playlist_restore_verify`` and
+    ``playlist_interrupted``; none count toward ``sync``'s refusal. Rows
+    written before the LL → LM alignment redesign may carry legacy kinds
+    (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``, ``yt_relike_*``,
+    ``ytm_dedupe``). ``status`` is one of ``applied``,
     ``failed``, ``skipped``. ``reason`` carries sync-side detail (error
     message, LM diff, missing video_id, etc.) — the originating
     ``DiagnosisItem.reason`` is never overwritten.

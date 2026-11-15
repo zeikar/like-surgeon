@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from likesurgeon.db import make_session_factory
 from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS, ISSUE_PLAYLIST_RELINKED
 from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt
 from likesurgeon.playlist_dispatch import PLAYLIST_STOP, PlaylistExecResult, execute
@@ -638,3 +639,249 @@ def test_a_removed_b_with_another_change_stops_without_reporting_b(session: Sess
     assert (res.left_inserted, res.aborted) == ((), PLAYLIST_STOP)
     row = _attempts(session, actions[0].item_id)[-1]
     assert (row.kind, row.status) == ("playlist_rollback_verify", "failed")
+
+
+# ---------------------------------------------------------------------------
+# delete failures, restore, interruption
+# ---------------------------------------------------------------------------
+
+_INSERTED = [
+    ("playlist_precheck", "applied"),
+    ("playlist_insert", "applied"),
+    ("playlist_insert_verify", "applied"),
+    ("playlist_ytm_verify", "applied"),
+]
+_RESTORE = [("playlist_restore", "applied"), ("playlist_restore_verify", "applied")]
+_B_AT_A = [("i0", "v0"), ("new1", "B1"), ("i2", "A2")]  # PL1 after the first repoint
+
+
+def test_a_delete_the_quota_rejects_tries_to_remove_b(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.quota_after = 3  # baseline read, insert, its check read
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        unattempted=2,
+        quota_exhausted=True,
+        left_inserted=(("T PL1", 2, "B1"),),
+    )
+    rows = _attempts(session, actions[0].item_id)
+    assert [(r.kind, r.status) for r in rows] == [
+        *_INSERTED,
+        ("playlist_delete", "failed"),
+        ("playlist_rollback", "failed"),
+    ]
+    assert rows[-2].reason.startswith(QUOTA_REJECTED)
+    assert _status(session, actions[0]) == "open"
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        lambda acct: acct.delete_does_not_land.add("i1"),
+        lambda acct: acct.delete_errors.add("i1"),
+        lambda acct: acct.youtube_read_errors.update(
+            {3: YouTubeWriteError("PL1", "playlist_read", "HTTP 500: boom")}
+        ),
+    ],
+    ids=["accepted", "errored", "unreadable"],
+)
+def test_a_delete_youtube_cannot_confirm_is_reported_and_nothing_else_is_written(
+    session: Session, knob
+) -> None:
+    acct, actions, states = _prepared(session)
+    knob(acct)
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.delete_unconfirmed == (("T PL1", 2, "A1", "B1"),)
+    assert res.aborted is not None
+    assert (res.applied, res.failed, res.unattempted) == (0, 1, 2)
+    assert acct.write_calls == [("insert", "PL1", "B1", "1"), ("delete", "i1")]
+    assert acct.playlists["PL1"][1] == ("new1", "B1")
+    assert _steps(session, actions[0].item_id)[-1] == ("playlist_delete_verify", "failed")
+    assert _status(session, actions[0]) == "open"
+
+
+def test_a_delete_landing_after_the_checks_leaves_b_in_as_slot(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.delete_lands_late = {"i1": 2}  # right after the delete check's re-read
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.delete_unconfirmed == (("T PL1", 2, "A1", "B1"),)
+    assert acct.write_calls == [("insert", "PL1", "B1", "1"), ("delete", "i1")]
+    assert acct.playlists["PL1"] == _B_AT_A  # B in A's slot, never neither
+
+
+def test_a_lagging_youtube_read_after_the_delete_is_settled_by_the_re_read(
+    session: Session, sleeps: list[float]
+) -> None:
+    acct = _one_playlist()
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    acct.delete_read_lag = {"i1": 1}  # YT Music already matches
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=1, failed=0, skipped=0)
+    assert _steps(session, action.item_id) == _APPLIED
+    assert sleeps == [5, 5, 15]
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        lambda acct: acct.ytm_reads_returning.update({3: ["v0", "A2"], 4: ["v0", "A2"]}),
+        lambda acct: acct.ytm_read_errors.update({3: UnexpectedResponseError("shape changed")}),
+    ],
+    ids=["differs", "unreadable"],
+)
+def test_ytmusic_off_after_the_delete_puts_a_back_then_removes_b(session: Session, knob) -> None:
+    acct, actions, states = _prepared(session)
+    knob(acct)
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert (res.applied, res.failed, res.skipped, res.restored) == (0, 0, 1, 1)
+    assert (res.unattempted, res.aborted is not None) == (2, True)
+    assert acct.write_calls == [
+        ("insert", "PL1", "B1", "1"),
+        ("delete", "i1"),
+        ("insert", "PL1", "A1", "1"),
+        ("delete", "new1"),
+    ]
+    assert [v for _, v in acct.playlists["PL1"]] == [v for _, v in states["PL1"].youtube]
+    assert acct.playlists["PL1"][1] == ("new2", "A1")  # A is back under a new item id
+    assert _steps(session, actions[0].item_id)[-6:] == [
+        ("playlist_delete_verify", "applied"),
+        ("playlist_check", "failed"),
+        *_RESTORE,
+        *_ROLLBACK,
+    ]
+    assert _status(session, actions[0]) == "skipped"
+
+
+def test_ytmusic_differing_after_the_delete_stops_with_playlist_stop(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_reads_returning = {3: ["v0", "A2"], 4: ["v0", "A2"]}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.aborted == PLAYLIST_STOP
+
+
+def test_an_a_that_cannot_be_put_back_keeps_b_and_is_reported(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_reads_returning = {3: ["v0", "A2"], 4: ["v0", "A2"]}
+    acct.insert_errors = {"A1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.left_removed == (("T PL1", 2, "A1"),)
+    assert (res.restored, res.aborted) == (0, PLAYLIST_STOP)
+    assert ("delete", "new1") not in acct.write_calls
+    assert acct.playlists["PL1"] == _B_AT_A
+    assert _status(session, actions[0]) == "open"
+
+
+def test_an_a_put_back_elsewhere_keeps_b_and_is_reported(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_reads_returning = {3: ["v0", "A2"], 4: ["v0", "A2"]}
+    acct.insert_lands_at_end = {"A1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.left_removed == (("T PL1", 2, "A1"),)
+    assert ("delete", "new1") not in acct.write_calls
+    assert _steps(session, actions[0].item_id)[-1] == ("playlist_restore_verify", "failed")
+
+
+def test_a_restore_with_another_slot_changed_keeps_b_and_is_reported(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_reads_returning = {3: ["v0", "A2"], 4: ["v0", "A2"]}
+    insert = acct.insert_playlist_item
+
+    def insert_and_someone_re_adds_v0(playlist_id: str, video_id: str, position: int) -> str:
+        # Same video ids, but slot 1 is now a different item: only item ids show it.
+        if video_id == "A1":
+            acct.playlists[playlist_id][0] = ("i0x", "v0")
+        return insert(playlist_id, video_id, position)
+
+    acct.insert_playlist_item = insert_and_someone_re_adds_v0  # type: ignore[method-assign]
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.left_removed == (("T PL1", 2, "A1"),)
+    assert ("delete", "new1") not in acct.write_calls
+    row = _attempts(session, actions[0].item_id)[-1]
+    assert (row.kind, row.status) == ("playlist_restore_verify", "failed")
+    assert "position 1 holds ('i0x', 'v0')" in row.reason
+
+
+def test_a_delete_that_errored_but_landed_stays_open_and_the_run_goes_on(
+    session: Session,
+) -> None:
+    acct, actions, states = _prepared(session)
+    acct.delete_errors_after_landing = {"i1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=2, failed=1, skipped=0)
+    assert _steps(session, actions[0].item_id) == [
+        *_INSERTED,
+        ("playlist_delete", "failed"),
+        ("playlist_delete_verify", "applied"),
+        ("playlist_check", "applied"),
+    ]
+    assert _status(session, actions[0]) == "open"
+    assert acct.playlists["PL1"] == [("i0", "v0"), ("new1", "B1"), ("new2", "B2")]
+
+
+def test_an_interrupt_after_the_delete_call_is_recorded(session: Session) -> None:
+    factory = make_session_factory(session.bind)
+    acct, actions, states = _prepared(session)
+    acct.youtube_read_errors[3] = KeyboardInterrupt()  # the delete's check read
+
+    with pytest.raises(KeyboardInterrupt):
+        execute(session, actions, states, ytm=acct, yt=acct)
+
+    fresh = factory()
+    try:
+        assert _steps(fresh, actions[0].item_id) == [
+            *_INSERTED,
+            ("playlist_delete", "applied"),
+            ("playlist_interrupted", "failed"),
+        ]
+    finally:
+        fresh.close()
+
+
+def test_each_write_row_is_on_disk_before_the_next_wait(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = make_session_factory(session.bind)
+    acct = _one_playlist()
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    committed_at_waits: list[list[tuple[str, str]]] = []
+
+    def sleep(_seconds: float) -> None:
+        fresh = factory()
+        try:
+            committed_at_waits.append(_steps(fresh, action.item_id))
+        finally:
+            fresh.close()
+
+    monkeypatch.setattr("likesurgeon.playlist_dispatch.time.sleep", sleep)
+
+    execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert committed_at_waits[0][-1] == ("playlist_insert", "applied")
+    assert committed_at_waits[1][-1] == ("playlist_delete", "applied")

@@ -24,11 +24,27 @@ isn't listed, as it may land later. Only an errored insert that didn't land,
 or that landed at A's index and was cleanly removed, lets the run go on;
 everything else stops it.
 
+After A's delete is sent, B is never removed while A's item may still be
+listed: a delete the YouTube side can't confirm (A's item still listed after
+the re-read, or the side unreadable) may yet land, so nothing is undone, the
+pair is reported in ``delete_unconfirmed`` and the run stops. With A's item
+gone but YT Music off or unreadable, A is inserted again at its index (new
+item id, so that check compares video ids) and B is removed only once A is
+confirmed back; an A that isn't is reported in ``left_removed`` with B left in
+its slot. A delete call that errored but landed, with both checks passing, is
+not ``applied`` (a call failed) but lets the run go on.
+
 Without such reads (a playlist's first action) both sides are read and must
 equal the planning scan plus this run's applied repoints, and A and B must sit
 where the action says. A playlist that fails this gets no writes this run (its
 items stay ``open``) and the run moves on to other playlists. A side that
 can't be read stops the run, as does YouTube's daily quota.
+
+Row kinds: ``playlist_precheck``; ``playlist_insert``,
+``playlist_insert_verify``, ``playlist_ytm_verify``; ``playlist_delete``,
+``playlist_delete_verify``, ``playlist_check``; ``playlist_rollback``,
+``playlist_rollback_verify`` (removing B); ``playlist_restore``,
+``playlist_restore_verify`` (putting A back); ``playlist_interrupted``.
 
 Invariants:
   * ``DiagnosisItem.reason`` is never modified; sync-side detail lives on
@@ -94,10 +110,13 @@ class PlaylistExecResult:
     # (playlist title, A's 1-based position, B): B inserted for A and possibly
     # still in the playlist next to A; the user removes it by hand.
     left_inserted: tuple[tuple[str, int, str], ...] = ()
-    # A deleted and not put back.
-    left_removed: tuple[PlaylistAction, ...] = ()
-    # A's delete was sent but its item still listed or unreadable: it may land later.
-    delete_unconfirmed: tuple[PlaylistAction, ...] = ()
+    # (playlist title, A's 1-based position, A): A deleted and possibly not
+    # back; B stays in its slot. The user adds A back by hand.
+    left_removed: tuple[tuple[str, int, str], ...] = ()
+    # (playlist title, A's 1-based position, A, B): A's delete was sent but the
+    # YouTube side still lists A's item or couldn't be read. The delete may
+    # still land, so nothing was undone: B stays at A's position.
+    delete_unconfirmed: tuple[tuple[str, int, str, str], ...] = ()
 
 
 class _Sides(NamedTuple):
@@ -144,11 +163,14 @@ def execute(
         applied=outcomes["applied"],
         failed=outcomes["failed"],
         skipped=outcomes["skipped"],
+        restored=run.restored,
         unattempted=unattempted,
         quota_exhausted=run.quota_exhausted,
         aborted=run.aborted,
         stale_playlists=tuple(run.stale),
         left_inserted=tuple(run.left_inserted),
+        left_removed=tuple(run.left_removed),
+        delete_unconfirmed=tuple(run.delete_unconfirmed),
     )
 
 
@@ -194,6 +216,10 @@ def _added_item(base: _YouTube, got: _YouTube, video_id: str) -> tuple[str, str 
     return None
 
 
+def _video_ids(items: _YouTube) -> tuple[str | None, ...]:
+    return tuple(video_id for _, video_id in items)
+
+
 class _ReadFailed(Exception):
     """A side couldn't be read; ``quota`` when YouTube's daily quota refused it."""
 
@@ -216,6 +242,9 @@ class _PlaylistRun:
         self.confirmed: set[str] = set()
         self.stale: list[str] = []
         self.left_inserted: list[tuple[str, int, str]] = []
+        self.left_removed: list[tuple[str, int, str]] = []
+        self.delete_unconfirmed: list[tuple[str, int, str, str]] = []
+        self.restored = 0
         self.quota_exhausted = False
         self.aborted: str | None = None
 
@@ -325,19 +354,84 @@ class _PlaylistRun:
                 lambda: self.yt.delete_playlist_item(action.a_playlist_item_id),
                 lambda _: f"deleted item {action.a_playlist_item_id} ({action.a_video_id})",
             )
-            if result != "ok":
-                return self._halt()
+            if result != "quota":
+                return self._settle_delete(action, base, b_item, sent_ok=result == "ok")
+        # Rejected outright: nothing was sent, so A is in place and B can go.
+        self._remove_b(action, base, new_id)
+        return "failed"
+
+    def _settle_delete(
+        self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str], *, sent_ok: bool
+    ) -> _Outcome:
+        """After A's delete was sent (``sent_ok``: with a 2xx): confirm A's item
+        gone with B in its slot, then YT Music unchanged. While A's item may
+        still be listed nothing is undone — the delete may yet land, and
+        removing B then would leave neither. Once it is gone, a YT Music side
+        that is off or unreadable puts A back (``_restore``)."""
+        p = action.a_index
+        replaced = base.youtube[:p] + (b_item,) + base.youtube[p + 1 :]
+        time.sleep(_VERIFY_WAIT_SECONDS)
+        youtube = self._youtube_after(action, "playlist_delete_verify", replaced)
+        if youtube is None or action.a_playlist_item_id in {item_id for item_id, _ in youtube}:
+            self.delete_unconfirmed.append(
+                (action.playlist_title, p + 1, action.a_video_id, action.b_video_id)
+            )
+            return self._halt()
+        # Known limit: a YT Music read served from before the insert would
+        # pass too — as with the likes repoint's "LM unchanged" check.
+        if youtube != replaced or (
+            self._ytmusic_after(action, "playlist_check", base.ytmusic) != base.ytmusic
+        ):
+            return self._restore(action, base, b_item)
+        # Both sides as planned, so later actions in this playlist build on it.
+        self.expected[action.playlist_id] = _Sides(replaced, base.ytmusic)
+        self.confirmed.add(action.playlist_id)
+        return "applied" if sent_ok else "failed"
+
+    def _restore(self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str]) -> _Outcome:
+        """Insert A again at its index and, once it is confirmed back there with
+        B right after it and every other item unchanged, remove B. A comes back
+        under a new item id. An A not confirmed back keeps B in its slot and is
+        reported in ``left_removed``. Always stops the run."""
+        p, a = action.a_index, action.a_video_id
+        result, _ = self._write(
+            action.item_id,
+            "playlist_restore",
+            lambda: self.yt.insert_playlist_item(action.playlist_id, a, p),
+            lambda item_id: f"inserted {a} at position {p + 1} as item {item_id}",
+        )
+        if result != "quota":  # an errored insert may have landed too
             time.sleep(_VERIFY_WAIT_SECONDS)
-            replaced = base.youtube[:p] + (b_item,) + base.youtube[p + 1 :]
-            if self._youtube_after(action, "playlist_delete_verify", replaced) != replaced:
-                return self._halt()
-            # Known limit: a YT Music read served from before the insert would
-            # pass too — as with the likes repoint's "LM unchanged" check.
-            if self._ytmusic_after(action, "playlist_check", base.ytmusic) != base.ytmusic:
-                return self._halt()
-            self.expected[action.playlist_id] = _Sides(replaced, base.ytmusic)
-            self.confirmed.add(action.playlist_id)
-            return "applied"
+
+            def wanted(got: _YouTube) -> _YouTube:
+                """The baseline with A back at its index under the item id ``got``
+                shows there (A's old one if none) and B right after it."""
+                new_a = got[p][0] if p < len(got) and got[p][1] == a else action.a_playlist_item_id
+                return base.youtube[:p] + ((new_a, a), b_item) + base.youtube[p + 1 :]
+
+            def back(got: _YouTube) -> bool:
+                return got == wanted(got) and got[p][0] != action.a_playlist_item_id
+
+            youtube = self._read_settled(
+                action,
+                "playlist_restore_verify",
+                lambda: self._read_youtube(action.playlist_id),
+                back,
+            )
+            if youtube is not None:
+                self._record_check(
+                    action, "playlist_restore_verify", "YouTube side", wanted(youtube), youtube
+                )
+            if youtube is not None and back(youtube):
+                restored = youtube[: p + 1] + youtube[p + 2 :]  # the baseline with A's new item id
+                removed = self._remove_b(action, _Sides(restored, base.ytmusic), b_item[0])
+                self._halt()
+                if removed:
+                    self.restored += 1
+                    return "skipped"
+                return "failed"
+        self.left_removed.append((action.playlist_title, p + 1, a))
+        return self._halt()
 
     def _settle_errored_insert(self, action: PlaylistAction, base: _Sides) -> _Outcome:
         """After an insert call that errored, so B's item id is unknown: B
@@ -443,7 +537,8 @@ class _PlaylistRun:
                     action.item_id,
                     "playlist_interrupted",
                     "failed",
-                    f"{type(exc).__name__} after A's delete call started — A may be removed",
+                    f"{type(exc).__name__} after A's delete call started — A may be missing "
+                    "or B may be extra; re-scan playlists",
                 )
                 self.session.commit()
             except BaseException:
@@ -451,7 +546,7 @@ class _PlaylistRun:
                 print(
                     f"likesurgeon: stopped after deleting YouTube video {action.a_video_id} "
                     f"from playlist {action.playlist_title!r}, unrecorded — if it is missing, "
-                    "add it back by hand",
+                    f"add it back by hand; if it is there, remove {action.b_video_id} next to it",
                     file=sys.stderr,
                 )
             raise
