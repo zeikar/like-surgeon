@@ -1,6 +1,6 @@
 [project]
 name = "likesurgeon"
-version = "0.12.0"
+version = "0.13.0"
 description = "Fix the mismatches between your YouTube Music liked songs and YouTube likes — swapped, duplicated, missing and dead songs. A local CLI that fixes only what it can prove."
 readme = "README.md"
 requires-python = ">=3.11"
