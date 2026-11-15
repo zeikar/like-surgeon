@@ -264,6 +264,18 @@ _RATE_VIDEO_MAX_ATTEMPTS = 3
 _RATE_VIDEO_BACKOFFS = (0.5, 1.0)
 
 
+def playlist_item_video_id(item: dict[str, Any]) -> str | None:
+    """The video id of a raw ``playlistItems.list`` entry."""
+    snippet = item.get("snippet") or {}
+    content = item.get("contentDetails") or {}
+    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+
+
+def playlist_item_key(item: dict[str, Any]) -> tuple[str, str | None]:
+    """``(playlist item id, video id)`` of a raw ``playlistItems.list`` entry."""
+    return item["id"], playlist_item_video_id(item)
+
+
 class YouTubeClient:
     def __init__(
         self,
@@ -559,6 +571,75 @@ class YouTubeClient:
             raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
 
         return any(item.get("rating") == "like" for item in resp.get("items", []))
+
+    def _playlist_call(self, subject: str, op: str, call: Any) -> Any:
+        """Run ``call(service)`` for a playlist read or write, mapping failures.
+
+        Never retries: an insert or delete that errored may still have landed,
+        and repeating it would duplicate or remove another item. The message
+        carries the HTTP status and reason only, because ``str(HttpError)``
+        embeds the request URL (and with it the API key).
+        """
+        from googleapiclient.errors import HttpError
+
+        try:
+            return call(self._service())
+        except HttpError as exc:
+            message = f"HTTP {exc.status_code}: {exc.reason}"
+            if _is_quota_exceeded(exc):
+                raise YouTubeQuotaExceededError(subject, op, message) from exc
+            raise YouTubeWriteError(subject, op, message) from exc
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YouTubeWriteError(subject, op, str(exc)) from exc
+
+    def insert_playlist_item(self, playlist_id: str, video_id: str, position: int) -> str:
+        """Insert ``video_id`` at ``position`` via ``playlistItems.insert`` (50 units).
+
+        Returns the new playlist item id, which the caller needs to remove the
+        item again.
+        """
+        body = {
+            "snippet": {
+                "playlistId": playlist_id,
+                "position": position,
+                "resourceId": {"kind": "youtube#video", "videoId": video_id},
+            }
+        }
+        response = self._playlist_call(
+            video_id,
+            "playlist_insert",
+            lambda service: service.playlistItems().insert(part="snippet", body=body).execute(),
+        )
+        item_id = response.get("id") if isinstance(response, dict) else None
+        if not isinstance(item_id, str) or not item_id:
+            # The insert landed but can't be addressed: callers must treat B as
+            # possibly in the playlist, so this is a write error, not a KeyError.
+            raise YouTubeWriteError(
+                video_id, "playlist_insert", "insert returned no playlist item id"
+            )
+        return item_id
+
+    def delete_playlist_item(self, item_id: str) -> None:
+        """Remove one playlist item by its item id via ``playlistItems.delete`` (50 units)."""
+        self._playlist_call(
+            item_id,
+            "playlist_delete",
+            lambda service: service.playlistItems().delete(id=item_id).execute(),
+        )
+
+    def read_playlist_items(self, playlist_id: str) -> list[tuple[str, str | None]]:
+        """``(item id, video id)`` of every item, in playlist order.
+
+        Errors arrive as ``YouTubeWriteError`` / ``YouTubeQuotaExceededError``
+        so a caller checking a playlist after a write handles them like a
+        failed write.
+        """
+        items = self._playlist_call(
+            playlist_id,
+            "playlist_read",
+            lambda service: self.fetch_playlist_items(playlist_id, service=service),
+        )
+        return [playlist_item_key(item) for item in items]
 
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2

@@ -63,6 +63,7 @@ from .sync_preflight import (
     stranded_unliked_video_ids,
     sync_attempts_since_older_scan,
 )
+from .youtube_client import playlist_item_video_id
 from .ytmusic_client import (
     SUPPORTED_BROWSERS,
     AuthFileMissingError,
@@ -410,7 +411,7 @@ def scan_youtube_likes(
     except HttpError as e:
         _fail(f"YouTube API error while fetching liked videos: {e}", code=1)
 
-    video_ids = [vid for vid in map(_playlist_item_video_id, items) if vid]
+    video_ids = [vid for vid in map(playlist_item_video_id, items) if vid]
 
     statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
@@ -442,13 +443,6 @@ def scan_youtube_likes(
             "https://github.com/zeikar/like-surgeon/blob/main/docs/notes/hidden-likes.md "
             "to find and re-like them."
         )
-
-
-def _playlist_item_video_id(item: dict[str, Any]) -> str | None:
-    """The video id of a raw ``playlistItems.list`` entry."""
-    snippet = item.get("snippet") or {}
-    content = item.get("contentDetails") or {}
-    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
 
 
 @scan_app.command("playlists")
@@ -562,7 +556,7 @@ def _youtube_playlist_items(
 
     video_ids = list(
         dict.fromkeys(
-            vid for items in results.values() for vid in map(_playlist_item_video_id, items) if vid
+            vid for items in results.values() for vid in map(playlist_item_video_id, items) if vid
         )
     )
     if cfg.region is None and video_ids:
