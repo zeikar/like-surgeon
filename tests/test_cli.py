@@ -8,6 +8,7 @@ the user_region keyword reaching fetch_video_statuses.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -637,6 +638,234 @@ def test_scan_playlists_stores_youtube_items_unchecked_when_the_status_read_fail
     finally:
         s.close()
     assert availability == [None, None, None]
+
+
+def _scan_playlists(
+    patch: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    result = CliRunner().invoke(app, ["scan", "playlists"])
+    assert result.exit_code == 0, result.output
+
+
+def _playlists_cmd(*args: str) -> Any:
+    from likesurgeon.cli import app
+
+    return CliRunner().invoke(app, ["playlists", *args], env={"COLUMNS": "200"})
+
+
+def _cells(result: Any) -> str:
+    """Table output with the box-drawing borders removed, whitespace collapsed."""
+    return " ".join(re.sub("[│┃┏┓┗┛┡┩└┘┌┐├┤┬┴┼━─╇╈┳┻╋]", " ", result.output).split())
+
+
+def test_playlists_without_a_scan_hints_at_scan_playlists(fake_home: Path) -> None:
+    result = _playlists_cmd()
+
+    assert result.exit_code == 0, result.output
+    assert "likesurgeon scan playlists" in _out(result)
+
+
+def test_playlists_with_an_empty_scan_says_it_found_none(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    patch_playlist_clients[0].library = []
+    _scan_playlists(patch_playlist_clients)
+
+    result = _playlists_cmd()
+
+    out = _out(result)
+    assert result.exit_code == 0, result.output
+    assert "#1" in out
+    assert "found no playlists" in out
+    assert "auth youtube" not in out
+
+
+def test_playlists_lists_one_row_per_playlist(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    ytm, yt = patch_playlist_clients
+    ytm.library[4]["title"] = ytm.playlists["PLroad"]["title"] = "[Live] Road Trip"
+    ytm.playlists["PLroad"]["tracks"][1]["videoType"] = "MUSIC_VIDEO_TYPE_UGC"
+    _scan_playlists(patch_playlist_clients)
+
+    result = _playlists_cmd()
+
+    out = _cells(result)
+    assert result.exit_code == 0, result.output
+    assert "Playlist scan #1" in out
+    assert "[Live] Road Trip" in out
+    assert "Late Night" in out
+    # id, title, own, YT Music count, music %, music / UGC / other, YouTube count, dead
+    assert "1 [Live] Road Trip own 2 50% 1 1 0 3 0" in out
+    # PLnight has no YouTube side: placeholders, not zeros.
+    assert "3 Late Night own 1 100% 1 0 0 - -" in out
+    assert "dead items" not in out
+    assert "auth youtube" not in out  # one playlist has a YouTube side
+
+
+def test_playlists_says_youtube_coverage_is_absent_and_suggests_auth(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    patch_playlist_clients[1].playlists_error = RuntimeError("boom")
+    _scan_playlists(patch_playlist_clients)
+
+    out = _out(_playlists_cmd())
+
+    assert "no YouTube coverage" in out
+    assert "likesurgeon auth youtube" in out
+
+
+def test_playlists_does_not_suggest_auth_when_youtube_is_authorized(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.config import Config
+
+    patch_playlist_clients[1].playlists_error = RuntimeError("boom")
+    _scan_playlists(patch_playlist_clients)
+    Config.load().youtube_token_path.write_text("{}")
+
+    out = _out(_playlists_cmd())
+
+    assert "no YouTube coverage" in out
+    assert "auth youtube" not in out
+
+
+def _mark_dead(
+    monkeypatch: pytest.MonkeyPatch, yt: type[_FakeYouTubeClient], dead: set[str]
+) -> None:
+    def statuses(self: Any, video_ids: list[str], *, user_region: str | None = None) -> dict:
+        # v2 has no verdict: it is stored unchecked.
+        return {
+            v: VideoStatus(
+                is_available=None if v == "v2" else v not in dead,
+                reason="deleted" if v in dead else None,
+            )
+            for v in video_ids
+        }
+
+    monkeypatch.setattr(yt, "fetch_video_statuses", statuses)
+
+
+def test_playlists_dead_lists_dead_items_and_flag_off_hides_them(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    ytm, yt = patch_playlist_clients
+    _mark_dead(monkeypatch, yt, {"v1"})
+    _scan_playlists(patch_playlist_clients)
+
+    plain = _cells(_playlists_cmd())
+    dead = _cells(_playlists_cmd("--dead"))
+
+    # v1 sits at positions 1 and 3 of the YouTube copy; v2 is unchecked.
+    assert "2 (1 unchecked)" in plain
+    assert "deleted" not in plain
+    assert "Road Trip 1 v1 deleted Track v1" in dead
+    assert "Road Trip 3 v1 deleted Track v1" in dead
+
+
+def test_playlists_dead_escapes_markup_in_titles(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    ytm, yt = patch_playlist_clients
+    yt.playlists["PLroad"][0]["snippet"]["title"] = "Gone [x] song"
+    _mark_dead(monkeypatch, yt, {"v1"})
+    _scan_playlists(patch_playlist_clients)
+
+    assert "Gone [x] song" in _cells(_playlists_cmd("--dead"))
+
+
+def test_playlists_dead_without_youtube_coverage_adds_no_none_found_line(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    patch_playlist_clients[1].playlists_error = RuntimeError("boom")
+    _scan_playlists(patch_playlist_clients)
+
+    out = _out(_playlists_cmd("--dead"))
+
+    assert "no YouTube coverage" in out
+    assert "No dead items" not in out
+
+
+def test_snapshots_with_only_playlist_snapshots_mentions_them(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    from likesurgeon.cli import app
+
+    patch_playlist_clients[0].library = patch_playlist_clients[0].library[-1:]
+    _scan_playlists(patch_playlist_clients)
+
+    out = _out(CliRunner().invoke(app, ["snapshots"], env={"COLUMNS": "200"}))
+
+    assert "No likes snapshots yet" in out
+    assert "1 playlist snapshot is not listed" in out
+    assert "likesurgeon playlists" in out
+
+
+def test_playlists_dead_with_none_says_so(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    _scan_playlists(patch_playlist_clients)
+
+    assert "No dead items" in _out(_playlists_cmd("--dead"))
+
+
+def test_export_returns_the_tracks_of_a_reported_snapshot_id(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+
+    _scan_playlists(patch_playlist_clients)
+    assert "1 Road Trip" in _cells(_playlists_cmd())
+
+    result = CliRunner().invoke(app, ["export", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Track v1" in result.output
+    assert "Track v2" in result.output
+    json.loads(result.output)
+
+
+def test_snapshots_lists_likes_only_and_counts_playlist_snapshots(
+    fake_home: Path,
+    patch_playlist_clients: tuple[type[_FakeYTMusicPlaylists], type[_FakeYouTubeClient]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from likesurgeon.cli import app
+
+    _scan_playlists(patch_playlist_clients)
+    monkeypatch.setattr(
+        _FakeYTMusicPlaylists,
+        "fetch_liked_songs",
+        lambda self, limit=None: [{"videoId": "v1", "title": "Song", "artists": [{"name": "X"}]}],
+        raising=False,
+    )
+    assert CliRunner().invoke(app, ["scan", "ytmusic"]).exit_code == 0
+
+    result = CliRunner().invoke(app, ["snapshots"], env={"COLUMNS": "200"})
+
+    out = _out(result)
+    assert result.exit_code == 0, result.output
+    assert "ytmusic_playlist" not in out
+    assert "youtube_playlist" not in out
+    assert "ytmusic_liked_songs" in out
+    assert "3 playlist snapshots are not listed" in out
+    assert "likesurgeon playlists" in out
 
 
 def test_config_load_propagates_invalid_region_in_json(

@@ -40,7 +40,7 @@ from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
 from .pipeline import MissingSnapshotsError, compare_and_persist
-from .playlists import is_backed_up
+from .playlists import is_backed_up, playlist_report
 from .snapshot import (
     PlaylistRead,
     create_playlist_scan,
@@ -582,7 +582,11 @@ def snapshots() -> None:
     """List previous snapshots."""
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        rows = list_snapshots(session)
+        all_rows = list_snapshots(session)
+    # Playlist snapshots are one per playlist per scan and would bury the likes
+    # rows; `playlists` is where they are listed.
+    rows = [s for s in all_rows if s.playlist_id is None]
+    playlist_snapshots = len(all_rows) - len(rows)
 
     table = Table(title="Snapshots")
     table.add_column("ID", justify="right")
@@ -597,11 +601,104 @@ def snapshots() -> None:
             str(s.raw_count),
         )
     if not rows:
+        if not playlist_snapshots:
+            console.print(
+                "[yellow]No snapshots yet.[/yellow] Run [cyan]likesurgeon scan ytmusic[/cyan]."
+            )
+            return
+        console.print("[yellow]No likes snapshots yet.[/yellow]")
+    else:
+        console.print(table)
+    if playlist_snapshots:
+        noun = "snapshot is" if playlist_snapshots == 1 else "snapshots are"
         console.print(
-            "[yellow]No snapshots yet.[/yellow] Run [cyan]likesurgeon scan ytmusic[/cyan]."
+            f"[dim]{playlist_snapshots} playlist {noun} not listed; "
+            "see [cyan]likesurgeon playlists[/cyan].[/dim]"
+        )
+
+
+@app.command()
+def playlists(
+    dead: Annotated[
+        bool, typer.Option("--dead", help="List the dead items of the latest scan.")
+    ] = False,
+) -> None:
+    """Report the latest playlist scan: music share and dead items per playlist."""
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        report = playlist_report(session)
+    if report is None:
+        console.print(
+            "[yellow]No playlist scan yet.[/yellow] Run [cyan]likesurgeon scan playlists[/cyan]."
         )
         return
+
+    when = report.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    if not report.rows:
+        console.print(
+            f"Playlist scan [bold]#{report.scan_id}[/bold] ({when} UTC) found no playlists."
+        )
+        return
+
+    table = Table(title=f"Playlist scan #{report.scan_id} ({when} UTC)")
+    table.add_column("ID", justify="right")
+    table.add_column("Playlist")
+    table.add_column("Own")
+    table.add_column("YT Music", justify="right")
+    table.add_column("Music %", justify="right")
+    table.add_column("Music", justify="right")
+    table.add_column("UGC", justify="right")
+    table.add_column("Other", justify="right")
+    table.add_column("YouTube", justify="right")
+    table.add_column("Dead", justify="right")
+    for r in report.rows:
+        dead_cell = "-" if r.dead is None else str(r.dead)
+        if r.unchecked:
+            dead_cell += f" ({r.unchecked} unchecked)"
+        table.add_row(
+            str(r.ytmusic_snapshot_id),
+            escape(r.title),
+            "?" if r.owned is None else "own" if r.owned else "saved",
+            str(r.ytmusic_count),
+            "-" if r.music_share is None else f"{r.music_share:.0%}",
+            str(r.music),
+            str(r.ugc),
+            str(r.other),
+            "-" if r.youtube_count is None else str(r.youtube_count),
+            dead_cell,
+        )
     console.print(table)
+
+    no_youtube = all(r.youtube_count is None for r in report.rows)
+    if no_youtube:
+        hint = ""
+        if not cfg.youtube_token_path.exists():
+            hint = " Run [cyan]likesurgeon auth youtube[/cyan] and scan again to add it."
+        console.print(
+            f"[yellow]This scan has no YouTube coverage, so no dead items.[/yellow]{hint}"
+        )
+
+    if dead:
+        if not report.dead_items:
+            # With no YouTube side the line above already explains the absence.
+            if not no_youtube:
+                console.print("No dead items in this scan.")
+            return
+        dead_table = Table(title="Dead items")
+        dead_table.add_column("Playlist")
+        dead_table.add_column("Pos", justify="right")
+        dead_table.add_column("Video")
+        dead_table.add_column("Reason")
+        dead_table.add_column("Title")
+        for d in report.dead_items:
+            dead_table.add_row(
+                escape(d.playlist_title),
+                str(d.position),
+                escape(d.video_id or "-"),
+                escape(d.reason or "-"),
+                escape(d.title),
+            )
+        console.print(dead_table)
 
 
 @app.command()
