@@ -180,7 +180,7 @@ class Config:
     # warn that it's ignored. None when unset.
     fuzzy_threshold: int | None
     # Browser `auth ytmusic --from-browser` used and the account signed in
-    # there; a stale Liked songs read re-extracts cookies from that browser if
+    # there; a stale Liked songs or library playlists read re-extracts cookies from that browser if
     # it is still that account. None when unset (e.g. after a manual paste).
     ytmusic_browser: str | None
     ytmusic_account: str | None
