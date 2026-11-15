@@ -7,9 +7,20 @@ whole reason ``SnapshotItem`` only has a unique constraint on
 
 from __future__ import annotations
 
+import json
+
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from likesurgeon.snapshot import create_snapshot, get_snapshot_items, upsert_ytmusic_track
+from likesurgeon.models import PlaylistScan, Snapshot, Track
+from likesurgeon.snapshot import (
+    PlaylistRead,
+    create_playlist_scan,
+    create_snapshot,
+    get_snapshot_items,
+    latest_snapshot,
+    upsert_ytmusic_track,
+)
 
 
 def _item(video_id: str, title: str, artists: list[str]) -> dict:
@@ -401,3 +412,115 @@ def test_upsert_ytmusic_track_creates_then_reuses_row(session: Session):
 
     snap = create_snapshot(session, "ytmusic_liked_songs", [raw])
     assert get_snapshot_items(session, snap.id)[0].track_id == first.id
+
+
+def test_ytmusic_snapshot_stores_video_type(session: Session):
+    with_type = {**_item("v1", "Song", ["A"]), "videoType": "MUSIC_VIDEO_TYPE_ATV"}
+    without_type = _item("v2", "Other", ["A"])
+    snap = create_snapshot(session, "ytmusic_liked_songs", [with_type, without_type])
+    rows = get_snapshot_items(session, snap.id)
+    assert rows[0].video_type == "MUSIC_VIDEO_TYPE_ATV"
+    assert rows[1].video_type is None
+
+
+def _yt_item(video_id: str, title: str, status: dict | None = None) -> dict:
+    item = {
+        "snippet": {"title": title, "channelTitle": "Chan", "resourceId": {"videoId": video_id}},
+        "contentDetails": {"videoId": video_id},
+    }
+    if status is not None:
+        item["_likesurgeon_video_status"] = status
+    return item
+
+
+def _playlist_reads() -> list[PlaylistRead]:
+    return [
+        PlaylistRead(
+            playlist_id="PLmine",
+            title="Mine",
+            ytmusic={
+                "id": "PLmine",
+                "title": "Mine",
+                "description": "my mix",
+                "owned": True,
+                "tracks": [_item("v1", "Song", ["A"]), _item("v2", "Other", ["B"])],
+                "related": [{"title": "x"}],
+                "suggestions": [{"title": "y"}],
+            },
+            youtube_items=[
+                _yt_item("v1", "Song", {"is_available": True, "reason": None}),
+                _yt_item("v2", "Other", {"is_available": False, "reason": "deleted"}),
+            ],
+        ),
+        PlaylistRead(
+            playlist_id="PLsaved",
+            title="Saved",
+            ytmusic={"id": "PLsaved", "title": "Saved", "owned": False, "tracks": []},
+            youtube_items=None,
+        ),
+    ]
+
+
+def test_create_playlist_scan_links_snapshots(session: Session):
+    scan = create_playlist_scan(session, _playlist_reads())
+    session.commit()
+
+    snaps = list(session.scalars(select(Snapshot).order_by(Snapshot.id)))
+    assert len(list(session.scalars(select(PlaylistScan)))) == 1
+    assert [(s.source, s.playlist_id, s.playlist_title) for s in snaps] == [
+        ("ytmusic_playlist", "PLmine", "Mine"),
+        ("youtube_playlist", "PLmine", "Mine"),
+        ("ytmusic_playlist", "PLsaved", "Saved"),
+    ]
+    assert all(s.playlist_scan_id == scan.id for s in snaps)
+
+
+def test_create_playlist_scan_stores_owned_and_header_only(session: Session):
+    create_playlist_scan(session, _playlist_reads())
+    snaps = list(session.scalars(select(Snapshot).order_by(Snapshot.id)))
+    mine, yt_side, saved = snaps
+    assert mine.playlist_owned is True
+    assert saved.playlist_owned is False
+    header = json.loads(mine.playlist_raw_json)
+    assert header["description"] == "my mix"
+    assert not {"tracks", "related", "suggestions"} & header.keys()
+    # owned/raw header live on the ytmusic side only.
+    assert yt_side.playlist_owned is None
+    assert yt_side.playlist_raw_json is None
+
+
+def test_create_playlist_scan_stores_youtube_availability(session: Session):
+    create_playlist_scan(session, _playlist_reads())
+    yt_snap = session.scalar(select(Snapshot).where(Snapshot.source == "youtube_playlist"))
+    rows = get_snapshot_items(session, yt_snap.id)
+    assert [(r.video_id, r.is_available, r.unavailable_reason) for r in rows] == [
+        ("v1", True, None),
+        ("v2", False, "deleted"),
+    ]
+
+
+def test_create_playlist_scan_stores_empty_playlist(session: Session):
+    create_playlist_scan(session, _playlist_reads())
+    saved = session.scalar(select(Snapshot).where(Snapshot.playlist_id == "PLsaved"))
+    assert saved.raw_count == 0
+    assert get_snapshot_items(session, saved.id) == []
+
+
+def test_create_playlist_scan_with_no_reads(session: Session):
+    scan = create_playlist_scan(session, [])
+    assert scan.id is not None
+    assert list(session.scalars(select(Snapshot))) == []
+
+
+def test_playlist_scan_does_not_disturb_likes(session: Session):
+    likes = create_snapshot(session, "ytmusic_liked_songs", [_item("v1", "Song", ["A"])])
+    create_playlist_scan(session, _playlist_reads())
+    session.commit()
+
+    assert latest_snapshot(session, source="ytmusic_liked_songs").id == likes.id
+    tracks = list(session.scalars(select(Track).where(Track.video_id == "v1")))
+    assert sorted(t.source for t in tracks) == [
+        "youtube_playlist",
+        "ytmusic_liked_songs",
+        "ytmusic_playlist",
+    ]
