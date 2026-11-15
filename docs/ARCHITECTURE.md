@@ -29,7 +29,7 @@ likesurgeon is a local-first tool that diagnoses inconsistencies between your Yo
             user-facing output
 ```
 
-Two providers feed into one local SQLite database. Every snapshot is point-in-time and immutable. `compare-likes` (order alignment) is the only computation that crosses sources; everything else is per-source or read-only. `canonicalize` (not drawn) reads YT Music only: Liked songs plus artist pages. `scan playlists` and `playlists` (not drawn) back up library playlists from both providers and report on them, with no cross-source computation; `repoint-playlists` (not drawn) then aligns the two sides of each stored playlist the way `compare-likes` aligns likes.
+Two providers feed into one local SQLite database. Every snapshot is point-in-time and immutable. Two computations cross sources, both by order alignment: `compare-likes` (Liked videos against Liked songs) and `repoint-playlists` (each playlist's YouTube side against its YT Music side); everything else is per-source or read-only. `canonicalize` (not drawn) reads YT Music only: Liked songs plus artist pages. `scan playlists` and `playlists` (not drawn) back up library playlists from both providers and report on them, with no cross-source computation; `repoint-playlists` (not drawn) then aligns the two sides of each stored playlist the way `compare-likes` aligns likes.
 
 ## Data flow
 

@@ -217,10 +217,6 @@ def _added_item(base: _YouTube, got: _YouTube, video_id: str) -> tuple[str, str 
     return None
 
 
-def _video_ids(items: _YouTube) -> tuple[str | None, ...]:
-    return tuple(video_id for _, video_id in items)
-
-
 class _ReadFailed(Exception):
     """A side couldn't be read; ``quota`` when YouTube's daily quota refused it."""
 
