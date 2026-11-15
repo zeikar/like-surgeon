@@ -15,6 +15,15 @@ the list's length and every other slot, so a later action's indices in the
 same playlist still hold, and the matching post-check reads become its
 baseline.
 
+Until A's delete is sent, a check that fails removes B again — only the item
+this action added, by its item id (found by reading the YouTube side when the
+insert call errored) — and confirms the YouTube side is the baseline again. A
+B that may be in the playlist but can't be identified, removed or confirmed
+gone is reported in ``left_inserted``; so is an accepted insert that still
+isn't listed, as it may land later. Only an errored insert that didn't land,
+or that landed at A's index and was cleanly removed, lets the run go on;
+everything else stops it.
+
 Without such reads (a playlist's first action) both sides are read and must
 equal the planning scan plus this run's applied repoints, and A and B must sit
 where the action says. A playlist that fails this gets no writes this run (its
@@ -70,7 +79,7 @@ PLAYLIST_STOP = (
 class PlaylistExecResult:
     applied: int
     failed: int
-    skipped: int
+    skipped: int  # YT Music didn't show the inserted B (B removed again), or A was put back
     # Of ``skipped``: actions undone by putting A back.
     restored: int = 0
     # Actions left 'open' without any call: the run stopped early, or their
@@ -82,8 +91,9 @@ class PlaylistExecResult:
     aborted: str | None = None
     # Playlists whose live sides differed from the scan: no writes this run.
     stale_playlists: tuple[str, ...] = ()
-    # B inserted and possibly still there although A is too.
-    left_inserted: tuple[PlaylistAction, ...] = ()
+    # (playlist title, A's 1-based position, B): B inserted for A and possibly
+    # still in the playlist next to A; the user removes it by hand.
+    left_inserted: tuple[tuple[str, int, str], ...] = ()
     # A deleted and not put back.
     left_removed: tuple[PlaylistAction, ...] = ()
     # A's delete was sent but its item still listed or unreadable: it may land later.
@@ -138,6 +148,7 @@ def execute(
         quota_exhausted=run.quota_exhausted,
         aborted=run.aborted,
         stale_playlists=tuple(run.stale),
+        left_inserted=tuple(run.left_inserted),
     )
 
 
@@ -174,6 +185,15 @@ def _misplaced(action: PlaylistAction, base: _Sides) -> list[str]:
     return problems
 
 
+def _added_item(base: _YouTube, got: _YouTube, video_id: str) -> tuple[str, str | None] | None:
+    """The one item ``got`` adds to ``base``, if that is all that changed and it
+    is ``video_id``."""
+    new = [it for it in got if it not in base]
+    if len(new) == 1 and new[0][1] == video_id and tuple(it for it in got if it != new[0]) == base:
+        return new[0]
+    return None
+
+
 class _ReadFailed(Exception):
     """A side couldn't be read; ``quota`` when YouTube's daily quota refused it."""
 
@@ -195,6 +215,7 @@ class _PlaylistRun:
         # Playlists whose last action's checks just read them as expected.
         self.confirmed: set[str] = set()
         self.stale: list[str] = []
+        self.left_inserted: list[tuple[str, int, str]] = []
         self.quota_exhausted = False
         self.aborted: str | None = None
 
@@ -240,7 +261,10 @@ class _PlaylistRun:
         return base
 
     def repoint(self, action: PlaylistAction, base: _Sides) -> _Outcome:
-        """Insert B at A's index, check both sides, delete A's item, check again."""
+        """Insert B at A's index, check both sides, delete A's item, check again.
+
+        Until A's delete is sent, anything off removes B again (``_remove_b``).
+        """
         p, b = action.a_index, action.b_video_id
         result, new_id = self._write(
             action.item_id,
@@ -250,18 +274,49 @@ class _PlaylistRun:
         )
         if result == "quota":
             return "failed"  # nothing was sent
-        if new_id is None:
-            return self._halt()
-        b_item = (new_id, b)
         time.sleep(_VERIFY_WAIT_SECONDS)
+        if new_id is None:
+            return self._settle_errored_insert(action, base)
+        b_item = (new_id, b)
         inserted = base.youtube[:p] + (b_item,) + base.youtube[p:]
-        if self._youtube_after(action, "playlist_insert_verify", inserted) != inserted:
+        youtube = self._read_settled(
+            action,
+            "playlist_insert_verify",
+            lambda: self._read_youtube(action.playlist_id),
+            lambda got: got == inserted,
+        )
+        if youtube is None:
+            self._remove_b(action, base, new_id)
+            return "failed"
+        if b_item not in youtube:
+            # Accepted, so it may still land: B is reported, not counted as absent.
+            self._record(
+                action.item_id,
+                "playlist_insert_verify",
+                "failed",
+                f"B's item {new_id} isn't listed ({_RECHECKED}) — the insert may still land",
+            )
+            self._report_inserted(action)
+            return "failed"
+        self._record_check(action, "playlist_insert_verify", "YouTube side", inserted, youtube)
+        if youtube != inserted:
+            self._remove_b(action, base, new_id)
             return self._halt()
         j = action.b_index
         # YT Music shows B at j already; one more B there reads the same on either side of it.
         shown = base.ytmusic[:j] + (b,) + base.ytmusic[j:]
-        if self._ytmusic_after(action, "playlist_ytm_verify", shown) != shown:
-            return self._halt()
+        ytmusic = self._side_after(
+            action,
+            "playlist_ytm_verify",
+            shown,
+            lambda: self._read_ytmusic(action.playlist_id),
+            "YT Music side",
+        )
+        if ytmusic != shown:
+            removed = self._remove_b(action, base, new_id)
+            self._halt()
+            # Terminal only when YT Music was read: the pair shows wrong, retrying repeats it.
+            return "skipped" if removed and ytmusic is not None else "failed"
 
         with self._interrupt_marks_delete(action):
             result, _ = self._write(
@@ -283,6 +338,90 @@ class _PlaylistRun:
             self.expected[action.playlist_id] = _Sides(replaced, base.ytmusic)
             self.confirmed.add(action.playlist_id)
             return "applied"
+
+    def _settle_errored_insert(self, action: PlaylistAction, base: _Sides) -> _Outcome:
+        """After an insert call that errored, so B's item id is unknown: B
+        landed if the YouTube side is the baseline plus exactly one item of B,
+        which is then removed. The run goes on only if B didn't land or landed
+        at A's index and was cleanly removed."""
+        p, b = action.a_index, action.b_video_id
+
+        def at_p(got: _YouTube) -> bool:
+            added = _added_item(base.youtube, got, b)
+            return added is not None and got.index(added) == p
+
+        # "Unchanged" is only concluded after the re-read: the insert may land late.
+        youtube = self._read_settled(
+            action,
+            "playlist_insert_verify",
+            lambda: self._read_youtube(action.playlist_id),
+            at_p,
+        )
+        if youtube is None:
+            self._report_inserted(action)
+            return "failed"
+        if youtube == base.youtube:
+            self._record(
+                action.item_id,
+                "playlist_insert_verify",
+                "failed",
+                f"B isn't listed ({_RECHECKED}) — the insert call errored and didn't land",
+            )
+            return "failed"
+        added = _added_item(base.youtube, youtube, b)
+        if added is None:
+            self._record(
+                action.item_id,
+                "playlist_insert_verify",
+                "failed",
+                f"YouTube side: {_difference(base.youtube, youtube, 'baseline')} ({_RECHECKED}) "
+                "— can't tell which item the errored insert added",
+            )
+            self._report_inserted(action)
+            return "failed"
+        self._record(
+            action.item_id,
+            "playlist_insert_verify",
+            "failed",
+            f"B listed as item {added[0]} at position {youtube.index(added) + 1} "
+            "although the insert call errored",
+        )
+        if self._remove_b(action, base, added[0]) and youtube.index(added) != p:
+            self._halt()
+        return "failed"
+
+    def _remove_b(self, action: PlaylistAction, base: _Sides, b_item_id: str) -> bool:
+        """Delete the B item this action added, by its item id, while A is still
+        in place, and confirm the YouTube side is the baseline again. A B that
+        may still be listed is reported (``_report_inserted``); a B gone with
+        something else changed only stops the run."""
+        result, _ = self._write(
+            action.item_id,
+            "playlist_rollback",
+            lambda: self.yt.delete_playlist_item(b_item_id),
+            lambda _: f"deleted item {b_item_id} ({action.b_video_id})",
+        )
+        if result == "ok":
+            time.sleep(_VERIFY_WAIT_SECONDS)
+            youtube = self._side_after(
+                action,
+                "playlist_rollback_verify",
+                base.youtube,
+                lambda: self._read_youtube(action.playlist_id),
+                "YouTube side",
+            )
+            if youtube == base.youtube:
+                return True
+            if youtube is not None and b_item_id not in {item_id for item_id, _ in youtube}:
+                self._halt()
+                return False
+        self._report_inserted(action)
+        return False
+
+    def _report_inserted(self, action: PlaylistAction) -> None:
+        """B may be in the playlist next to A: report it and stop the run."""
+        self.left_inserted.append((action.playlist_title, action.a_index + 1, action.b_video_id))
+        self._halt()
 
     def _halt(self) -> _Outcome:
         """Stop the run after a step that didn't go as planned, unless a read
@@ -373,9 +512,23 @@ class _PlaylistRun:
         read: Callable[[], _T],
         side: str,
     ) -> _T | None:
-        """Read a side, once more after a wait on a mismatch, and record one
-        ``kind`` row. Returns the last read, or None if it failed (which
-        stops the run)."""
+        """Read a side until it equals ``expected`` (``_read_settled``) and
+        record one ``kind`` row. Returns the last read, or None if it failed."""
+        got = self._read_settled(action, kind, read, lambda got: got == expected)
+        if got is not None:
+            self._record_check(action, kind, side, expected, got)
+        return got
+
+    def _read_settled(
+        self,
+        action: PlaylistAction,
+        kind: str,
+        read: Callable[[], _T],
+        accept: Callable[[_T], bool],
+    ) -> _T | None:
+        """Read a side, once more after a wait if ``accept`` rejects it; returns
+        the last read. A failed read records a ``kind`` row, stops the run and
+        returns None."""
         for attempt in range(2):
             if attempt:
                 time.sleep(_RECHECK_WAIT_SECONDS)
@@ -385,16 +538,27 @@ class _PlaylistRun:
                 self._record(action.item_id, kind, "failed", f"read failed: {exc}")
                 self._read_failed(action, exc, "to check a repoint")
                 return None
-            if got == expected:
-                self._record(action.item_id, kind, "applied", f"{side} as expected")
-                return got
-        self._record(
-            action.item_id,
-            kind,
-            "failed",
-            f"{side}: {_difference(expected, got, 'expected')} ({_RECHECKED})",
-        )
+            if accept(got):
+                break
         return got
+
+    def _record_check(
+        self,
+        action: PlaylistAction,
+        kind: str,
+        side: str,
+        expected: Sequence[object],
+        got: Sequence[object],
+    ) -> None:
+        if got == expected:
+            self._record(action.item_id, kind, "applied", f"{side} as expected")
+        else:
+            self._record(
+                action.item_id,
+                kind,
+                "failed",
+                f"{side}: {_difference(expected, got, 'expected')} ({_RECHECKED})",
+            )
 
     def _read_youtube(self, playlist_id: str) -> _YouTube:
         try:

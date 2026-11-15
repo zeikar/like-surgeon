@@ -16,8 +16,9 @@ from sqlalchemy.orm import Session
 
 from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLISTS, ISSUE_PLAYLIST_RELINKED
 from likesurgeon.models import Diagnosis, DiagnosisItem, SyncAttempt
-from likesurgeon.playlist_dispatch import PlaylistExecResult, execute
+from likesurgeon.playlist_dispatch import PLAYLIST_STOP, PlaylistExecResult, execute
 from likesurgeon.playlist_repoint import PlaylistAction, PlaylistState
+from likesurgeon.sync_dispatch import QUOTA_REJECTED
 from likesurgeon.youtube_client import YouTubeWriteError
 from likesurgeon.ytmusic_client import UnexpectedResponseError
 
@@ -110,6 +111,7 @@ _WRITES_AND_CHECKS = [
     ("playlist_check", "applied"),
 ]
 _APPLIED = [("playlist_precheck", "applied"), *_WRITES_AND_CHECKS]
+_ROLLBACK = [("playlist_rollback", "applied"), ("playlist_rollback_verify", "applied")]
 
 
 def _one_playlist() -> FakePlaylistAccount:
@@ -316,9 +318,10 @@ def test_a_check_read_error_is_recorded_and_stops_the_run(session: Session) -> N
 
     res = execute(session, [action], states, ytm=acct, yt=acct)
 
-    row = _attempts(session, action.item_id)[-1]
-    assert (row.kind, row.status) == ("playlist_insert_verify", "failed")
-    assert row.reason == f"read failed: YouTube: {acct.youtube_read_errors[2]}"
+    rows = _attempts(session, action.item_id)
+    assert (rows[2].kind, rows[2].status) == ("playlist_insert_verify", "failed")
+    assert rows[2].reason == f"read failed: YouTube: {acct.youtube_read_errors[2]}"
+    assert [(r.kind, r.status) for r in rows[3:]] == _ROLLBACK  # B is removed again
     assert res.aborted is not None and "HTTP 500: boom" in res.aborted
 
 
@@ -332,6 +335,306 @@ def test_quota_on_a_check_read_names_the_quota_not_a_failed_repoint(session: Ses
     res = execute(session, [action], states, ytm=acct, yt=acct)
 
     assert (res.quota_exhausted, res.aborted) == (True, None)
-    row = _attempts(session, action.item_id)[-1]
+    rows = _attempts(session, action.item_id)
+    assert (rows[2].kind, rows[2].status) == ("playlist_insert_verify", "failed")
+    assert "quotaExceeded" in rows[2].reason
+    # Removing B is refused too, so B is reported.
+    assert (rows[3].kind, rows[3].status) == ("playlist_rollback", "failed")
+    assert res.left_inserted == (("T PL1", 2, "B"),)
+
+
+# ---------------------------------------------------------------------------
+# insert failures and removing B again
+# ---------------------------------------------------------------------------
+
+
+def _prepared(session: Session) -> tuple[FakePlaylistAccount, list[PlaylistAction], dict]:
+    """Two playlists, three actions (two in PL1), as scanned."""
+    acct = _two_playlists()
+    actions = _two_playlist_actions(session, acct)
+    states = _states(acct)
+    session.commit()
+    return acct, actions, states
+
+
+def test_an_insert_the_quota_rejects_stops_the_run(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.quota_after = 1  # the baseline read
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0, failed=1, skipped=0, unattempted=2, quota_exhausted=True
+    )
+    rows = _attempts(session, actions[0].item_id)
+    assert [(r.kind, r.status) for r in rows] == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "failed"),
+    ]
+    assert rows[-1].reason.startswith(QUOTA_REJECTED)
+    assert acct.write_calls == []
+    assert (acct.youtube_reads, acct.ytm_reads) == (1, 1)
+
+
+def test_an_accepted_insert_that_is_not_listed_is_reported_and_stops_the_run(
+    session: Session, sleeps: list[float]
+) -> None:
+    """A 2xx insert may still land later, so B is reported as possibly there."""
+    acct, actions, states = _prepared(session)
+    acct.insert_does_not_land = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        unattempted=2,
+        aborted=PLAYLIST_STOP,
+        left_inserted=(("T PL1", 2, "B1"),),
+    )
+    assert _steps(session, actions[0].item_id) == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "applied"),
+        ("playlist_insert_verify", "failed"),
+    ]
+    assert _status(session, actions[0]) == "open"
+    assert acct.write_calls == [("insert", "PL1", "B1", "1")]
+    assert sleeps == [5, 15]
+
+
+def test_an_insert_that_errored_and_did_not_land_stays_open(
+    session: Session, sleeps: list[float]
+) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_errors = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=2, failed=1, skipped=0)
+    assert sleeps[:2] == [5, 15]  # "didn't land" only after the re-read
+    assert _steps(session, actions[0].item_id) == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "failed"),
+        ("playlist_insert_verify", "failed"),
+    ]
+    assert _status(session, actions[0]) == "open"
+    assert ("i1", "A1") in acct.playlists["PL1"]
+
+
+def test_an_insert_that_errored_but_landed_is_removed_again(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_errors_after_landing = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=2, failed=1, skipped=0)
+    assert _steps(session, actions[0].item_id) == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "failed"),
+        ("playlist_insert_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    # Only the item this action added is deleted, by its item id.
+    assert acct.write_calls[:3] == [
+        ("insert", "PL1", "B1", "1"),
+        ("delete", "new1"),
+        ("insert", "PL1", "B2", "2"),
+    ]
+    assert _status(session, actions[0]) == "open"
+    # B1 gone again; the next action then repointed A2.
+    assert acct.playlists["PL1"] == [("i0", "v0"), ("i1", "A1"), ("new2", "B2")]
+
+
+def test_an_errored_insert_at_another_index_is_removed_and_stops_the_run(
+    session: Session,
+) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_errors_after_landing = {"B1"}
+    acct.insert_lands_at_end = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0, failed=1, skipped=0, unattempted=2, aborted=PLAYLIST_STOP
+    )
+    assert _steps(session, actions[0].item_id)[-3:] == [
+        ("playlist_insert_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.playlists["PL1"] == list(states["PL1"].youtube)
+
+
+def test_an_errored_insert_whose_item_cannot_be_identified_deletes_nothing(
+    session: Session,
+) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_errors_after_landing = {"B1"}
+    insert = acct.insert_playlist_item
+
+    def insert_and_someone_adds_another(playlist_id: str, video_id: str, position: int) -> str:
+        acct.playlists[playlist_id].append(("ix", "B1"))
+        return insert(playlist_id, video_id, position)
+
+    acct.insert_playlist_item = insert_and_someone_adds_another  # type: ignore[method-assign]
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0,
+        failed=1,
+        skipped=0,
+        unattempted=2,
+        aborted=PLAYLIST_STOP,
+        left_inserted=(("T PL1", 2, "B1"),),
+    )
+    assert [c for c in acct.write_calls if c[0] == "delete"] == []
+    row = _attempts(session, actions[0].item_id)[-1]
     assert (row.kind, row.status) == ("playlist_insert_verify", "failed")
-    assert "quotaExceeded" in row.reason
+    assert "can't tell which item" in row.reason
+
+
+def test_an_insert_at_another_index_is_removed_and_stops_the_run(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_lands_at_end = {"B1"}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0, failed=1, skipped=0, unattempted=2, aborted=PLAYLIST_STOP
+    )
+    assert _steps(session, actions[0].item_id) == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "applied"),
+        ("playlist_insert_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.playlists["PL1"] == list(states["PL1"].youtube)
+    assert acct.write_calls == [("insert", "PL1", "B1", "1"), ("delete", "new1")]
+
+
+def test_b_not_shown_by_ytmusic_is_removed_and_a_kept(
+    session: Session, sleeps: list[float]
+) -> None:
+    acct, actions, states = _prepared(session)
+    unchanged = list(states["PL1"].ytmusic)
+    acct.ytm_reads_returning = {2: unchanged, 3: unchanged}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(
+        applied=0, failed=0, skipped=1, unattempted=2, aborted=PLAYLIST_STOP
+    )
+    assert _steps(session, actions[0].item_id) == [
+        ("playlist_precheck", "applied"),
+        ("playlist_insert", "applied"),
+        ("playlist_insert_verify", "applied"),
+        ("playlist_ytm_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.write_calls == [("insert", "PL1", "B1", "1"), ("delete", "new1")]
+    assert acct.playlists["PL1"] == list(states["PL1"].youtube)
+    assert _status(session, actions[0]) == "skipped"
+    assert sleeps == [5, 15, 5]
+
+
+def test_an_unreadable_ytmusic_check_removes_b_and_stops_the_run(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_read_errors = {2: UnexpectedResponseError("shape changed")}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.aborted is not None and "shape changed" in res.aborted
+    assert (res.failed, res.unattempted) == (1, 2)
+    assert _steps(session, actions[0].item_id)[-3:] == [
+        ("playlist_ytm_verify", "failed"),
+        *_ROLLBACK,
+    ]
+    assert acct.write_calls == [("insert", "PL1", "B1", "1"), ("delete", "new1")]
+    assert _status(session, actions[0]) == "open"
+
+
+def test_a_stale_ytmusic_read_is_settled_by_the_re_read(
+    session: Session, sleeps: list[float]
+) -> None:
+    acct = _one_playlist()
+    action = _action(session, _diagnosis(session), acct, "PL1", 1)
+    states = _states(acct)
+    session.commit()
+    acct.ytm_stale_reads = {2}  # repeats the baseline read
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=1, failed=0, skipped=0)
+    assert _steps(session, action.item_id) == _APPLIED
+    assert sleeps == [5, 15, 5]
+
+
+@pytest.mark.parametrize("knob", ["delete_errors", "delete_does_not_land"])
+def test_a_b_that_cannot_be_removed_is_reported(session: Session, knob: str) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_lands_at_end = {"B1"}
+    getattr(acct, knob).add("new1")
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.left_inserted == (("T PL1", 2, "B1"),)
+    assert res.aborted == PLAYLIST_STOP
+    assert res.unattempted == 2
+    assert _attempts(session, actions[0].item_id)[-1].status == "failed"
+
+
+def test_a_failed_insert_after_an_applied_repoint_does_not_make_the_playlist_stale(
+    session: Session,
+) -> None:
+    acct = FakePlaylistAccount(
+        {"PL1": [("i1", "A1"), ("i2", "A2"), ("i3", "A3")]},
+        renders={"A1": "B1", "A2": "B2", "A3": "B3"},
+    )
+    diag = _diagnosis(session)
+    actions = [_action(session, diag, acct, "PL1", i) for i in range(3)]
+    states = _states(acct)
+    session.commit()
+    acct.insert_errors = {"B2"}  # didn't land: the run goes on
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=2, failed=1, skipped=0)
+    assert [v for _, v in acct.playlists["PL1"]] == ["B1", "A2", "B3"]
+    # The third action re-reads both sides and compares them with the scan
+    # plus the first repoint.
+    assert _steps(session, actions[2].item_id) == _APPLIED
+
+
+def test_a_b_removal_that_cannot_be_read_back_is_reported(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_lands_at_end = {"B1"}
+    # Reads: baseline, insert check and its re-read, then the removal's check.
+    acct.youtube_read_errors[4] = YouTubeWriteError("PL1", "playlist_read", "HTTP 500: boom")
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res.left_inserted == (("T PL1", 2, "B1"),)
+    assert res.aborted is not None and "HTTP 500: boom" in res.aborted
+    assert _steps(session, actions[0].item_id)[-2:] == [
+        ("playlist_rollback", "applied"),
+        ("playlist_rollback_verify", "failed"),
+    ]
+
+
+def test_a_removed_b_with_another_change_stops_without_reporting_b(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.insert_lands_at_end = {"B1"}
+    delete = acct.delete_playlist_item
+
+    def delete_and_someone_adds(item_id: str) -> None:
+        delete(item_id)
+        acct.playlists["PL1"].append(("iy", "Y"))
+
+    acct.delete_playlist_item = delete_and_someone_adds  # type: ignore[method-assign]
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert (res.left_inserted, res.aborted) == ((), PLAYLIST_STOP)
+    row = _attempts(session, actions[0].item_id)[-1]
+    assert (row.kind, row.status) == ("playlist_rollback_verify", "failed")
