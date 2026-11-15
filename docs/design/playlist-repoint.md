@@ -1,6 +1,6 @@
 # Playlist repoint
 
-Spec for `repoint-playlists`: a report of dead items in your own playlists that YT Music shows as another video (A → B), and `repoint-playlists --apply`, which replaces A's playlist item with B at the same position through the YouTube Data API. The code is in `playlist_repoint.py` (pure pairing, report, planner) and `playlist_dispatch.py` (the writes); this is the model and the rules they follow.
+Spec for `repoint-playlists`: a report of dead items in your own playlists that YT Music shows as another video (A → B), and `repoint-playlists --apply`, which replaces A's playlist item with B through the YouTube Data API: at the same position in a manually sorted playlist, and where the sort order puts it in an automatically sorted one. The code is in `playlist_repoint.py` (pure pairing, report, planner) and `playlist_dispatch.py` (the writes); this is the model and the rules they follow.
 
 ## Model
 
