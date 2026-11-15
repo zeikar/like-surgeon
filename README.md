@@ -15,6 +15,8 @@
 
 YouTube Music keeps no likes of its own: *Liked songs* is a view of your YouTube *Liked videos*, and over the years the two drift apart. A song gets swapped for another release while your like stays on the dead upload, the same song shows up twice, music you liked never appears, or a like is left on a deleted video. like-surgeon lines the two lists up, works out which YouTube like is behind every song, and fixes the mismatches it can prove — on YouTube, with a check after every change.
 
+Optionally, `canonicalize` moves each like to the release the artist's page lists (a compilation track → the original single), so your likes show on the artist page and in Top songs — and catches the same song liked twice as two releases along the way.
+
 It's a command-line tool that runs on your machine. Each scan of both lists is kept as a snapshot in a local SQLite file, which doubles as the backup YouTube Music doesn't offer. No server, no account of ours: your data and credentials stay on your computer.
 
 ## How it works
@@ -38,6 +40,7 @@ likesurgeon scan ytmusic
 likesurgeon scan youtube-likes --region US        # your country code, so region-blocked videos are caught
 likesurgeon compare-likes                         # what's wrong, and what can be fixed
 likesurgeon sync --dry-run                        # the plan, without writing anything
+likesurgeon canonicalize                          # optional: likes on another release than the artist page lists
 ```
 
 <p align="center">
@@ -59,6 +62,8 @@ Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — n
 | `unrendered_music` | A plays fine and looks like music, but isn't shown in YT Music | **`relike`** with `--relike-unrendered` (off by default) |
 | `unbacked_lm_entry` | a YT Music entry with no like that can be pinned behind it | report only |
 | `metadata_drift` | a title or artist changed between two scans | report only |
+
+`canonicalize` keeps its own report, separate from these: `canonical_version` (a liked audio track the artist page doesn't list, with exactly one same-title, same-length track that it does) and `canonical_ambiguous` — see [Canonicalize](https://github.com/zeikar/like-surgeon#6-canonicalize-optional).
 
 ## Safety
 
