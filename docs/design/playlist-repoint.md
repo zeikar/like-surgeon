@@ -111,6 +111,13 @@ A live probe on 2026-11-15, on an owned 16-item playlist of an account that has 
 - **A region-blocked video can be inserted again.** The API accepted an insert of the playlist's own region-blocked video at index 1. YT Music showed, in that slot, the same playable video it already shows in place of that blocked video elsewhere in the playlist. The list grew by one and the rest was unchanged. This confirms the rendering model (YT Music shows a playable version in place of a blocked item), and that putting a region-blocked A back during an undo is possible.
 - **Quota.** Taken from the documented costs, not measured: 50 units per insert or delete, 1 per `playlistItems.list` page.
 
+### First live run (2026-11-15)
+
+- **Manually sorted playlist (16 items):** 1 repoint, then the remaining 5. All 6 applied; each action's seven rows were `applied`. After a re-scan the playlist still held 16 items in YT Music, every song at its old position, and none of its dead items was left.
+- **Automatically sorted playlists:** the first positional insert in one was refused (`HTTP 400: Playlist should use manual sorting to support position.`), which led to sorted mode. After it, 37 repoints in 8 automatically sorted playlists (all sorted by date added, newest first) applied with no failure, skip or restore. Each B went to the top of its playlist; the other songs kept their relative order and moved down by the number of repoints in that playlist. Every playlist kept its song set and count.
+- **Totals:** 43 of the 45 findings applied; the other 2 (B already on the playlist) stay report-only. Dead items on the YouTube side went from 199 to 156.
+- **Quota:** a day of repeated playlist scans (about 200+ units each) plus the probe and the first repoints exhausted the daily quota once; the run stopped before sending anything and continued cleanly after the reset.
+
 The first real `--apply` (2026-11-15) worked on a manually sorted playlist. On an automatically sorted one, `playlistItems.insert` with `snippet.position` failed with `HTTP 400: Playlist should use manual sorting to support position.` (reason `manualSortRequired`). Nothing landed (checked by hand). The dispatcher of that time treated the errored insert as possibly landing, reported B in `left_inserted` and stopped. An insert without a position is accepted by such a playlist, and B goes where its sort rule puts it. This is why the [Sorted playlists](#sorted-playlists) mode exists.
 
 ## Decisions
