@@ -1337,8 +1337,10 @@ def real_ytmusic_client(
         def get_liked_songs(self, limit: int | None) -> dict[str, Any]:
             return {"tracks": acct.fetch_liked_songs(limit)}
 
-        def get_account_info(self) -> dict[str, Any]:
-            return {"accountName": "Me", "channelHandle": "@me"}
+        def _send_request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+            from .test_ytmusic_client import account_menu
+
+            return account_menu({"accountName": "Me", "channelHandle": "@me"})
 
     class _AccountClient(YTMusicClient):
         def _build(self, path: Path | None = None) -> Any:

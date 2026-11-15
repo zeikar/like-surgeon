@@ -8,6 +8,7 @@ ytmusicapi >= 1.7 requires user-supplied Google Cloud credentials wrapped in
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -251,36 +252,65 @@ def parse_artist_page(response: dict[str, Any]) -> tuple[list[str], str | None] 
     raise MissingSongsShelfError("the artist page came back without its songs list")
 
 
-def _account_identity(client: YTMusic) -> str:
-    """See ``YTMusicClient.account_identity``.
+def _run_text(field: Any) -> str | None:
+    """The text of a ``{"runs": [{"text": ...}, ...]}`` field, or None."""
+    runs = field.get("runs") if isinstance(field, dict) else None
+    if not isinstance(runs, list):
+        return None
+    text = "".join(
+        r["text"] for r in runs if isinstance(r, dict) and isinstance(r.get("text"), str)
+    )
+    return text or None
 
-    The channel handle is the only unique id ytmusicapi exposes. Without one,
-    a display name alone would let another account with the same name pass,
-    so the name is paired with the profile photo URL (``name|photo_url``);
-    a changed photo then reads as another account, which only turns the
-    refresh off. Neither is guaranteed unique, so two handle-less accounts
-    with the same name and photo URL still pass; accepted by the maintainer
-    as a known limit over turning the refresh off for such accounts.
+
+def parse_account_menu(response: Any) -> str:
+    """The account identity in a raw ``account/account_menu`` response.
+
+    The channel handle when there is one: it is unique. Without one,
+    ``<sha256 of the Google account email>|<display name>``. The email is the
+    only stable unique value the menu carries for such accounts (the profile
+    photo URL is re-signed between sessions, so 0.13.1's ``name|photo_url``
+    stopped matching within hours); it is hashed so config.json never holds
+    it. The name stays because brand accounts under one Google login share
+    its email; two brand accounts under one login with the same name still
+    pass, a known limit (every write's full Liked songs check still applies).
+    Raises ``UnexpectedResponseError`` when neither is readable.
     """
     try:
-        info = client.get_account_info()
+        header = response["actions"][0]["openPopupAction"]["popup"]["multiPageMenuRenderer"][
+            "header"
+        ]["activeAccountHeaderRenderer"]
+        if not isinstance(header, dict):
+            raise TypeError(f"header is a {type(header).__name__}")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise UnexpectedResponseError(
+            "couldn't confirm the signed-in YT Music account "
+            f"(no account header: {type(exc).__name__}: {exc})"
+        ) from exc
+    handle = _run_text(header.get("channelHandle"))
+    if handle:
+        return handle
+    name = _run_text(header.get("accountName"))
+    email = _run_text(header.get("email"))
+    if name and email and "@" in email:
+        digest = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
+        return f"{digest}|{name}"
+    raise UnexpectedResponseError(
+        "couldn't confirm the signed-in YT Music account (no channel handle, "
+        "and no name and account email to use instead)"
+    )
+
+
+def _account_identity(client: YTMusic) -> str:
+    """See ``YTMusicClient.account_identity``. Reads the menu raw because
+    ``get_account_info`` doesn't return the email."""
+    try:
+        response = client._send_request("account/account_menu", {})
     except Exception as exc:  # noqa: BLE001 — system-boundary catch
         raise UnexpectedResponseError(
             f"couldn't confirm the signed-in YT Music account ({type(exc).__name__}: {exc})"
         ) from exc
-    if not isinstance(info, dict):
-        raise UnexpectedResponseError(
-            f"couldn't confirm the signed-in YT Music account (got a {type(info).__name__})"
-        )
-    handle, name, photo = (info.get(k) for k in ("channelHandle", "accountName", "accountPhotoUrl"))
-    if isinstance(handle, str) and handle:
-        return handle
-    if isinstance(name, str) and name and isinstance(photo, str) and photo:
-        return f"{name}|{photo}"
-    raise UnexpectedResponseError(
-        "couldn't confirm the signed-in YT Music account (no channel handle, "
-        "and no name and profile photo to use instead)"
-    )
+    return parse_account_menu(response)
 
 
 class YTMusicClient:
@@ -407,8 +437,8 @@ class YTMusicClient:
             ) from exc
 
     def account_identity(self) -> str:
-        """The signed-in account's channel handle, or ``name|photo_url`` when it
-        has none (see ``_account_identity``). Raises ``AuthFileMissingError``
+        """The signed-in account's channel handle, or ``<email sha256>|name``
+        when it has none (see ``parse_account_menu``). Raises ``AuthFileMissingError``
         without a usable auth file and ``UnexpectedResponseError`` when the
         account can't be read."""
         return _account_identity(self._build())
@@ -438,9 +468,9 @@ class YTMusicClient:
             if identity != account:
                 raise UnexpectedResponseError(
                     f"{browser} is now signed in to {identity}, not {account}, the account "
-                    "`auth ytmusic --from-browser` recorded. If it is the same account (a new "
-                    "profile photo, or an identity recorded by an older version), re-run "
-                    "that command"
+                    "`auth ytmusic --from-browser` recorded. If it is the same account (a "
+                    "renamed account, one that gained a handle, or an identity recorded by an "
+                    "older version), re-run that command"
                 )
             os.replace(candidate, target)
         # Extraction boundary: browser_cookie3 and the OS decrypt paths raise

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from likesurgeon.ytmusic_client import (
     MissingSongsShelfError,
     UnexpectedResponseError,
     YTMusicClient,
+    parse_account_menu,
     parse_artist_page,
 )
 
@@ -189,10 +191,33 @@ def test_fetch_liked_songs_wraps_parse_indexerror_as_unexpected_response() -> No
     assert isinstance(exc_info.value.__cause__, IndexError)
 
 
+def account_menu(account: dict[str, Any]) -> dict[str, Any]:
+    """A raw ``account/account_menu`` response carrying ``account``'s
+    ``accountName`` / ``channelHandle`` / ``email`` (absent keys left out)."""
+    keys = {"accountName": "accountName", "channelHandle": "channelHandle", "email": "email"}
+    header = {
+        field: {"runs": [{"text": account[key]}]}
+        for key, field in keys.items()
+        if account.get(key) is not None
+    }
+    header["accountPhoto"] = {"thumbnails": [{"url": "https://yt3/re-signed-every-session"}]}
+    return {
+        "actions": [
+            {
+                "openPopupAction": {
+                    "popup": {
+                        "multiPageMenuRenderer": {"header": {"activeAccountHeaderRenderer": header}}
+                    }
+                }
+            }
+        ]
+    }
+
+
 class _SequenceYTMusic:
     """Fake YTMusic whose successive ``get_liked_songs`` calls (shared across
     rebuilds) raise or return the next item of ``outcomes``; ``account`` is
-    what ``get_account_info`` reports (an exception is raised)."""
+    what the account menu reports (an exception is raised)."""
 
     def __init__(self, outcomes: list[Any], account: Any = None) -> None:
         self.outcomes = outcomes
@@ -206,10 +231,11 @@ class _SequenceYTMusic:
             raise outcome
         return outcome
 
-    def get_account_info(self) -> Any:
+    def _send_request(self, endpoint: str, body: dict[str, Any]) -> Any:
+        assert endpoint == "account/account_menu"
         if isinstance(self.account, BaseException):
             raise self.account
-        return self.account
+        return account_menu(self.account)
 
 
 class _RefreshClient(YTMusicClient):
@@ -288,15 +314,18 @@ def test_fetch_liked_songs_refreshes_cookies_and_retries_once(
     assert _only_auth_file_left(auth_file)
 
 
-_NO_HANDLE = {"accountName": "Me", "channelHandle": None, "accountPhotoUrl": "https://yt3/me"}
+_EMAIL_HASH = hashlib.sha256(b"me@example.com").hexdigest()
+_NO_HANDLE = {"accountName": "Me", "channelHandle": None, "email": "Me@Example.com "}
 
 
-def test_fetch_liked_songs_without_handle_matches_name_and_photo(
+def test_fetch_liked_songs_without_handle_matches_email_and_name(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:
+    """The email is hashed after trimming and casefolding; the photo URL
+    (re-signed between sessions) plays no part."""
     fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=_NO_HANDLE)
     client = _RefreshClient(
-        fake, auth_file, refresh_browser="chrome", refresh_account="Me|https://yt3/me"
+        fake, auth_file, refresh_browser="chrome", refresh_account=f"{_EMAIL_HASH}|Me"
     )
     assert client.fetch_liked_songs() == []
     assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
@@ -304,13 +333,19 @@ def test_fetch_liked_songs_without_handle_matches_name_and_photo(
 
 @pytest.mark.parametrize(
     "recorded",
-    ["Me|https://yt3/other-me", "Me"],
-    ids=["same-name-other-photo", "name-only-from-older-version"],
+    [
+        f"{hashlib.sha256(b'other@example.com').hexdigest()}|Me",
+        f"{_EMAIL_HASH}|Brand channel",
+        "Me|https://yt3/me",
+        "Me",
+    ],
+    ids=["same-name-other-email", "same-email-other-name", "name-photo-0.13.1", "name-0.13.0"],
 )
-def test_fetch_liked_songs_without_handle_same_name_is_not_enough(
+def test_fetch_liked_songs_without_handle_needs_email_and_name(
     extractions: list[tuple[str, Path]], auth_file: Path, recorded: str
 ) -> None:
-    """Another account with the same display name must not pass."""
+    """Another account with the same name, a brand account under the same
+    Google login, or an identity recorded by an older version must not pass."""
     fake = _SequenceYTMusic([_STALE, {"tracks": []}], account=_NO_HANDLE)
     client = _RefreshClient(fake, auth_file, refresh_browser="chrome", refresh_account=recorded)
     with pytest.raises(UnexpectedResponseError, match="re-run that command"):
@@ -319,7 +354,7 @@ def test_fetch_liked_songs_without_handle_same_name_is_not_enough(
     assert fake.calls == 1
 
 
-def test_fetch_liked_songs_without_handle_or_photo_is_not_refreshed(
+def test_fetch_liked_songs_without_handle_or_email_is_not_refreshed(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:
     fake = _SequenceYTMusic(
@@ -332,7 +367,7 @@ def test_fetch_liked_songs_without_handle_or_photo_is_not_refreshed(
     assert _only_auth_file_left(auth_file)
 
 
-def test_account_identity_without_handle_or_photo_raises() -> None:
+def test_account_identity_without_handle_or_email_raises() -> None:
     """`auth ytmusic --from-browser` then records no browser: refresh is off."""
     client = _RefreshClient(
         _SequenceYTMusic([], account={"accountName": "Me", "channelHandle": None}),
@@ -340,6 +375,48 @@ def test_account_identity_without_handle_or_photo_raises() -> None:
     )
     with pytest.raises(UnexpectedResponseError, match="no channel handle"):
         client.account_identity()
+
+
+def test_parse_account_menu_prefers_handle_and_never_stores_email() -> None:
+    both = {"accountName": "Me", "channelHandle": "@me", "email": "me@example.com"}
+    assert parse_account_menu(account_menu(both)) == "@me"
+    identity = parse_account_menu(account_menu(_NO_HANDLE))
+    assert identity == f"{_EMAIL_HASH}|Me"
+    assert "example.com" not in identity
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"actions": []},
+        {
+            "actions": [
+                {
+                    "openPopupAction": {
+                        "popup": {
+                            "multiPageMenuRenderer": {
+                                "header": {"activeAccountHeaderRenderer": None}
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+    ],
+    ids=["no-actions", "header-not-a-dict"],
+)
+def test_parse_account_menu_without_header_raises(response: dict[str, Any]) -> None:
+    with pytest.raises(UnexpectedResponseError, match="no account header"):
+        parse_account_menu(response)
+
+
+def test_parse_account_menu_skips_malformed_runs_and_needs_an_email() -> None:
+    menu = account_menu({"accountName": "Me", "email": "me@example.com"})
+    header = menu["actions"][0]["openPopupAction"]["popup"]["multiPageMenuRenderer"]["header"]
+    header["activeAccountHeaderRenderer"]["accountName"]["runs"].append({"text": None})
+    assert parse_account_menu(menu) == f"{_EMAIL_HASH}|Me"
+    with pytest.raises(UnexpectedResponseError, match="no channel handle"):
+        parse_account_menu(account_menu({"accountName": "Me", "email": "not-an-email"}))
 
 
 @pytest.mark.parametrize(
