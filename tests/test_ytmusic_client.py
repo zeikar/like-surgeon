@@ -14,6 +14,7 @@ from likesurgeon.ytmusic_client import (
     ArtistSongs,
     AuthFileMissingError,
     CookieExtractionError,
+    MissingSongsShelfError,
     UnexpectedResponseError,
     YTMusicClient,
     parse_artist_page,
@@ -34,6 +35,8 @@ class _FakeYTMusic:
     def _send_request(self, endpoint: str, body: dict[str, Any]) -> Any:
         self.browse_calls.append((endpoint, body))
         result = self._payload[body["browseId"]]
+        if isinstance(result, list):  # successive responses for one artist
+            result = result.pop(0)
         if isinstance(result, Exception):
             raise result
         return result
@@ -751,6 +754,31 @@ def test_parse_artist_page_plain_channel_has_no_songs_list() -> None:
     assert parse_artist_page(page) is None
 
 
+def _artist_page_without_songs() -> dict[str, Any]:
+    """A real artist page (immersive header) whose songs shelf didn't come back."""
+    page = _page({"musicCarouselShelfRenderer": {"header": {}}}, _PROMO_CAROUSEL)
+    page["header"] = {"musicImmersiveHeaderRenderer": {}}
+    return page
+
+
+def test_parse_artist_page_artist_without_songs_shelf_raises() -> None:
+    with pytest.raises(MissingSongsShelfError, match="songs list"):
+        parse_artist_page(_artist_page_without_songs())
+
+
+@pytest.mark.parametrize("header", [None, {"musicSomeNewHeaderRenderer": {}}])
+def test_parse_artist_page_unknown_header_without_songs_shelf_raises(
+    header: dict[str, Any] | None,
+) -> None:
+    # Only the plain-channel header means "no songs list": anything else might
+    # be an artist whose list was dropped, and must block its songs.
+    page = _page(_PROMO_CAROUSEL)
+    if header is not None:
+        page["header"] = header
+    with pytest.raises(MissingSongsShelfError):
+        parse_artist_page(page)
+
+
 def test_parse_artist_page_shelf_without_show_all_endpoint() -> None:
     assert parse_artist_page(_page(_songs_shelf(["t1"], None))) == (["t1"], None)
 
@@ -811,10 +839,56 @@ def test_fetch_artist_songs_without_show_all_link_skips_playlist(sleeps: list[fl
 
 
 def test_fetch_artist_songs_plain_channel_is_none(sleeps: list[float]) -> None:
-    client = _ArtistClient({"UC1": _page(_PROMO_CAROUSEL)})
+    page = _page(_PROMO_CAROUSEL)
+    page["header"] = {"musicVisualHeaderRenderer": {}}
+    client = _ArtistClient({"UC1": page})
     results, errors = client.fetch_artist_songs(["UC1"])
     assert results == {"UC1": None}
     assert errors == {}
+    assert client.fake is not None
+    assert len(client.fake.browse_calls) == 1  # no retry
+    assert sleeps == []
+
+
+def test_fetch_artist_songs_artist_without_songs_shelf_is_an_error_after_one_retry(
+    sleeps: list[float],
+) -> None:
+    client = _ArtistClient({"UC1": [_artist_page_without_songs(), _artist_page_without_songs()]})
+    results, errors = client.fetch_artist_songs(["UC1"])
+    assert results == {}
+    assert "MissingSongsShelfError" in errors["UC1"]
+    assert client.fake is not None
+    assert len(client.fake.browse_calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_fetch_artist_songs_retry_recovers_the_songs_shelf(sleeps: list[float]) -> None:
+    client = _ArtistClient(
+        {"UC1": [_artist_page_without_songs(), _page(_songs_shelf(["t1"], None))]}
+    )
+    results, errors = client.fetch_artist_songs(["UC1"])
+    assert errors == {}
+    assert results["UC1"] == ArtistSongs(("t1",), ())
+    assert sleeps == [1.0]
+
+
+def test_fetch_artist_songs_stops_retrying_after_three_failed_retries_in_a_row(
+    sleeps: list[float],
+) -> None:
+    missing = _artist_page_without_songs()
+    pages: dict[str, Any] = {f"UC{n}": [missing, missing] for n in range(1, 10)}
+    pages["UC3"] = [missing, _page(_songs_shelf(["t3"], None))]  # resets the streak
+    pages["UC8"] = _page(_songs_shelf(["t8"], None))  # outage over: resets it too
+    client = _ArtistClient(pages)
+    results, errors = client.fetch_artist_songs([f"UC{n}" for n in range(1, 10)])
+    assert set(errors) == {"UC1", "UC2", "UC4", "UC5", "UC6", "UC7", "UC9"}
+    assert results == {"UC3": ArtistSongs(("t3",), ()), "UC8": ArtistSongs(("t8",), ())}
+    assert client.fake is not None
+    reads = [body["browseId"] for _, body in client.fake.browse_calls]
+    assert reads.count("UC6") == 2  # third failed retry in a row
+    assert reads.count("UC7") == 1  # outage: no more retries
+    assert reads.count("UC9") == 2  # retried again after UC8 read cleanly
+    assert sleeps.count(1.0) == 7
 
 
 def test_fetch_artist_songs_one_failing_artist_does_not_stop_the_rest(

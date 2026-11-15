@@ -2106,6 +2106,86 @@ def test_canonicalize_unreadable_artist_is_a_warning(
     assert len(_canonical_items(fake_home)) == 1  # vid_c gets no finding
 
 
+def test_canonicalize_artist_page_without_songs_shelf_is_unreadable(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real ``fetch_artist_songs``: an artist page
+    (immersive header) that came back without its songs shelf, twice, blocks
+    the artist's songs instead of reading as "no songs list"."""
+    import json
+
+    import likesurgeon.cli as _cli_mod
+    from likesurgeon.cli import app
+    from likesurgeon.ytmusic_client import YTMusicClient
+
+    page = {
+        "header": {"musicImmersiveHeaderRenderer": {}},
+        "contents": {
+            "singleColumnBrowseResultsRenderer": {
+                "tabs": [
+                    {
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{"musicCarouselShelfRenderer": {"contents": []}}]
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+    }
+
+    class _Raw:
+        def get_liked_songs(self, limit: Any = None) -> dict[str, Any]:
+            return {"tracks": [_atv("vid_a", "Paper Lantern - Single")]}
+
+        def _send_request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+            return page
+
+    class _Client(YTMusicClient):
+        def _build(self) -> Any:
+            return _Raw()
+
+    monkeypatch.setattr(_cli_mod, "YTMusicClient", _Client)
+    monkeypatch.setattr("likesurgeon.ytmusic_client.time.sleep", lambda s: None)
+
+    result = CliRunner().invoke(app, ["canonicalize", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "MissingSongsShelfError" in payload["artist_errors"]["ch_art"]
+    assert "re-run canonicalize later" in result.stderr
+    assert payload["summary"]["unreadable"] == 1
+    assert payload["items"] == []
+
+
+def test_canonicalize_many_unreadable_artists_collapse_to_a_count(
+    fake_home: Path,
+    patch_discovery_client: type[_FakeYTMusicDiscovery],
+) -> None:
+    from likesurgeon.cli import app
+
+    fake = patch_discovery_client
+    for n in range(15):
+        fake.liked.append(_atv(f"vid_c{n}", "Lone Single", artist=f"ch_broken{n}"))
+    fake.artist_errors = {f"ch_broken{n}": "MissingSongsShelfError: gone" for n in range(15)}
+
+    result = CliRunner().invoke(app, ["canonicalize"], env={"COLUMNS": "250"})
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("couldn't be read") == 10
+    assert "5 more unreadable artist(s); `canonicalize --json` lists them all" in _out(result)
+    assert result.output.count("sometimes omits") == 1
+    [row] = [r for r in result.stdout.splitlines() if "unreadable artist (no finding)" in r]
+    assert "15" in row
+
+    as_json = CliRunner().invoke(app, ["canonicalize", "--json"], env={"COLUMNS": "250"})
+    assert as_json.exit_code == 0, as_json.output
+    assert "5 more unreadable artist(s); the JSON report lists them all" in as_json.stderr
+
+
 def test_canonicalize_second_run_keeps_a_skipped_finding_skipped(
     fake_home: Path,
     patch_discovery_client: type[_FakeYTMusicDiscovery],

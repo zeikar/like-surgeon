@@ -189,6 +189,13 @@ def extract_youtube_cookies(browser: str) -> list[Any]:
     return list(jar)
 
 
+class MissingSongsShelfError(UnexpectedResponseError):
+    """A page other than a plain channel came back without its songs shelf.
+    YT Music omits the shelf from real artist pages intermittently (ytmusicapi:
+    "API sometimes does not return songs"), so this is an unreadable artist,
+    not a page that has no songs list."""
+
+
 @dataclass(frozen=True)
 class ArtistSongs:
     """One artist's songs: Top songs ids, and the raw track dicts of the
@@ -200,13 +207,15 @@ class ArtistSongs:
 
 def parse_artist_page(response: dict[str, Any]) -> tuple[list[str], str | None] | None:
     """Read ``(top song ids, Show-all browse id)`` from a raw artist ``browse``
-    response, or ``None`` when the page has no songs shelf (a plain channel).
+    response, or ``None`` when a plain channel (``musicVisualHeaderRenderer``)
+    has no songs shelf.
 
     Keys on the first ``musicShelfRenderer`` anywhere in the section list
     rather than using ``get_artist``, which raises on plain channels and on
     headerless promo carousels. The Show-all id is ``None`` when the shelf has
-    no browse endpoint. Raises ``UnexpectedResponseError`` when the tabs path
-    is missing.
+    no browse endpoint. Raises ``MissingSongsShelfError`` for any other page
+    without the shelf, ``UnexpectedResponseError`` when the tabs path is
+    missing.
     """
     try:
         sections = response["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0][
@@ -232,7 +241,11 @@ def parse_artist_page(response: dict[str, Any]) -> tuple[list[str], str | None] 
         runs = shelf.get("title", {}).get("runs") or [{}]
         browse_id = runs[0].get("navigationEndpoint", {}).get("browseEndpoint", {}).get("browseId")
         return top_ids, browse_id
-    return None
+    # Allow-list the plain-channel header: an unknown or missing header could
+    # be an artist whose list was dropped, and must not read as "no songs".
+    if "musicVisualHeaderRenderer" in (response.get("header") or {}):
+        return None
+    raise MissingSongsShelfError("the artist page came back without its songs list")
 
 
 def _account_identity(client: YTMusic) -> str:
@@ -438,20 +451,34 @@ class YTMusicClient:
     ) -> tuple[dict[str, ArtistSongs | None], dict[str, str]]:
         """Read each artist's songs; returns ``(results, errors)`` by channel id.
 
-        ``results[id]`` is ``None`` for a page without a songs shelf (not an
-        error). A failing artist lands in ``errors`` with its message and the
-        rest continue; only a missing auth file stops the run.
+        ``results[id]`` is ``None`` for a plain channel without a songs shelf
+        (not an error). Any other page missing its shelf is read once more
+        after a pause, since the omission is intermittent. After three such
+        retries in a row have failed (an outage, where retrying only slows the
+        run), there are no more retries until a page returns its shelf. A
+        failing artist lands in ``errors`` with its message and the rest
+        continue; only a missing auth file stops the run.
         """
         ids = list(channel_ids)
         client = self._build()
         results: dict[str, ArtistSongs | None] = {}
         errors: dict[str, str] = {}
+        failed_retries = 0
         for done, channel_id in enumerate(ids, start=1):
+            body = {"browseId": channel_id}
             try:
-                parsed = parse_artist_page(client._send_request("browse", {"browseId": channel_id}))
+                try:
+                    parsed = parse_artist_page(client._send_request("browse", body))
+                except MissingSongsShelfError:
+                    if failed_retries >= 3:
+                        raise
+                    time.sleep(1.0)
+                    failed_retries += 1
+                    parsed = parse_artist_page(client._send_request("browse", body))
                 if parsed is None:
                     results[channel_id] = None
                 else:
+                    failed_retries = 0
                     top_ids, browse_id = parsed
                     songs: list[dict[str, Any]] = []
                     if browse_id is not None:

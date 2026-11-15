@@ -62,6 +62,7 @@ from .ytmusic_client import (
     SUPPORTED_BROWSERS,
     AuthFileMissingError,
     CookieExtractionError,
+    MissingSongsShelfError,
     UnexpectedResponseError,
     YTMusicClient,
     write_browser_json_from_browser,
@@ -738,6 +739,9 @@ def issues(
     console.print(_findings_table(f"{report} #{diag.id} — issues ({len(rows)})", rows))
 
 
+_ARTIST_WARNINGS_SHOWN = 10
+
+
 @app.command("canonicalize")
 def canonicalize_cmd(
     json_output: Annotated[
@@ -838,11 +842,21 @@ def canonicalize_cmd(
         diag_id = diag.id
         rows = _finding_rows(session, diagnosis_items(session, diag.id))
 
-    for artist_id, message in artist_errors.items():
+    # Capped: when YT Music drops the songs shelf for most artists, one line
+    # each would bury the report. --json keeps every error.
+    for artist_id, message in list(artist_errors.items())[:_ARTIST_WARNINGS_SHOWN]:
         out.print(
             f"[yellow]⚠[/yellow] artist {escape(artist_name(artist_id, *liked))} "
             f"({artist_id}) couldn't be read ({escape(message)}); its songs get no finding."
         )
+    if len(artist_errors) > _ARTIST_WARNINGS_SHOWN:
+        full_list = "the JSON report" if json_output else "`canonicalize --json`"
+        out.print(
+            f"[yellow]⚠[/yellow] … and {len(artist_errors) - _ARTIST_WARNINGS_SHOWN} more "
+            f"unreadable artist(s); {full_list} lists them all."
+        )
+    if any(m.startswith(f"{MissingSongsShelfError.__name__}:") for m in artist_errors.values()):
+        out.print("YT Music sometimes omits artist songs lists; re-run canonicalize later.")
     if carried:
         out.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
     if json_output:

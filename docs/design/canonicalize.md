@@ -30,7 +30,7 @@ Status: **implemented** (2026-11-15; proposed the same day). A separate command 
    - The B's: entries of those Show-all lists with a `videoId` ≠ A, `MUSIC_VIDEO_TYPE_ATV`, a `duration_seconds`, title key equal to A's, and `|duration(B) − duration(A)| ≤ 1 s`. The same B reached through two of A's artists, or listed twice, counts once.
    - Exactly one B → a `canonical_version` candidate. Two or more → `canonical_ambiguous`. None → nothing.
    - A shown more than once in LM → the finding is report-only (§4.1): another like also renders as A, and §5.1 would skip it at run time anyway.
-   - An artist with no songs list (§3) contributes no B's and doesn't block A.
+   - An artist with no songs list (a plain channel, §3) contributes no B's and doesn't block A.
 5. **Evidence flags** on each candidate, for the review: B is in Top songs; B is already liked (B's `videoId` is in LM); how many times LM shows A; a version keyword in A's album (§4.2).
 
 **Title key**: `normalize.normalize_for_match` (NFKC, wave dash → `~`, trimmed, casefolded) with every whitespace run collapsed to one space. Equality only; no substring, no fuzzy score. Example: `キズナミュージック♪ (instrumental)` at 317 s sits in the same list as the 316 s vocal track and is excluded only because its title key differs.
@@ -50,10 +50,11 @@ yt._send_request("browse", {"browseId": channelId})
 - **Songs shelf** = the first `musicShelfRenderer` anywhere in that section list (not necessarily the first section).
 - **Top songs ids** = `musicShelfRenderer.contents[].musicResponsiveListItemRenderer.playlistItemData.videoId`.
 - **Show-all browse id** = `musicShelfRenderer.title.runs[0].navigationEndpoint.browseEndpoint.browseId` → `get_playlist(browseId, limit=None)`; its raw track dicts are the songs list. A shelf without that endpoint yields Top songs ids and an empty songs list.
-- **No songs shelf** = "no songs list". Not an error: the artist is counted, contributes nothing, and doesn't block A.
-- A response without the tabs path, or a failing request, is a per-artist error: recorded with its message, reported as a warning, and the run continues with the other artists. A missing or unusable auth file stops the whole run.
+- **No songs shelf on a plain channel** (`musicVisualHeaderRenderer`) = "no songs list". Not an error: the artist is counted, contributes nothing, and doesn't block A.
+- **No songs shelf on any other page** (an artist page's `musicImmersiveHeaderRenderer`, no header, or an unknown one) = the songs list didn't come back. YT Music omits the shelf from artist pages intermittently (ytmusicapi's `get_artist`: "API sometimes does not return songs"); on 2026-11-15 it was missing from 8 of 8 reads of real artist pages (logged in and anonymous; the carousels and description came back), hours after the same pages had it. The page is read once more after 1 s; still missing → a per-artist error (`MissingSongsShelfError`), so A gets no finding rather than being judged against an empty list. After three such retries in a row have failed, the run stops retrying (an outage, where each retry only adds a second) unless a page reads cleanly: once a page returns its songs shelf, retries resume.
+- A response without the tabs path, or a failing request, is a per-artist error: recorded with its message, reported as a warning, and the run continues with the other artists. A missing or unusable auth file stops the whole run. The report prints the first 10 artist warnings and a count of the rest (the JSON report lists every error), plus one "re-run later" hint when a songs list was missing.
 
-**Header renderers.** A real artist page has a `musicImmersiveHeaderRenderer`. A plain YouTube channel credited as an artist has a `musicVisualHeaderRenderer` and only carousels (Videos, Playlists), no songs shelf. The parser ignores the header and keys on the shelf.
+**Header renderers.** A real artist page has a `musicImmersiveHeaderRenderer`. A plain YouTube channel credited as an artist has a `musicVisualHeaderRenderer` and only carousels (Videos, Playlists), no songs shelf. The parser keys on the shelf and looks at the header only when the shelf is missing. Only the plain-channel header is allow-listed as "no songs list": a missing or renamed header falls on the unreadable side, because "no songs list" doesn't block A and could let a dropped list produce a write-eligible finding.
 
 **The two `get_artist` failures:**
 1. Plain channel: `KeyError: 'musicImmersiveHeaderRenderer'`. The raw read gives "no songs list".
@@ -185,6 +186,7 @@ A stale finding (A unliked since the report, LM changed) ends `skipped`. Because
 - **About 150 songs per Show-all list** (HoneyWorks 150, Mariah Carey 149, Poppin'Party 149). For a larger catalog, A or B may sit past the cap: A may get a finding although listed further down, or B may be missed. Top songs ids count as listed as a small cushion. The review is the guard.
 - **Position isn't asserted.** The LM check compares counts; B's move to the top is documented, not verified.
 - **A wrong B passes the LM check.** If B were a different recording, "one A fewer, one B more" would still hold. The guards are the candidate rule (same artist list, ATV, equal title key, ±1 s), the version-keyword net and the review. The LM check guards A, the like that gets removed.
+- **The songs shelf comes and goes.** An artist page without it is unreadable (§3), so during an omission most artists can be unreadable and the report has few or no findings. The summary's "Audio tracks with an unreadable artist" and "Artist pages read / total" rows show it; re-run later.
 - **ytmusicapi's private `_send_request`** carries the artist-page read; an upstream rename breaks it. Every failure is per artist (no finding for its songs) except a missing auth file.
 
 ## 8. Docs and code impact
