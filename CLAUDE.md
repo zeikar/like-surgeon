@@ -35,13 +35,13 @@ Spec: [docs/design/canonicalize.md](docs/design/canonicalize.md). Gotchas:
 
 Cut a git tag **and** a GitHub release at every milestone bump (0.4.0, 0.4.1, 0.5.0, ...). Without these two artifacts there's no quick changelog and no rollback target — they're cheap, do them every time.
 
-Procedure on `main`, after the feature PR is merged:
+Procedure on `main`, once the feature is merged:
 
 1. Bump `version` in `pyproject.toml` **and** `__version__` in `src/likesurgeon/__init__.py` — these two must stay in lockstep (v0.8.0 shipped with `__init__.py` stale at `0.7.1`, fixed in 0.9.0).
 2. Commit `chore: bump version to <X.Y.Z>`.
 3. Tag the commit `v<X.Y.Z>` (with the `v` prefix).
 4. `git push && git push --tags`.
-5. `gh release create v<X.Y.Z> --title "v<X.Y.Z> — <slug>" --notes "..."` — notes summarize what shipped (cribbing from the PR description is fine), include the action-mapping or quota table when behavior changed. Publishing the release uploads to PyPI (`.github/workflows/release.yml`, trusted publishing); the workflow fails if the tag doesn't match both version strings. A PyPI version can't be re-uploaded, so a broken release means a new patch version.
+5. `gh release create v<X.Y.Z> --title "v<X.Y.Z> — <slug>" --notes "..."` — notes summarize what shipped (cribbing from the commit log is fine), include the action-mapping or quota table when behavior changed. Publishing the release uploads to PyPI (`.github/workflows/release.yml`, trusted publishing); the workflow fails if the tag doesn't match both version strings. A PyPI version can't be re-uploaded, so a broken release means a new patch version.
 
 Don't retro-edit a published tag/release for follow-up fixes — cut a fresh patch tag instead.
 
@@ -54,10 +54,6 @@ uv run ruff check
 ```
 
 CI runs all three. `ruff format --check` is the easy miss — `ruff check` alone catches lint but not formatting, and CI WILL fail on unformatted code.
-
-## Workflow
-
-Feature work goes through a PR (see PR #7 for the template). One-line patches, chore commits (version bumps), README fixes, and lint corrections can go straight to main — solo-maintained, CI runs on every push.
 
 ## Sync state model (when touching sync*.py / models)
 

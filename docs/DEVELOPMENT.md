@@ -176,17 +176,13 @@ for it in data['items'][:5]:
 
 ## Workflow
 
-Branch → commit → PR. Per-task TDD discipline (failing test → implementation → green → commit) for non-trivial changes; small fixes (typos, docstring drift, comment cleanup) can land as single commits.
+Per-task TDD discipline (failing test → implementation → green → commit) for non-trivial changes; small fixes (typos, docstring drift, comment cleanup) can land as single commits. Run the CI gate before pushing:
 
 ```bash
-git checkout -b feat/<short-name>
-# ... work ...
 uv run pytest -q && uv run ruff check . && uv run ruff format --check .
-git push -u origin feat/<short-name>
-gh pr create --base main --title "..." --body "..."
 ```
 
-CI is GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) running `ruff check`, `ruff format --check`, and `pytest` on Ubuntu / Python 3.13 for every push to main and every PR. Live tests stay deselected (the runner has no logged-in browser). PR descriptions follow the pattern in recent merged PRs (Summary + Test plan).
+CI is GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) running `ruff check`, `ruff format --check`, and `pytest` on Ubuntu / Python 3.13 for every push to main. Live tests stay deselected (the runner has no logged-in browser).
 
 ## Release process
 
