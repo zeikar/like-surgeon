@@ -14,6 +14,7 @@ from likesurgeon.compare import CanonicalMetadata
 from likesurgeon.diagnosis import (
     ALIGNMENT_ISSUE_TYPES,
     DIAGNOSIS_KIND_CANONICALIZE,
+    DIAGNOSIS_KIND_PLAYLISTS,
     ISSUE_DEAD_UNRENDERED,
     ISSUE_METADATA_DRIFT,
     ISSUE_RELINKED,
@@ -71,6 +72,19 @@ def test_latest_diagnosis_filters_by_kind(session: Session):
     session.commit()
     assert latest_diagnosis(session).id == alignment.id
     assert latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE).id == canon.id
+
+
+def test_latest_diagnosis_ignores_playlists_report(session: Session):
+    alignment = _make_empty_diagnosis(session)
+    canon = Diagnosis(kind=DIAGNOSIS_KIND_CANONICALIZE)
+    session.add(canon)
+    session.commit()
+    playlists = Diagnosis(kind=DIAGNOSIS_KIND_PLAYLISTS)
+    session.add(playlists)
+    session.commit()
+    assert latest_diagnosis(session).id == alignment.id
+    assert latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE).id == canon.id
+    assert latest_diagnosis(session, kind=DIAGNOSIS_KIND_PLAYLISTS).id == playlists.id
 
 
 def test_carry_over_skipped_keeps_terminal_skip_across_diagnoses(session: Session) -> None:

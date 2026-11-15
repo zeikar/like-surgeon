@@ -647,6 +647,54 @@ def test_fetch_library_playlists_transport_error_is_not_refreshed(
     assert extractions == []
 
 
+def test_fetch_playlist_returns_raw_dict(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    playlist = {"id": "PL1", "tracks": [{"videoId": "v1"}]}
+    fake = _SequenceYTMusic([playlist])
+    assert _refresh_client(fake, auth_file).fetch_playlist("PL1") == playlist
+    assert extractions == []
+
+
+@pytest.mark.parametrize("result", [["tracks"], {"id": "PL1"}, {"tracks": None}])
+def test_fetch_playlist_malformed_result_raises(auth_file: Path, result: Any) -> None:
+    with pytest.raises(UnexpectedResponseError):
+        _refresh_client(_SequenceYTMusic([result]), auth_file).fetch_playlist("PL1")
+
+
+@pytest.mark.parametrize(
+    "first_failure", [_STALE, YTMusicServerError("Server returned HTTP 401: Unauthorized.")]
+)
+def test_fetch_playlist_refreshes_cookies_and_retries_once(
+    extractions: list[tuple[str, Path]], auth_file: Path, first_failure: Exception
+) -> None:
+    fake = _SequenceYTMusic([first_failure, {"tracks": [{"videoId": "v1"}]}])
+    assert _refresh_client(fake, auth_file).fetch_playlist("PL1") == {"tracks": [{"videoId": "v1"}]}
+    assert len(extractions) == 1
+    assert auth_file.read_text(encoding="utf-8") == '{"Cookie": "new"}'
+    assert fake.calls == 2
+
+
+def test_fetch_playlist_transport_error_is_not_refreshed(
+    extractions: list[tuple[str, Path]], auth_file: Path
+) -> None:
+    fake = _SequenceYTMusic([ConnectionError("network down"), {"tracks": []}])
+    with pytest.raises(UnexpectedResponseError, match="network down"):
+        _refresh_client(fake, auth_file).fetch_playlist("PL1")
+    assert extractions == []
+
+
+def test_fetch_playlist_missing_auth_file_is_not_refreshed(
+    extractions: list[tuple[str, Path]],
+) -> None:
+    client = YTMusicClient(
+        browser_path=Path("/nope/browser.json"), refresh_browser="chrome", refresh_account="@me"
+    )
+    with pytest.raises(AuthFileMissingError):
+        client.fetch_playlist("PL1")
+    assert extractions == []
+
+
 def test_fetch_library_playlists_empty_with_readable_account_is_empty(
     extractions: list[tuple[str, Path]], auth_file: Path
 ) -> None:

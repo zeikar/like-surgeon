@@ -12,8 +12,12 @@ from google.auth.exceptions import RefreshError
 from likesurgeon.youtube_client import (
     AuthorizationRequiredError,
     ClientSecretsMissingError,
+    PlaylistManualSortRequired,
     YouTubeClient,
+    YouTubeQuotaExceededError,
     YouTubeWriteError,
+    playlist_item_key,
+    playlist_item_video_id,
 )
 
 
@@ -48,6 +52,18 @@ class _FakePlaylistItems:
             k: (list(v) if isinstance(v, list) else v) for k, v in (by_playlist or {}).items()
         }
         self.calls: list[dict[str, Any]] = []
+        self.insert_calls: list[dict[str, Any]] = []
+        self.delete_calls: list[dict[str, Any]] = []
+        self.write_error: Exception | None = None
+        self.insert_response: dict[str, Any] = {"id": "PLI_new"}
+
+    def insert(self, **kwargs: Any) -> _FakeRequest:
+        self.insert_calls.append(kwargs)
+        return _FakeRequest(self.insert_response, error=self.write_error)
+
+    def delete(self, **kwargs: Any) -> _FakeRequest:
+        self.delete_calls.append(kwargs)
+        return _FakeRequest(error=self.write_error)
 
     def list(self, **kwargs: Any) -> _FakeRequest:
         self.calls.append(kwargs)
@@ -1704,3 +1720,190 @@ def test_fetch_playlists_authorization_required_propagates():
     c._service = boom  # type: ignore[method-assign]
     with pytest.raises(AuthorizationRequiredError):
         c.fetch_playlists(["PL_one"])
+
+
+def test_playlist_item_video_id_prefers_content_details_then_resource_id():
+    assert playlist_item_video_id({"contentDetails": {"videoId": "c"}}) == "c"
+    assert playlist_item_video_id({"snippet": {"resourceId": {"videoId": "r"}}}) == "r"
+    assert playlist_item_video_id({"snippet": {}}) is None
+
+
+def test_playlist_item_key_pairs_item_id_with_video_id():
+    item = {"id": "PLI_1", "contentDetails": {"videoId": "vidA"}}
+    assert playlist_item_key(item) == ("PLI_1", "vidA")
+    assert playlist_item_key({"id": "PLI_2", "snippet": {}}) == ("PLI_2", None)
+
+
+def test_insert_playlist_item_sends_one_insert_and_returns_new_item_id():
+    c = _FakeClient([])
+    assert c.insert_playlist_item("PL_x", "vidB", 3) == "PLI_new"
+    assert c._fake_pi.insert_calls == [
+        {
+            "part": "snippet",
+            "body": {
+                "snippet": {
+                    "playlistId": "PL_x",
+                    "position": 3,
+                    "resourceId": {"kind": "youtube#video", "videoId": "vidB"},
+                }
+            },
+        }
+    ]
+
+
+def test_insert_playlist_item_without_a_position_omits_it():
+    c = _FakeClient([])
+    assert c.insert_playlist_item("PL_x", "vidB") == "PLI_new"
+    assert "position" not in c._fake_pi.insert_calls[0]["body"]["snippet"]
+
+
+_MANUAL_SORT = "Playlist should use manual sorting to support position."
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(400, _MANUAL_SORT, reason="manualSortRequired"),
+        _http_error(400, _MANUAL_SORT),  # no reason in the body: the message decides
+    ],
+    ids=["reason", "message"],
+)
+def test_insert_playlist_item_into_an_automatically_sorted_playlist_is_its_own_error(error):
+    c = _FakeClient([])
+    c._fake_pi.write_error = error
+    with pytest.raises(PlaylistManualSortRequired) as exc_info:
+        c.insert_playlist_item("PL_x", "vidB", 3)
+    assert "HTTP 400" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_insert_playlist_item_other_400_is_a_plain_write_error():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(400, "Bad request.", reason="invalidValue")
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.insert_playlist_item("PL_x", "vidB", 3)
+    assert not isinstance(exc_info.value, PlaylistManualSortRequired)
+
+
+def test_insert_playlist_item_http_error_has_status_and_reason_but_no_url():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(404, "Playlist not found.")
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.insert_playlist_item("PL_x", "vidB", 0)
+    assert not isinstance(exc_info.value, YouTubeQuotaExceededError)
+    assert "404" in str(exc_info.value)
+    assert "Playlist not found" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_insert_playlist_item_without_an_id_in_the_response_is_a_write_error():
+    c = _FakeClient([])
+    c._fake_pi.insert_response = {}
+    with pytest.raises(YouTubeWriteError, match="no playlist item id"):
+        c.insert_playlist_item("PL_x", "vidB", 0)
+
+
+def test_insert_playlist_item_quota_exceeded_is_its_own_error():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(403, "Quota exceeded.", reason="quotaExceeded")
+    with pytest.raises(YouTubeQuotaExceededError):
+        c.insert_playlist_item("PL_x", "vidB", 0)
+
+
+def test_insert_playlist_item_is_sent_once_on_a_503():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(503, "Backend error.")
+    with pytest.raises(YouTubeWriteError):
+        c.insert_playlist_item("PL_x", "vidB", 0)
+    assert len(c._fake_pi.insert_calls) == 1
+
+
+def test_insert_playlist_item_service_failure_becomes_write_error(monkeypatch):
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def broken() -> Any:
+        raise AuthorizationRequiredError("revoked")
+
+    monkeypatch.setattr(c, "_service", broken)
+    with pytest.raises(YouTubeWriteError, match="revoked"):
+        c.insert_playlist_item("PL_x", "vidB", 0)
+
+
+def test_delete_playlist_item_sends_one_delete_by_item_id():
+    c = _FakeClient([])
+    c.delete_playlist_item("PLI_9")
+    assert c._fake_pi.delete_calls == [{"id": "PLI_9"}]
+
+
+def test_delete_playlist_item_http_error_has_no_url_and_is_not_retried():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(503, "Backend error.")
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.delete_playlist_item("PLI_9")
+    assert "503" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+    assert len(c._fake_pi.delete_calls) == 1
+
+
+def test_delete_playlist_item_quota_exceeded_is_its_own_error():
+    c = _FakeClient([])
+    c._fake_pi.write_error = _http_error(403, "Quota exceeded.", reason="quotaExceeded")
+    with pytest.raises(YouTubeQuotaExceededError):
+        c.delete_playlist_item("PLI_9")
+
+
+def test_delete_playlist_item_service_failure_becomes_write_error(monkeypatch):
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def broken() -> Any:
+        raise AuthorizationRequiredError("revoked")
+
+    monkeypatch.setattr(c, "_service", broken)
+    with pytest.raises(YouTubeWriteError, match="revoked"):
+        c.delete_playlist_item("PLI_9")
+
+
+def test_read_playlist_items_returns_item_and_video_ids_across_pages():
+    pages = [
+        {
+            "items": [
+                {"id": "PLI_1", "contentDetails": {"videoId": "vidA"}},
+                {"id": "PLI_2", "snippet": {}},
+            ],
+            "nextPageToken": "p2",
+        },
+        {"items": [{"id": "PLI_3", "snippet": {"resourceId": {"videoId": "vidC"}}}]},
+    ]
+    c = _FakeClient([], by_playlist={"PL_x": pages})
+    assert c.read_playlist_items("PL_x") == [
+        ("PLI_1", "vidA"),
+        ("PLI_2", None),
+        ("PLI_3", "vidC"),
+    ]
+
+
+def test_read_playlist_items_http_error_becomes_write_error_without_url():
+    c = _FakeClient([], by_playlist={"PL_x": _http_error(404, "Playlist not found.")})
+    with pytest.raises(YouTubeWriteError) as exc_info:
+        c.read_playlist_items("PL_x")
+    assert "404" in str(exc_info.value)
+    assert "SECRET" not in str(exc_info.value)
+
+
+def test_read_playlist_items_quota_exceeded_is_its_own_error():
+    c = _FakeClient(
+        [], by_playlist={"PL_x": _http_error(403, "Quota exceeded.", reason="quotaExceeded")}
+    )
+    with pytest.raises(YouTubeQuotaExceededError):
+        c.read_playlist_items("PL_x")
+
+
+def test_read_playlist_items_auth_failure_becomes_write_error(monkeypatch):
+    c = YouTubeClient(client_secrets_path=None, token_path=None)
+
+    def broken() -> Any:
+        raise AuthorizationRequiredError("revoked")
+
+    monkeypatch.setattr(c, "_service", broken)
+    with pytest.raises(YouTubeWriteError, match="revoked"):
+        c.read_playlist_items("PL_x")

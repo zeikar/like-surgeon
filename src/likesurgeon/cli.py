@@ -1,7 +1,8 @@
 """Typer CLI for likesurgeon.
 
 Every command only reads the providers and writes the local DB, except
-``sync`` and ``canonicalize --apply``, which write likes on YouTube.
+``sync`` and ``canonicalize --apply``, which write likes on YouTube, and
+``repoint-playlists --apply``, which edits playlists on YouTube.
 """
 
 from __future__ import annotations
@@ -32,15 +33,18 @@ from .diagnosis import (
     ALIGNMENT_ISSUE_TYPES,
     CANONICAL_ISSUE_TYPES,
     DIAGNOSIS_KIND_CANONICALIZE,
+    DIAGNOSIS_KIND_PLAYLISTS,
     ISSUE_CANONICAL_AMBIGUOUS,
     ISSUE_CANONICAL_VERSION,
+    ISSUE_PLAYLIST_RELINKED,
+    PLAYLIST_ISSUE_TYPES,
     diagnosis_items,
     latest_diagnosis,
 )
 from .diff import diff_snapshots
 from .doctor import health_summary
 from .export import export_snapshot_json
-from .pipeline import MissingSnapshotsError, compare_and_persist
+from .pipeline import MissingSnapshotsError, compare_and_persist, fetch_pair_metadata
 from .playlists import is_backed_up, playlist_report
 from .snapshot import (
     PlaylistRead,
@@ -62,7 +66,9 @@ from .sync_preflight import (
     diagnosis_staleness,
     stranded_unliked_video_ids,
     sync_attempts_since_older_scan,
+    unsettled_playlist_actions,
 )
+from .youtube_client import playlist_item_video_id
 from .ytmusic_client import (
     SUPPORTED_BROWSERS,
     AuthFileMissingError,
@@ -410,7 +416,7 @@ def scan_youtube_likes(
     except HttpError as e:
         _fail(f"YouTube API error while fetching liked videos: {e}", code=1)
 
-    video_ids = [vid for vid in map(_playlist_item_video_id, items) if vid]
+    video_ids = [vid for vid in map(playlist_item_video_id, items) if vid]
 
     statuses = client.fetch_video_statuses(video_ids, user_region=user_region)
     attach_video_statuses(items, statuses)
@@ -442,13 +448,6 @@ def scan_youtube_likes(
             "https://github.com/zeikar/like-surgeon/blob/main/docs/notes/hidden-likes.md "
             "to find and re-like them."
         )
-
-
-def _playlist_item_video_id(item: dict[str, Any]) -> str | None:
-    """The video id of a raw ``playlistItems.list`` entry."""
-    snippet = item.get("snippet") or {}
-    content = item.get("contentDetails") or {}
-    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
 
 
 @scan_app.command("playlists")
@@ -562,7 +561,7 @@ def _youtube_playlist_items(
 
     video_ids = list(
         dict.fromkeys(
-            vid for items in results.values() for vid in map(_playlist_item_video_id, items) if vid
+            vid for items in results.values() for vid in map(playlist_item_video_id, items) if vid
         )
     )
     if cfg.region is None and video_ids:
@@ -913,6 +912,19 @@ def _findings_table(title: str, rows: list[dict[str, Any]]) -> Table:
     return table
 
 
+# Diagnosis kind -> (report name, the command that writes it). ``None`` is compare-likes.
+_REPORTS: dict[str | None, tuple[str, str]] = {
+    None: ("Diagnosis", "compare-likes"),
+    DIAGNOSIS_KIND_CANONICALIZE: ("Canonicalize report", "canonicalize"),
+    DIAGNOSIS_KIND_PLAYLISTS: ("Playlist repoint report", "repoint-playlists"),
+}
+# Issue types that live in a report other than the compare-likes diagnosis.
+_KIND_BY_ISSUE_TYPE: dict[str, str] = {
+    **dict.fromkeys(CANONICAL_ISSUE_TYPES, DIAGNOSIS_KIND_CANONICALIZE),
+    **dict.fromkeys(PLAYLIST_ISSUE_TYPES, DIAGNOSIS_KIND_PLAYLISTS),
+}
+
+
 @app.command()
 def issues(
     type: Annotated[
@@ -921,8 +933,9 @@ def issues(
             "--type",
             help=(
                 "Filter findings by issue type. One of: "
-                f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; or, from the latest canonicalize "
-                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}."
+                f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; from the latest canonicalize "
+                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}; or, from the latest "
+                f"repoint-playlists report, {' | '.join(PLAYLIST_ISSUE_TYPES)}."
             ),
         ),
     ] = None,
@@ -938,25 +951,26 @@ def issues(
         typer.Option("--format", "-f", help="Output format: 'table' (default) or 'json'."),
     ] = "table",
 ) -> None:
-    """List issues from the latest diagnosis (or canonicalize report, for its types)."""
+    """List issues from the latest diagnosis (or canonicalize / repoint-playlists report,
+    for their types)."""
     import json as jsonlib
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
-    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES
+    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES + PLAYLIST_ISSUE_TYPES
     if type is not None and type not in known:
         _fail(f"Unknown issue type: {type!r}. One of: {', '.join(known)}.", code=2)
-    canonical = type in CANONICAL_ISSUE_TYPES
+    kind = _KIND_BY_ISSUE_TYPE.get(type) if type is not None else None
+    report, command = _REPORTS[kind]
 
     _, factory = _bootstrap()
     with session_scope(factory) as session:
-        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_CANONICALIZE if canonical else None)
+        diag = latest_diagnosis(session, kind=kind)
         if diag is None:
-            command = "canonicalize" if canonical else "compare-likes"
-            what = "canonicalize report" if canonical else "diagnosis"
             console.print(
-                f"[yellow]No {what} yet.[/yellow] Run [cyan]likesurgeon {command}[/cyan] first."
+                f"[yellow]No {report.lower()} yet.[/yellow] "
+                f"Run [cyan]likesurgeon {command}[/cyan] first."
             )
             return
         items = diagnosis_items(session, diag.id)
@@ -974,7 +988,6 @@ def issues(
     if not rows:
         console.print("[dim]No issues match the filter.[/dim]")
         return
-    report = "Canonicalize report" if canonical else "Diagnosis"
     console.print(_findings_table(f"{report} #{diag.id} — issues ({len(rows)})", rows))
 
 
@@ -1297,14 +1310,277 @@ def _print_left_behind(result) -> None:
         )
 
 
+@app.command("repoint-playlists")
+def repoint_playlists_cmd(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help=(
+                "Instead of a new report, replace each open write-eligible playlist_relinked "
+                "item of the latest report with the video YT Music shows in its place."
+            ),
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option(
+            "--limit",
+            min=0,
+            help="With --apply: act on at most the first N findings (smallest playlists first).",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="With --apply: skip the interactive confirmation prompt."),
+    ] = False,
+) -> None:
+    """Find dead playlist items that YT Music shows as another video.
+
+    Reads the latest playlist scan and saves one playlist_relinked finding per
+    dead item on a playlist's YouTube side that YT Music shows as another
+    video in its place. videos.list metadata for both videos decides which are
+    write-eligible. Nothing is written to YouTube, except by --apply, which
+    replaces each open write-eligible finding's dead item with the video YT
+    Music shows in its place, smallest playlists first.
+    """
+    from .playlist_repoint import find_pairs, persist_report
+    from .playlists import load_scan
+
+    if not apply and (limit is not None or yes):
+        _fail("--limit and --yes only apply with --apply.", code=2)
+    if apply:
+        _repoint_playlists_apply(limit=limit, yes=yes)
+        return
+
+    cfg, factory = _bootstrap()
+    warnings: list[str] = []
+    with session_scope(factory) as session:
+        scan = load_scan(session)
+        if scan is None:
+            _fail("No playlist scan yet. Run `likesurgeon scan playlists` first.")
+        found = find_pairs(scan)
+        # A dead row can lack a video id; it then has no metadata to fetch.
+        vids = sorted({v for p in found.pairs for v in (p.a.video_id, p.b.video_id) if v})
+        metadata = (
+            fetch_pair_metadata(cfg, vids, warnings, report_only=f"{ISSUE_PLAYLIST_RELINKED} pairs")
+            if vids
+            else {}
+        )
+        diag, carried = persist_report(session, scan.scan.id, found.pairs, metadata)
+        diag_id = diag.id
+        rows = _finding_rows(session, diagnosis_items(session, diag.id))
+        with_youtube = sum(p.youtube_items is not None for p in scan.playlists)
+        dead = sum(it.is_available is False for p in scan.playlists for it in p.youtube_items or ())
+        playlist_count = len(scan.playlists)
+
+    for warning in warnings:
+        console.print(warning)
+    if carried:
+        console.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
+    console.print(f"[green]✓[/green] Playlist repoint report [bold]#{diag_id}[/bold] saved.")
+    # What `--apply` would act on: carried-over skips don't count.
+    eligible = sum(r["confidence"] == 1.0 and r["status"] == "open" for r in rows)
+    table = Table(title="repoint-playlists summary")
+    table.add_column("Bucket")
+    table.add_column("Count", justify="right")
+    table.add_row("Playlists with a YouTube side / total", f"{with_youtube} / {playlist_count}")
+    table.add_row("Dead items on the YouTube side", str(dead))
+    table.add_row(
+        f"{ISSUE_PLAYLIST_RELINKED} (open write-eligible / total)", f"{eligible} / {len(rows)}"
+    )
+    table.add_row("Dead items YT Music shows as themselves", str(found.dead_shown_as_itself))
+    table.add_row("Dead items YT Music doesn't place (no finding)", str(found.dead_unplaced))
+    console.print(table)
+    if not rows:
+        console.print("[dim]No findings.[/dim]")
+        return
+    console.print(
+        _findings_table(f"Playlist repoint report #{diag_id} — findings ({len(rows)})", rows)
+    )
+    console.print(
+        "Review them, keep any out with [cyan]likesurgeon skip <id>[/cyan], then run "
+        "[cyan]likesurgeon repoint-playlists --apply[/cyan]."
+    )
+
+
+def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
+    """``repoint-playlists --apply``: act on the latest playlists report, behind
+    the same gates as ``canonicalize --apply``. Every action re-reads both
+    sides of its playlist before writing, so a playlist that changed since the
+    scan only gets no writes."""
+    from sqlalchemy import select
+
+    from . import playlist_dispatch, playlist_repoint
+    from .models import PlaylistScan, SnapshotItem
+
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_PLAYLISTS)
+        if diag is None:
+            console.print(
+                "[yellow]No playlist repoint report yet.[/yellow] "
+                "Run [cyan]likesurgeon repoint-playlists[/cyan] first."
+            )
+            raise typer.Exit(1)
+        latest_scan = session.scalars(
+            select(PlaylistScan.id).order_by(PlaylistScan.created_at.desc(), PlaylistScan.id.desc())
+        ).first()
+        if latest_scan != diag.playlist_scan_id:
+            console.print(
+                f"[yellow]Playlist scan #{latest_scan} is newer than the scan "
+                f"(#{diag.playlist_scan_id}) report #{diag.id} was built on.[/yellow] "
+                "Re-run [cyan]likesurgeon repoint-playlists[/cyan] first."
+            )
+            raise typer.Exit(1)
+        actions, states = playlist_repoint.plan(session, diag)
+        if limit is not None and limit < len(actions):
+            console.print(
+                f"[yellow]--limit {limit}: applying the first {limit} of "
+                f"{len(actions)} actions.[/yellow]"
+            )
+            actions = actions[:limit]
+        if actions:
+            related = {it.id: it.related_item_id for it in diag.items}
+            table = Table(
+                title=f"Playlist repoint report #{diag.id} — plan, smallest playlists first"
+            )
+            for column in ("ID", "Playlist", "Position", "A", "B", "B's title"):
+                table.add_column(
+                    column, justify="right" if column in ("ID", "Position") else "left"
+                )
+            for a in actions:
+                b_title = session.get_one(SnapshotItem, related[a.item_id]).title
+                table.add_row(
+                    str(a.item_id),
+                    escape(a.playlist_title),
+                    str(a.a_index + 1),
+                    a.a_video_id,
+                    a.b_video_id,
+                    escape(b_title),
+                )
+            console.print(table)
+        console.print(playlist_repoint.summarize(actions, states))
+        if unsettled := unsettled_playlist_actions(session):
+            console.print(
+                f"[bold red]{len(unsettled)} playlist repoint(s) an earlier run left unsettled, "
+                "so B may sit next to A or A may be gone:[/bold red] "
+                + "; ".join(
+                    f"{escape(title)} position {pos}: {a} → {b}" for title, pos, a, b in unsettled
+                )
+                + ". Check those slots on YouTube; each drops off this list once "
+                "[cyan]scan playlists[/cyan] has read its playlist again."
+            )
+        if not actions:
+            console.print("Nothing to apply.")
+            return
+
+        if not yes and not typer.confirm("Proceed?", default=False):
+            raise typer.Abort()
+
+        # Function-local so tests can swap the class on the youtube_client module.
+        from .youtube_client import YouTubeClient
+
+        yt = YouTubeClient(
+            client_secrets_path=cfg.youtube_oauth_client_path,
+            token_path=cfg.youtube_token_path,
+        )
+        if not yt.has_write_scope():
+            console.print(
+                "[yellow]YouTube write scope not granted.[/yellow] "
+                "Run [cyan]likesurgeon auth youtube[/cyan] to re-grant it."
+            )
+            raise typer.Exit(1)
+
+        ytm = _ytmusic_client(cfg)
+        # Every write is checked against the playlist's YT Music side; browser
+        # cookies go stale fast, so fail here (after the one automatic refresh)
+        # rather than mid-run.
+        try:
+            ytm.fetch_liked_songs(limit=1)
+        except (AuthFileMissingError, UnexpectedResponseError) as e:
+            console.print(f"[yellow]YouTube Music auth check failed:[/yellow] {escape(str(e))}")
+            raise typer.Exit(1) from e
+        result = playlist_dispatch.execute(session, actions, states, ytm=ytm, yt=yt)
+
+    console.print(
+        f"[bold]Playlist repoint result:[/bold] "
+        f"applied=[green]{result.applied}[/green] "
+        f"failed=[red]{result.failed}[/red] "
+        f"skipped=[yellow]{result.skipped}[/yellow] "
+        f"restored=[yellow]{result.restored}[/yellow]"
+    )
+    if result.skipped:
+        console.print(
+            f"[yellow]{result.skipped} action(s) were undone:[/yellow] YT Music didn't show "
+            "the playlist as expected, so the change was reverted and the finding marked "
+            f"'skipped'. See [cyan]likesurgeon issues --type {ISSUE_PLAYLIST_RELINKED}[/cyan]."
+        )
+    if result.reordered:
+        console.print(
+            f"[yellow]{result.reordered} repoint(s) in automatically sorted playlists:[/yellow] "
+            "B went where each playlist's sort order puts it (not A's old position): "
+            + ", ".join(escape(t) for t in result.sorted_playlists)
+        )
+    if result.stale_playlists:
+        title = {a.playlist_id: a.playlist_title for a in actions}
+        console.print(
+            "[yellow]These playlists changed since the scan, so they got no writes:[/yellow] "
+            + ", ".join(escape(title[pid]) for pid in result.stale_playlists)
+            + ". Re-scan with [cyan]likesurgeon scan playlists[/cyan]."
+        )
+    if result.quota_exhausted:
+        console.print(
+            f"[red]YouTube daily quota exhausted — stopped early; {result.unattempted} "
+            "action(s) not attempted.[/red] After it resets (midnight Pacific), re-scan and "
+            "apply again."
+        )
+    if result.aborted:
+        console.print(
+            f"[red]Stopped early: {escape(result.aborted)}; {result.unattempted} action(s) "
+            "not attempted.[/red]"
+        )
+    # Each independent of ``aborted``: a delete can go unconfirmed on a read error too.
+    if result.left_inserted:
+        console.print(
+            "[bold red]A repoint inserted B and it may still be in the playlist (next to A, "
+            "or where an automatically sorted playlist puts it); remove it by hand:[/bold red] "
+            + "; ".join(f"{escape(t)} position {pos}: {b}" for t, pos, b in result.left_inserted)
+        )
+    if result.left_removed:
+        console.print(
+            "[bold red]A repoint deleted A and it may not be back (B stays in); "
+            "add A back by hand at its position:[/bold red] "
+            + "; ".join(f"{escape(t)} position {pos}: {a}" for t, pos, a in result.left_removed)
+        )
+    if result.delete_unconfirmed:
+        console.print(
+            "[bold red]A's delete was sent but couldn't be confirmed, so nothing was undone "
+            "and B was kept:[/bold red] "
+            + "; ".join(
+                f"{escape(t)} position {pos}: {a} (kept {b})"
+                for t, pos, a, b in result.delete_unconfirmed
+            )
+            + ". Once the delete has had time to land, check by hand that A's item is gone "
+            "from the playlist, and remove it if not."
+        )
+    console.print(
+        "Before the next [cyan]repoint-playlists --apply[/cyan], run "
+        "[cyan]likesurgeon scan playlists[/cyan] and [cyan]likesurgeon repoint-playlists[/cyan] "
+        "again: the report no longer matches the playlists this run changed."
+    )
+    if result.failed or result.aborted or result.quota_exhausted or result.stale_playlists:
+        raise typer.Exit(1)
+
+
 def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     """Flip findings between 'open' and 'skipped'.
 
-    Ids must belong to the latest alignment diagnosis or the latest
-    canonicalize report. All-or-nothing: every id is validated first, so a
-    typo changes nothing. 'skipped' carries over to later diagnoses
-    (``carry_over_skipped``), so this is the durable way to keep ``sync`` or
-    ``canonicalize --apply`` off a finding.
+    Ids must belong to the latest alignment diagnosis, canonicalize report or
+    repoint-playlists report. All-or-nothing: every id is validated first, so
+    a typo changes nothing. 'skipped' carries over to later diagnoses
+    (``carry_over_skipped``), so this is the durable way to keep ``sync``,
+    ``canonicalize --apply`` or ``repoint-playlists --apply`` off a finding.
     """
     from .models import DiagnosisItem
 
@@ -1312,17 +1588,14 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     _, factory = _bootstrap()
     with session_scope(factory) as session:
         latest = {
-            label: diag
-            for label, kind in (
-                ("compare-likes", None),
-                ("canonicalize", DIAGNOSIS_KIND_CANONICALIZE),
-            )
+            command: diag
+            for kind, (_, command) in _REPORTS.items()
             if (diag := latest_diagnosis(session, kind=kind)) is not None
         }
         if not latest:
+            commands = [f"`likesurgeon {command}`" for _, command in _REPORTS.values()]
             _fail(
-                "No diagnosis yet. Run `likesurgeon compare-likes` or "
-                "`likesurgeon canonicalize` first.",
+                f"No diagnosis yet. Run {', '.join(commands[:-1])} or {commands[-1]} first.",
                 code=1,
             )
         latest_ids = {diag.id for diag in latest.values()}
@@ -1348,8 +1621,8 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
 
 
 _FINDING_IDS_HELP = (
-    "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis or the "
-    "latest canonicalize report."
+    "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis, "
+    "canonicalize report or repoint-playlists report."
 )
 
 
@@ -1357,7 +1630,8 @@ _FINDING_IDS_HELP = (
 def skip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Keep `sync` or `canonicalize --apply` off these findings, across future runs too."""
+    """Keep `sync`, `canonicalize --apply` or `repoint-playlists --apply` off these findings,
+    across future runs too."""
     _set_findings_status(item_ids, to="skipped")
 
 
@@ -1365,7 +1639,8 @@ def skip(
 def unskip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Re-open skipped findings so the next `sync` or `canonicalize --apply` acts on them."""
+    """Re-open skipped findings so the next `sync`, `canonicalize --apply` or
+    `repoint-playlists --apply` acts on them."""
     _set_findings_status(item_ids, to="open")
 
 

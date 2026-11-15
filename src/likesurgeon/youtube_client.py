@@ -76,6 +76,13 @@ class YouTubeQuotaExceededError(YouTubeWriteError):
     re-like of a video it unliked)."""
 
 
+class PlaylistManualSortRequired(YouTubeWriteError):
+    """``playlistItems.insert`` with a position was refused (HTTP 400
+    ``manualSortRequired``) because the playlist is sorted automatically.
+    Nothing was added; an insert without a position is accepted and lands
+    where the playlist's sort order puts it."""
+
+
 @dataclass(frozen=True)
 class VideoStatus:
     """Result of a single video's availability check.
@@ -131,14 +138,21 @@ _RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
 
 def _error_reasons_403(exc: Any) -> set[str]:
-    """Extract ``error.errors[].reason`` values from a 403's JSON body.
+    """``_error_reasons`` of a 403; empty for any other status."""
+    if getattr(getattr(exc, "resp", None), "status", None) != 403:
+        return set()
+    return _error_reasons(exc)
+
+
+def _error_reasons(exc: Any) -> set[str]:
+    """Extract ``error.errors[].reason`` values from an HttpError's JSON body.
 
     The HTTP-level `e.resp.reason` is just "Forbidden" for any 403, so we
     parse `e.content` (bytes) instead — the body's `error.errors[].reason`
     field is what carries `quotaExceeded` / `dailyLimitExceeded` /
     `rateLimitExceeded`.
 
-    Defensive at every shape boundary: non-403 responses, missing bodies,
+    Defensive at every shape boundary: missing bodies,
     non-UTF-8 bytes, malformed JSON, or any payload whose shape doesn't
     precisely match `{"error": {"errors": [{"reason": ...}, ...]}}` all
     return an empty set rather than raising. We'd rather mis-classify an
@@ -148,8 +162,6 @@ def _error_reasons_403(exc: Any) -> set[str]:
     """
     import json
 
-    if getattr(getattr(exc, "resp", None), "status", None) != 403:
-        return set()
     content = getattr(exc, "content", None)
     if not content:
         return set()
@@ -176,6 +188,17 @@ def _is_quota_exceeded(exc: Any) -> bool:
 def _is_rate_limited(exc: Any) -> bool:
     """403 short-window throttling — retryable like a 429."""
     return bool(_error_reasons_403(exc) & _RATE_LIMIT_REASONS)
+
+
+def _is_manual_sort_required(exc: Any) -> bool:
+    """A 400 refusing a position because the playlist is sorted automatically.
+    Seen live as ``Playlist should use manual sorting to support position.``;
+    the message is the fallback when the body carries no reason."""
+    if getattr(getattr(exc, "resp", None), "status", None) != 400:
+        return False
+    return "manualSortRequired" in _error_reasons(exc) or (
+        "manual sorting" in str(getattr(exc, "reason", "")).lower()
+    )
 
 
 def _classify_status(
@@ -262,6 +285,18 @@ def attach_video_statuses(items: list[dict[str, Any]], statuses: dict[str, Video
 
 _RATE_VIDEO_MAX_ATTEMPTS = 3
 _RATE_VIDEO_BACKOFFS = (0.5, 1.0)
+
+
+def playlist_item_video_id(item: dict[str, Any]) -> str | None:
+    """The video id of a raw ``playlistItems.list`` entry."""
+    snippet = item.get("snippet") or {}
+    content = item.get("contentDetails") or {}
+    return content.get("videoId") or (snippet.get("resourceId") or {}).get("videoId")
+
+
+def playlist_item_key(item: dict[str, Any]) -> tuple[str, str | None]:
+    """``(playlist item id, video id)`` of a raw ``playlistItems.list`` entry."""
+    return item["id"], playlist_item_video_id(item)
 
 
 class YouTubeClient:
@@ -559,6 +594,83 @@ class YouTubeClient:
             raise YouTubeWriteError(video_id, "verify", str(exc)) from exc
 
         return any(item.get("rating") == "like" for item in resp.get("items", []))
+
+    def _playlist_call(self, subject: str, op: str, call: Any) -> Any:
+        """Run ``call(service)`` for a playlist read or write, mapping failures.
+
+        Never retries: an insert or delete that errored may still have landed,
+        and repeating it would duplicate or remove another item. The message
+        carries the HTTP status and reason only, because ``str(HttpError)``
+        embeds the request URL (and with it the API key).
+        """
+        from googleapiclient.errors import HttpError
+
+        try:
+            return call(self._service())
+        except HttpError as exc:
+            message = f"HTTP {exc.status_code}: {exc.reason}"
+            if _is_quota_exceeded(exc):
+                raise YouTubeQuotaExceededError(subject, op, message) from exc
+            if _is_manual_sort_required(exc):
+                raise PlaylistManualSortRequired(subject, op, message) from exc
+            raise YouTubeWriteError(subject, op, message) from exc
+        except Exception as exc:  # noqa: BLE001 — system-boundary catch
+            raise YouTubeWriteError(subject, op, str(exc)) from exc
+
+    def insert_playlist_item(
+        self, playlist_id: str, video_id: str, position: int | None = None
+    ) -> str:
+        """Insert ``video_id`` at ``position`` via ``playlistItems.insert`` (50 units).
+
+        Without a position the item lands where YouTube puts it: at the end,
+        or where an automatically sorted playlist's sort order says. Such a
+        playlist refuses a position (``PlaylistManualSortRequired``).
+
+        Returns the new playlist item id, which the caller needs to remove the
+        item again.
+        """
+        snippet: dict[str, Any] = {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
+        }
+        if position is not None:
+            snippet["position"] = position
+        body = {"snippet": snippet}
+        response = self._playlist_call(
+            video_id,
+            "playlist_insert",
+            lambda service: service.playlistItems().insert(part="snippet", body=body).execute(),
+        )
+        item_id = response.get("id") if isinstance(response, dict) else None
+        if not isinstance(item_id, str) or not item_id:
+            # The insert landed but can't be addressed: callers must treat B as
+            # possibly in the playlist, so this is a write error, not a KeyError.
+            raise YouTubeWriteError(
+                video_id, "playlist_insert", "insert returned no playlist item id"
+            )
+        return item_id
+
+    def delete_playlist_item(self, item_id: str) -> None:
+        """Remove one playlist item by its item id via ``playlistItems.delete`` (50 units)."""
+        self._playlist_call(
+            item_id,
+            "playlist_delete",
+            lambda service: service.playlistItems().delete(id=item_id).execute(),
+        )
+
+    def read_playlist_items(self, playlist_id: str) -> list[tuple[str, str | None]]:
+        """``(item id, video id)`` of every item, in playlist order.
+
+        Errors arrive as ``YouTubeWriteError`` / ``YouTubeQuotaExceededError``
+        so a caller checking a playlist after a write handles them like a
+        failed write.
+        """
+        items = self._playlist_call(
+            playlist_id,
+            "playlist_read",
+            lambda service: self.fetch_playlist_items(playlist_id, service=service),
+        )
+        return [playlist_item_key(item) for item in items]
 
     _STATUS_BATCH_SIZE = 50
     _RETRY_SLEEPS: tuple[float, ...] = (1.0, 3.0)  # delays before retry 1 and 2

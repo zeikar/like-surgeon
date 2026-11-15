@@ -1,4 +1,4 @@
-"""Read-only report over the latest playlist scan.
+"""Load stored playlist scans, and the read-only report over the latest one.
 
 Reads stored snapshots only; makes no provider calls and writes nothing.
 """
@@ -71,11 +71,30 @@ class PlaylistReport:
     dead_items: tuple[DeadItem, ...]
 
 
-def playlist_report(session: Session) -> PlaylistReport | None:
-    """Summarize the latest playlist scan, or ``None`` if none was taken."""
-    scan = session.scalars(
-        select(PlaylistScan).order_by(PlaylistScan.created_at.desc(), PlaylistScan.id.desc())
-    ).first()
+@dataclass(frozen=True)
+class LoadedPlaylist:
+    """One playlist of a scan: its YT Music side and, if read, its YouTube side."""
+
+    ytmusic: Snapshot
+    ytmusic_items: tuple[SnapshotItem, ...]
+    youtube: Snapshot | None
+    youtube_items: tuple[SnapshotItem, ...] | None
+
+
+@dataclass(frozen=True)
+class LoadedScan:
+    scan: PlaylistScan
+    playlists: tuple[LoadedPlaylist, ...]  # in YT Music snapshot id order
+
+
+def load_scan(session: Session, scan_id: int | None = None) -> LoadedScan | None:
+    """Load a playlist scan (the latest by default), or ``None`` if there is none."""
+    if scan_id is None:
+        scan = session.scalars(
+            select(PlaylistScan).order_by(PlaylistScan.created_at.desc(), PlaylistScan.id.desc())
+        ).first()
+    else:
+        scan = session.get(PlaylistScan, scan_id)
     if scan is None:
         return None
 
@@ -95,22 +114,40 @@ def playlist_report(session: Session) -> PlaylistReport | None:
         items.setdefault(snapshot_id, []).append(item)
 
     youtube_by_playlist = {s.playlist_id: s for s in snapshots if s.source == YOUTUBE_PLAYLIST}
-
-    rows: list[PlaylistRow] = []
-    dead_items: list[DeadItem] = []
+    playlists: list[LoadedPlaylist] = []
     for snap in snapshots:
         if snap.source != YTMUSIC_PLAYLIST:
             continue
-        kinds = [music_kind(i.video_type) for i in items.get(snap.id, [])]
+        yt_snap = youtube_by_playlist.get(snap.playlist_id)
+        playlists.append(
+            LoadedPlaylist(
+                ytmusic=snap,
+                ytmusic_items=tuple(items.get(snap.id, [])),
+                youtube=yt_snap,
+                youtube_items=None if yt_snap is None else tuple(items.get(yt_snap.id, [])),
+            )
+        )
+    return LoadedScan(scan=scan, playlists=tuple(playlists))
+
+
+def playlist_report(session: Session) -> PlaylistReport | None:
+    """Summarize the latest playlist scan, or ``None`` if none was taken."""
+    loaded = load_scan(session)
+    if loaded is None:
+        return None
+
+    rows: list[PlaylistRow] = []
+    dead_items: list[DeadItem] = []
+    for playlist in loaded.playlists:
+        snap = playlist.ytmusic
+        kinds = [music_kind(i.video_type) for i in playlist.ytmusic_items]
         music, ugc = kinds.count("music"), kinds.count("ugc")
 
         youtube_count = dead = unchecked = None
-        yt_snap = youtube_by_playlist.get(snap.playlist_id)
-        if yt_snap is not None:
-            yt_items = items.get(yt_snap.id, [])
-            youtube_count = len(yt_items)
+        if playlist.youtube_items is not None:
+            youtube_count = len(playlist.youtube_items)
             dead = unchecked = 0
-            for i in yt_items:
+            for i in playlist.youtube_items:
                 if i.is_available is None:
                     unchecked += 1
                 elif i.is_available is False:
@@ -142,8 +179,8 @@ def playlist_report(session: Session) -> PlaylistReport | None:
             )
         )
     return PlaylistReport(
-        scan_id=scan.id,
-        created_at=scan.created_at,
+        scan_id=loaded.scan.id,
+        created_at=loaded.scan.created_at,
         rows=tuple(rows),
         dead_items=tuple(dead_items),
     )

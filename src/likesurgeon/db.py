@@ -60,7 +60,14 @@ def _migrate_in_place(engine: Engine) -> None:
                     ("playlist_raw_json", "TEXT"),
                 ),
             ),
-            ("diagnoses", (("kind", "VARCHAR(32)"),)),
+            (
+                "diagnoses",
+                (("kind", "VARCHAR(32)"), ("playlist_scan_id", "INTEGER")),
+            ),
+            (
+                "diagnosis_items",
+                (("source_item_id", "INTEGER"), ("related_item_id", "INTEGER")),
+            ),
         ):
             if table not in tables:
                 continue

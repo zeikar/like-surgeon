@@ -153,11 +153,13 @@ class SnapshotItem(Base):
 
 
 class Diagnosis(Base):
-    """A persisted ``compare-likes`` or ``canonicalize`` run.
+    """A persisted ``compare-likes``, ``canonicalize`` or ``repoint-playlists`` run.
 
-    ``kind`` is ``None`` for a ``compare-likes`` (alignment) run and
-    ``'canonicalize'`` for a ``canonicalize`` report, so ``sync`` and
-    ``doctor`` never mistake one for the other.
+    ``kind`` is ``None`` for a ``compare-likes`` (alignment) run,
+    ``'canonicalize'`` for a ``canonicalize`` report and ``'playlists'`` for a
+    ``repoint-playlists`` report, so ``sync`` and ``doctor`` never mistake one
+    for another. A playlists report sets ``playlist_scan_id`` to the scan it
+    was built from (a plain integer, no FK, like ``snapshots.playlist_scan_id``).
     """
 
     __tablename__ = "diagnoses"
@@ -171,6 +173,7 @@ class Diagnosis(Base):
         ForeignKey("snapshots.id", ondelete="SET NULL"), nullable=True
     )
     kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    playlist_scan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     items: Mapped[list[DiagnosisItem]] = relationship(
         back_populates="diagnosis", cascade="all, delete-orphan"
@@ -197,6 +200,12 @@ class DiagnosisItem(Base):
     ``diagnosis.CANONICAL_ISSUE_TYPES``): a liked video that has a better
     version, or one whose better version can't be picked unambiguously.
 
+    A playlists report (``Diagnosis.kind == 'playlists'``) uses
+    ``playlist_relinked`` (see ``diagnosis.PLAYLIST_ISSUE_TYPES``): A is a dead
+    YouTube playlist item and B the video YT Music shows in its place.
+    ``source_item_id`` / ``related_item_id`` are the ``SnapshotItem`` ids of
+    A's ``youtube_playlist`` row and B's ``ytmusic_playlist`` row.
+
     Rows written before the LL → LM alignment redesign may carry legacy
     values (``possibly_missing_from_ytmusic``, ``possible_pointer_drift``,
     ``ytmusic_only``, ``unavailable_video``, ``duplicate_in_source``); nothing
@@ -218,6 +227,8 @@ class DiagnosisItem(Base):
     related_track_id: Mapped[int | None] = mapped_column(
         ForeignKey("tracks.id", ondelete="SET NULL"), nullable=True
     )
+    source_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    related_item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="open")
 
     diagnosis: Mapped[Diagnosis] = relationship(back_populates="items")
@@ -227,7 +238,8 @@ class DiagnosisItem(Base):
 
 
 class SyncAttempt(Base):
-    """One row per ``sync`` / ``canonicalize --apply`` API call, LM check, or skip decision.
+    """One row per ``sync`` / ``canonicalize --apply`` / playlist repoint API call,
+    check, or skip decision.
 
     ``kind`` names the step: ``repoint_precheck_a``,
     ``repoint_precheck_b``, ``repoint_like``, ``repoint_verify``,
@@ -244,9 +256,15 @@ class SyncAttempt(Base):
     ``lm_check`` / ``restore_*`` rows; or the action kind
     (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
     action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
-    authoritative list. Rows written before the LL → LM alignment redesign may
-    carry legacy kinds (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``,
-    ``yt_relike_*``, ``ytm_dedupe``). ``status`` is one of ``applied``,
+    authoritative list. Playlist repoints (``playlist_dispatch.py``) write
+    ``playlist_precheck``, ``playlist_insert``, ``playlist_insert_verify``,
+    ``playlist_ytm_verify``, ``playlist_delete``, ``playlist_delete_verify``,
+    ``playlist_check``, ``playlist_rollback``, ``playlist_rollback_verify``,
+    ``playlist_restore``, ``playlist_restore_verify`` and
+    ``playlist_interrupted``; none count toward ``sync``'s refusal. Rows
+    written before the LL → LM alignment redesign may carry legacy kinds
+    (``yt_unlike``, ``ytm_like_*``, ``yt_like_*``, ``yt_relike_*``,
+    ``ytm_dedupe``). ``status`` is one of ``applied``,
     ``failed``, ``skipped``. ``reason`` carries sync-side detail (error
     message, LM diff, missing video_id, etc.) — the originating
     ``DiagnosisItem.reason`` is never overwritten.

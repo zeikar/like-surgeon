@@ -358,9 +358,10 @@ class YTMusicClient:
       * the CLI sees one clear exception when auth isn't set up yet, instead
         of leaking ytmusicapi internals.
 
-    Only the Liked songs and library playlists reads refresh stale cookies.
-    Per-item reads (artist pages, playlists) collect errors instead, so one
-    page ytmusicapi can't parse doesn't re-extract cookies.
+    The Liked songs, library playlists and single playlist (``fetch_playlist``,
+    behind every ``repoint-playlists --apply`` check) reads refresh stale
+    cookies. Per-item reads (artist pages, ``fetch_playlists``) collect errors
+    instead, so one page ytmusicapi can't parse doesn't re-extract cookies.
     """
 
     def __init__(
@@ -370,8 +371,8 @@ class YTMusicClient:
         refresh_account: str | None = None,
         on_refresh: Callable[[str], None] | None = None,
     ) -> None:
-        """``refresh_browser`` / ``refresh_account``: when a Liked songs or
-        library playlists read fails like stale cookies do (they go stale
+        """``refresh_browser`` / ``refresh_account``: when a Liked songs,
+        library playlists or single playlist read fails like stale cookies do (they go stale
         within the hour), re-extract cookies from this browser once, provided
         it is still signed in to this account (``account_identity``). Both are
         needed; ``on_refresh(browser)`` is told before the retry."""
@@ -481,6 +482,28 @@ class YTMusicClient:
                     "auth file is probably stale; refresh it with `likesurgeon auth ytmusic`."
                 ) from exc
         return result
+
+    def fetch_playlist(self, playlist_id: str) -> dict[str, Any]:
+        """One playlist with every track (``get_playlist``), raw.
+
+        Refreshes cookies like ``fetch_liked_songs``. Raises
+        ``UnexpectedResponseError`` unless the result is a dict with a list
+        under ``"tracks"``.
+        """
+        result = self._read_refreshing(lambda: self._request_playlist(playlist_id))
+        if not isinstance(result, dict) or not isinstance(result.get("tracks"), list):
+            raise UnexpectedResponseError(
+                f"ytmusicapi.get_playlist({playlist_id}) returned no dict with a 'tracks' "
+                "list. The library's response shape may have changed; "
+                "see https://github.com/sigma67/ytmusicapi/issues."
+            )
+        return result
+
+    def _request_playlist(self, playlist_id: str) -> Any:
+        """One ``get_playlist`` call on a fresh client (see ``_read``); the
+        payload is returned unchecked."""
+        client = self._build()
+        return _read(lambda: client.get_playlist(playlist_id, limit=None), "playlist")  # type: ignore[arg-type]
 
     def _read_refreshing(self, request: Callable[[], Any]) -> Any:
         """``request()``, refreshed and retried once (``_refresh_and_request``)
