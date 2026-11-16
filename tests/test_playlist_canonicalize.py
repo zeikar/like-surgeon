@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -279,6 +281,42 @@ def test_b_in_the_playlist_without_a_playable_item_makes_it_report_only(
     assert cause == "B's item in the playlist isn't playable"
 
 
+def _credited(video_id: str, *artists: tuple[str, str], album: str = "Single") -> dict:
+    """``_atv`` credited to ``artists`` as (id, name) pairs."""
+    return {**_atv(video_id, album=album), "artists": [{"name": n, "id": i} for i, n in artists]}
+
+
+_DUET_A = (("AR1", "Tenor"), ("AR2", "Soprano"))
+# A lone release of the same title and length in AR1's list, by other performers.
+_DUET_ARTISTS = {
+    "AR1": _page(_credited("B", ("AR3", "Alto"), ("AR1", "Tenor"), album="Album")),
+    "AR2": _page(),
+}
+
+
+def _duet_mix(album: str = "Single") -> PlaylistRead:
+    return _read("PLa", "Mix", [_credited("A", *_DUET_A, album=album)], _side("PLa", "A"))
+
+
+def test_a_lone_b_by_other_performers_makes_it_report_only(session: Session) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(), artists=_DUET_ARTISTS)
+
+    (item,) = diagnosis.items
+    assert item.confidence == 0.4
+    assert item.reason.split("report-only: ")[1] == (
+        "different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
+    )
+
+
+def test_one_artist_under_two_names_is_write_eligible(session: Session) -> None:
+    artists = {"AR1": _page(_credited("B", ("AR1", "風"), album="Album"))}
+    read = _read("PLa", "Mix", [_credited("A", ("AR1", "Kaze"))], _side("PLa", "A"))
+    diagnosis, _ = _reported(session, read, artists=artists)
+
+    (item,) = diagnosis.items
+    assert item.confidence == 1.0
+
+
 def test_b_already_in_the_playlist_once_is_write_eligible_and_named(session: Session) -> None:
     diagnosis, _ = _reported(session, _mix(_B, extra_youtube=("B",)))
 
@@ -403,6 +441,33 @@ def test_include_flagged_adds_a_keyword_only_finding_and_nothing_else(session: S
     assert [a.playlist_id for a in flagged] == ["PLa"]
 
 
+def test_include_flagged_never_adds_different_performers_even_with_a_keyword(
+    session: Session,
+) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(album="Live at Hall"), artists=_DUET_ARTISTS)
+    (item,) = diagnosis.items
+    assert item.reason.split("report-only: ")[1] == (
+        "version keyword 'Live' in A's album; "
+        "different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
+    )
+
+    assert plan(session, diagnosis, include_flagged=True) == ([], {})
+
+
+def test_include_flagged_adds_a_keyword_finding_by_one_artist_under_two_names(
+    session: Session,
+) -> None:
+    artists = {"AR1": _page(_credited("B", ("AR1", "風"), album="Album"))}
+    read = _read(
+        "PLa", "Mix", [_credited("A", ("AR1", "Kaze"), album="Live at Hall")], _side("PLa", "A")
+    )
+    diagnosis, _ = _reported(session, read, artists=artists)
+
+    actions, _ = plan(session, diagnosis, include_flagged=True)
+
+    assert [(a.a_video_id, a.b_video_id) for a in actions] == [("A", "B")]
+
+
 def test_forecast_is_merge_when_b_is_in_the_playlist_or_an_earlier_action_puts_it_there(
     session: Session,
 ) -> None:
@@ -473,3 +538,40 @@ def test_summarize_of_merges_only_has_no_insert_note(session: Session) -> None:
     assert "canonical_repoint: 0" in text
     assert "automatically sorted playlist" not in text
     assert "sort order" not in text
+
+
+def test_a_mismatch_stays_out_when_b_is_later_rewritten_with_matching_credits(
+    session: Session,
+) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(album="Live at Hall"), artists=_DUET_ARTISTS)
+    (item,) = diagnosis.items
+    assert item.confidence == 0.4
+    session.get(Track, item.related_track_id).raw_json = json.dumps(_credited("B", *_DUET_A))
+    session.flush()
+
+    assert plan(session, diagnosis, include_flagged=True) == ([], {})
+
+
+@pytest.mark.parametrize("confidence", [1.0, 0.5])
+def test_a_mismatch_in_a_report_saved_before_the_check_is_dropped(
+    session: Session, confidence: float
+) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(), artists=_DUET_ARTISTS)
+    diagnosis.items[0].confidence = confidence
+    session.flush()
+
+    assert plan(session, diagnosis, include_flagged=True) == ([], {})
+
+
+def test_a_partial_credit_never_matches_a_solo_recording(session: Session) -> None:
+    artists = {"AR1": _page(_credited("B", ("AR1", "Tenor"), album="Album"))}
+    read = _read(
+        "PLa",
+        "Mix",
+        [_credited("A", ("AR1", "Tenor"), (None, "Guest"))],
+        _side("PLa", "A"),
+    )
+    diagnosis, _ = _reported(session, read, artists=artists)
+
+    (item,) = diagnosis.items
+    assert item.confidence == 0.4

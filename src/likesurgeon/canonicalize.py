@@ -4,14 +4,16 @@ Pure discovery. See ``docs/design/canonicalize.md`` §2 and §4.
 
 A (a liked ATV) is a candidate when none of its artists' songs lists (Show all
 or Top songs) contains it while exactly one ATV B in the Show-all lists has the
-same title key and a duration within 1 s. This is the one place a title picks the
-target of a write: only inside A's own artist lists, only by exact key
-equality — A's like is A's own, never inferred. (``align.pair_passes_sanity``
-compares titles too, but only to verify pairs that order has already fixed.)
+same title key and a duration within 1 s; B credited to other artist ids than A
+makes it report-only. This is the one place a title picks the target of a write:
+only inside A's own artist lists, only by exact key equality — A's like is A's
+own, never inferred. (``align.pair_passes_sanity`` compares titles too, but only
+to verify pairs that order has already fixed.)
 """
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections import Counter
@@ -28,7 +30,7 @@ from .diagnosis import (
     ISSUE_CANONICAL_VERSION,
     carry_over_skipped,
 )
-from .models import Diagnosis, DiagnosisItem, SnapshotItem
+from .models import Diagnosis, DiagnosisItem, SnapshotItem, Track
 from .normalize import normalize_for_match
 from .snapshot import upsert_ytmusic_track
 from .sync import QUOTA_COST, PlannedAction, quota_lines
@@ -89,6 +91,33 @@ def artist_ids(liked: Sequence[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(i for s in liked for i in _ids(s)))
 
 
+def _credits(song: dict[str, Any]) -> str:
+    return " · ".join(str(a.get("name") or a.get("id")) for a in song.get("artists") or [])
+
+
+# Confidence of a finding whose performers differ: never planned, never lifted.
+CONFIDENCE_DIFFERENT_PERFORMERS = 0.4
+
+
+def _complete_ids(song: dict[str, Any]) -> set[str]:
+    """The credited artist ids, or empty when there is no credit or any credit
+    lacks an id (a partial credit proves nothing about who performs)."""
+    artists = song.get("artists") or []
+    ids = [a.get("id") for a in artists]
+    return set(ids) if artists and all(ids) else set()
+
+
+def performers_cause(a: dict[str, Any], b: dict[str, Any]) -> str | None:
+    """``"different performers: …"`` unless A and B credit the same non-empty
+    set of artist ids. Ids, not names: one artist can be credited under two
+    spellings, and two duets of one song share a title, a length and an artist.
+    Any credit without an id on either side counts as different."""
+    a_ids = _complete_ids(a)
+    if a_ids and a_ids == _complete_ids(b):
+        return None
+    return f"different performers: A by {_credits(a)!r}, B by {_credits(b)!r}"
+
+
 @dataclass(frozen=True)
 class Match:
     """One B: a listed track matching A, and the artist whose list holds it."""
@@ -113,10 +142,19 @@ class Candidate:
         return len(self.matches) > 1
 
     @property
+    def performers_cause(self) -> str | None:
+        # Two or more B's are ambiguous whoever performs them.
+        if self.ambiguous:
+            return None
+        return performers_cause(self.a, self.matches[0].song)
+
+    @property
     def report_only_cause(self) -> str | None:
         causes = []
         if self.keyword is not None:
             causes.append(f"version keyword '{self.keyword}' in A's album")
+        if self.performers_cause:
+            causes.append(self.performers_cause)
         if self.shown > 1:
             causes.append(f"A shown {self.shown} times in Liked songs")
         return "; ".join(causes) or None
@@ -261,11 +299,15 @@ def persist_report(
         else:
             issue_type = ISSUE_CANONICAL_VERSION
             related = upsert_ytmusic_track(session, c.matches[0].song).id
+        if c.performers_cause:
+            confidence = CONFIDENCE_DIFFERENT_PERFORMERS
+        else:
+            confidence = 0.5 if c.ambiguous or c.report_only_cause else 1.0
         session.add(
             DiagnosisItem(
                 diagnosis_id=diagnosis.id,
                 issue_type=issue_type,
-                confidence=0.5 if c.ambiguous or c.report_only_cause else 1.0,
+                confidence=confidence,
                 reason=_reason(c),
                 source_track_id=a_tracks[c.a["videoId"]],
                 related_track_id=related,
@@ -276,19 +318,56 @@ def persist_report(
     return diagnosis, carry_over_skipped(session, diagnosis)
 
 
-def flagged_keywords(lm: Sequence[SnapshotItem]) -> dict[int, str]:
-    """Track id -> version keyword in its album, for each track the Liked songs
-    snapshot ``lm`` shows exactly once.
+def performer_mismatches(
+    session: Session, items: Sequence[DiagnosisItem], lm: Sequence[SnapshotItem]
+) -> set[int]:
+    """Ids of the ``canonical_version`` ``items`` whose A and B fail
+    ``performers_cause`` now. A report saved by this version already gives such
+    a finding confidence 0.4; this also catches one saved before the check
+    existed, so the planner never trusts a confidence for performers."""
+    items = [it for it in items if it.issue_type == ISSUE_CANONICAL_VERSION]
+    # A as the snapshot shows it (else its Track); B only as its Track holds it,
+    # the Show-all song dict the report stored, never its snapshot row.
+    a_songs = {it.track_id: json.loads(it.raw_json or "{}") for it in lm}
+    tracks = {
+        t.id: json.loads(t.raw_json or "{}")
+        for t in session.scalars(
+            select(Track).where(
+                Track.id.in_({i for it in items for i in (it.source_track_id, it.related_track_id)})
+            )
+        )
+    }
+    return {
+        it.id
+        for it in items
+        if performers_cause(
+            a_songs.get(it.source_track_id) or tracks.get(it.source_track_id, {}),
+            tracks.get(it.related_track_id, {}),
+        )
+    }
 
-    A ``canonical_version`` at confidence 0.5 whose A is in here is report-only
-    for the keyword alone: the other cause, A shown more than once, is ruled
-    out by the same snapshot the report was built on (spec §6, rule 2).
+
+def flagged_keywords(
+    session: Session, items: Sequence[DiagnosisItem], lm: Sequence[SnapshotItem]
+) -> dict[int, str]:
+    """A's track id -> version keyword in its album, for each 0.5
+    ``canonical_version`` in ``items`` whose only report-only cause can be that
+    keyword.
+
+    Recomputed from data, never parsed from ``reason`` (spec §6, rule 2): A is
+    shown exactly once in ``lm``, the Liked songs snapshot the report was built
+    on. Performers are not decided here: a different-performers finding has
+    confidence 0.4, and ``performer_mismatches`` covers older reports.
     """
     shown = Counter(it.video_id for it in lm if it.video_id)
+    once = {it.track_id: it for it in lm if it.video_id and shown[it.video_id] == 1}
     return {
-        it.track_id: kw
-        for it in lm
-        if it.video_id and shown[it.video_id] == 1 and (kw := version_keyword(it.album or ""))
+        it.source_track_id: kw
+        for it in items
+        if it.issue_type == ISSUE_CANONICAL_VERSION
+        and it.confidence == 0.5
+        and it.source_track_id in once
+        and (kw := version_keyword(once[it.source_track_id].album or ""))
     }
 
 
@@ -302,7 +381,7 @@ def plan(
 ) -> list[PlannedAction]:
     """Open ``canonical_version`` findings at confidence 1.0 become actions,
     and with ``flagged`` (``--include-flagged``: ``flagged_keywords`` of the
-    report's LM) so do those whose A is in it.
+    report) so do those whose A is in it.
 
     Pure. ``lm_position`` maps A's track id to its Liked songs position (0 =
     newest) and ``liked_video_ids`` is every videoId in that report's LM. The

@@ -20,7 +20,7 @@ It reads the latest stored playlist scan, so the report costs no YouTube quota.
 
 1. **Eligible playlists**: your own playlists (`playlist_owned` true) with a YouTube side. Saved playlists, playlists whose ownership is unknown and playlists without a YouTube side are ignored.
 2. **Artist ids**: the distinct `artists[].id` of the **audio tracks** (`MUSIC_VIDEO_TYPE_ATV`) on the YT Music side of every eligible playlist, in first-seen order. Only an audio track can be an A. Each artist page is read once (`YTMusicClient.fetch_artist_songs`), however many playlists credit that artist. Before the reads, a one-song Liked songs read probes YT Music auth, so stale browser cookies are refreshed once before the slow part.
-3. **Per eligible playlist**: `canonicalize.find_candidates(that playlist's raw YT Music tracks, artists)`, unchanged. This is the likes rule: A is an ATV that none of its artists' lists (Show all or Top songs) contains, while exactly one ATV B in the Show-all lists has an equal title key and a length within 1 s. An unreadable artist blocks its A's.
+3. **Per eligible playlist**: `canonicalize.find_candidates(that playlist's raw YT Music tracks, artists)`, unchanged. This is the likes rule: A is an ATV that none of its artists' lists (Show all or Top songs) contains, while exactly one ATV B in the Show-all lists has an equal title key and a length within 1 s. An unreadable artist blocks its A's. A B credited to other artist ids than A is still a finding, report-only (below).
 4. **Own playable item**: `align.align(YouTube side, YT Music side)` for the playlist. A candidate is kept only if some YT Music entry showing A is backed by a YouTube item with the **same** video id whose availability is known to be playable (`is_available is True`). The first such backing gives A's YouTube row and A's YT Music row.
 
 The report counts, summed over playlists (a song in two playlists counts twice):
@@ -45,17 +45,18 @@ The reason names the playlist, A's 1-based position, A and B (`canonicalize.desc
 Confidence 1.0 is write-eligible. 0.5 is report-only, and the reason ends with every cause that applies (`report_only_cause`):
 
 - a version keyword in A's album (`Version`, `Ver.`, `Live`, `Remix`, ...; the likes list), read from A's YT Music row. Only this cause can be lifted by `--include-flagged`.
+- different performers: A's and B's sets of YT Music artist ids differ, or either side has a credit without an id (confidence 0.4, never planned, never lifted by `--include-flagged`; `canonicalize.performers_cause`, canonicalize.md §2). The reason names both credit lists. Ids, not names, so one artist under two spellings still matches.
 - A listed more than once on the YouTube side, or shown more than once by YT Music.
 - B not either absent from both sides or listed once and shown once. Examples: B shown only as the rendering of a dead item, B listed but hidden, B twice.
 - B's item in the playlist isn't playable (listed once and shown once, but its availability is dead or unknown, or YT Music marks its track `isAvailable=False` in the scan). A merge would delete the playable A and keep a B that may not play. `--apply` re-checks this live: a merge whose YT Music baseline marks B unavailable gets no writes (a failed `playlist_precheck` row, the item stays open, the playlist isn't stale), and a repoint whose inserted B YT Music shows unavailable fails `playlist_ytm_verify` like a B it doesn't show (B removed, A kept, item skipped, run stops). A is never deleted for an unavailable B.
 
-All causes except the keyword come from the playlist's shape (`structural_cause`). The planner recomputes them from the report's scan and never parses `reason`.
+All causes except the keyword and the performers come from the playlist's shape (`structural_cause`). The planner recomputes every cause and never parses `reason`: the keyword and A's artist ids from A's YT Music row in the report's scan, B's artist ids from B's `Track` (the artist-page song dict the report stored), the rest from the scan.
 
 Skips carry over as for `playlist_relinked`: by (issue type, A's track, B's track, A's playlist). So a skip covers the same pair in the same playlist only, and never carries to or from a `playlist_relinked` finding.
 
 ## Planner
 
-`playlist_canonicalize.plan(session, diagnosis, *, include_flagged)` turns open findings at 1.0 into actions. With `--include-flagged` it also takes an open 0.5 finding whose only cause is the keyword (keyword present, `structural_cause` None).
+`playlist_canonicalize.plan(session, diagnosis, *, include_flagged)` turns open findings at 1.0 into actions. With `--include-flagged` it also takes an open 0.5 finding whose only cause is the keyword (keyword present, `structural_cause` None). It drops every finding, 1.0 included, that fails `performers_cause` from A's row and B's `Track` now, so a report saved before the check can't act on a mismatch.
 
 - **Order**: smallest playlist (YouTube side count), then playlist id, then A's position, as `repoint-playlists`. So `--limit 1` is the smallest first write.
 - **Action**: `a_index` and `a_playlist_item_id` from A's YouTube row (its raw `snippet.position` and `id`). `b_index` = A's YT Music row position: the index of the entry rendering A's item, which for a canonical action is A itself.
@@ -136,13 +137,13 @@ If the `playlist_interrupted` row itself can't be committed, a stderr line names
 2. **Storage**: `Diagnosis.kind = 'playlist_canonicalize'`, one issue type `playlist_canonical_version` (1.0 write-eligible, 0.5 report-only), item ids as above, no schema change. A's with two or more B's are only counted. Alternative: a second report-only issue type, as likes has `canonical_ambiguous`.
 3. **Input**: the latest stored playlist scan, so the report costs no YouTube quota. Alternative: read every playlist again inside the command.
 4. **Repoint or merge**: decided at run time from the action's baseline. The planned kind is a forecast, as in likes canonicalize. Alternative: fix the flow at plan time and treat a differing baseline as stale.
-5. **Report-only causes**: the version keyword (the only one `--include-flagged` lifts), A more than once, B not cleanly absent or present once, and B's item not playable. All are recomputed from the scan at plan time. Alternative for duplicates: act on each copy by item id.
+5. **Report-only causes**: the version keyword (the only one `--include-flagged` lifts), different performers, A more than once, B not cleanly absent or present once, and B's item not playable. All are recomputed from the scan at plan time. Alternative for duplicates: act on each copy by item id.
 6. **Duplicates covered**: two releases of one recording in a playlist where the artist page lists exactly one of them (a merge keeps that one). Pairs the artist page lists both or neither of, and the same video twice, get no action. Alternative: keep the earlier-positioned one.
 7. **A merge whose A was put back has no settling row**, so it stays unsettled until its playlist is re-scanned. Alternative: let an applied `playlist_restore_verify` settle it. Rejected because it would also settle a repoint whose B removal was quota-rejected.
 
 ## Known limits
 
-- **A wrong B that renders as itself passes every check.** YT Music shows B as B, so the checks can't tell a right pair from a wrong one. The candidate rule (same artist list, ATV, equal title key, ±1 s), the keyword net and the review before `--apply` are the guards. `skip` anything doubtful.
+- **A wrong B that renders as itself passes every check.** YT Music shows B as B, so the checks can't tell a right pair from a wrong one. The candidate rule (same artist list, ATV, equal title key, ±1 s, same artist ids), the keyword net and the review before `--apply` are the guards. Two recordings by the same credited artists with the same title and length still pass (canonicalize.md §7). `skip` anything doubtful.
 - **Sorted playlists move B.** In an automatically sorted playlist a repoint's B goes to its sort place, not A's index. A merge removes A and leaves B where it is.
 - **About 150 songs per Show-all list.** For a large catalog, A may sit past the cap (a finding although listed further down) or B may be missed (canonicalize.md §7).
 - **Duplicates not covered.** Two releases the artist page lists both or neither of, and the same video listed twice, stay as they are.

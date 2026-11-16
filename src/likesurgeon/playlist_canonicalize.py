@@ -5,10 +5,11 @@ Pure: reads a loaded scan and artist pages passed in; no provider calls.
 The likes rule (``canonicalize.find_candidates``) run once per own playlist
 that has a YouTube side: A is an audio track YT Music shows in the playlist
 that none of its artists' lists contains while exactly one listed track B has
-its title key and length. A must be shown as itself for a playable YouTube
-item of its own (``align.align`` per playlist), so moving A means moving that
-item. ``playlist_dispatch`` then repoints A to B (insert B, delete A) or, with
-B already in the playlist, merges (delete A).
+its title key and length (report-only when B's artist ids differ). A must be
+shown as itself for a playable YouTube item of its own (``align.align`` per
+playlist), so moving A means moving that item. ``playlist_dispatch`` then
+repoints A to B (insert B, delete A) or, with B already in the playlist, merges
+(delete A).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from . import canonicalize
 from .align import align
-from .canonicalize import Candidate, Match, artist_name, version_keyword
+from .canonicalize import Candidate, Match, artist_name, performers_cause, version_keyword
 from .diagnosis import (
     DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE,
     ISSUE_PLAYLIST_CANONICAL_VERSION,
@@ -177,6 +178,7 @@ def report_only_cause(pair: CanonicalPair) -> str | None:
     keyword = _keyword(pair.shown)
     causes = [
         _keyword_cause(keyword) if keyword else None,
+        performers_cause(pair.candidate.a, pair.b.song),
         structural_cause(pair.playlist, pair.a.video_id or "", pair.b.song["videoId"]),
     ]
     return "; ".join(c for c in causes if c) or None
@@ -213,11 +215,15 @@ def persist_report(
     session.flush()
     for pair in pairs:
         cause = report_only_cause(pair)
+        if performers_cause(pair.candidate.a, pair.b.song):
+            confidence = canonicalize.CONFIDENCE_DIFFERENT_PERFORMERS
+        else:
+            confidence = 0.5 if cause else 1.0
         session.add(
             DiagnosisItem(
                 diagnosis_id=diagnosis.id,
                 issue_type=ISSUE_PLAYLIST_CANONICAL_VERSION,
-                confidence=0.5 if cause else 1.0,
+                confidence=confidence,
                 reason=_reason(pair, cause),
                 source_track_id=pair.a.track_id,
                 related_track_id=upsert_ytmusic_track(session, pair.b.song).id,
@@ -236,7 +242,8 @@ def plan(
     """Open confidence-1.0 findings become actions, plus each planned
     playlist's state; with ``include_flagged`` also a 0.5 finding whose only
     cause is a version keyword in A's album (causes are recomputed from the
-    report's scan, never read from ``reason``).
+    report's scan and B's ``Track``, the song dict the report stored, never
+    read from ``reason``).
 
     Order as ``repoint-playlists``: smallest playlist, playlist id, A's
     position. The kind is a forecast (the dispatcher decides from its live
@@ -257,8 +264,8 @@ def plan(
     rows = {
         r.id: r for r in session.scalars(select(SnapshotItem).where(SnapshotItem.id.in_(item_ids)))
     }
-    b_ids = {
-        t.id: t.video_id
+    b_tracks = {
+        t.id: t
         for t in session.scalars(
             select(Track).where(Track.id.in_({it.related_track_id for it in todo}))
         )
@@ -269,7 +276,15 @@ def plan(
     for it in todo:
         a, shown = rows[it.source_item_id], rows[it.related_item_id]
         loaded = playlists[shown.snapshot_id]
-        b_video_id = b_ids[it.related_track_id]
+        b = b_tracks[it.related_track_id]
+        b_video_id = b.video_id
+        # Every finding, 1.0 too: a report saved before the performer check
+        # has no 0.4 to tell it apart.
+        if (
+            performers_cause(json.loads(shown.raw_json or "{}"), json.loads(b.raw_json or "{}"))
+            is not None
+        ):
+            continue
         if it.confidence != 1.0 and (
             _keyword(shown) is None
             or structural_cause(loaded, a.video_id or "", b_video_id or "") is not None
