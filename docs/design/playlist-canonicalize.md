@@ -45,7 +45,7 @@ The reason names the playlist, A's 1-based position, A and B (`canonicalize.desc
 Confidence 1.0 is write-eligible. 0.5 is report-only, and the reason ends with every cause that applies (`report_only_cause`):
 
 - a version keyword in A's album (`Version`, `Ver.`, `Live`, `Remix`, ...; the likes list), read from A's YT Music row. Only this cause can be lifted by `--include-flagged`.
-- different performers: A's and B's sets of YT Music artist ids differ, or B has none (`canonicalize.performers_cause`, canonicalize.md §2). The reason names both credit lists. Ids, not names, so one artist under two spellings still matches.
+- different performers: A's and B's sets of YT Music artist ids differ, or either side has a credit without an id (confidence 0.4, never planned, never lifted by `--include-flagged`; `canonicalize.performers_cause`, canonicalize.md §2). The reason names both credit lists. Ids, not names, so one artist under two spellings still matches.
 - A listed more than once on the YouTube side, or shown more than once by YT Music.
 - B not either absent from both sides or listed once and shown once. Examples: B shown only as the rendering of a dead item, B listed but hidden, B twice.
 - B's item in the playlist isn't playable (listed once and shown once, but its availability is dead or unknown, or YT Music marks its track `isAvailable=False` in the scan). A merge would delete the playable A and keep a B that may not play. `--apply` re-checks this live: a merge whose YT Music baseline marks B unavailable gets no writes (a failed `playlist_precheck` row, the item stays open, the playlist isn't stale), and a repoint whose inserted B YT Music shows unavailable fails `playlist_ytm_verify` like a B it doesn't show (B removed, A kept, item skipped, run stops). A is never deleted for an unavailable B.
@@ -56,7 +56,7 @@ Skips carry over as for `playlist_relinked`: by (issue type, A's track, B's trac
 
 ## Planner
 
-`playlist_canonicalize.plan(session, diagnosis, *, include_flagged)` turns open findings at 1.0 into actions. With `--include-flagged` it also takes an open 0.5 finding whose only cause is the keyword (keyword present, `performers_cause` and `structural_cause` None).
+`playlist_canonicalize.plan(session, diagnosis, *, include_flagged)` turns open findings at 1.0 into actions. With `--include-flagged` it also takes an open 0.5 finding whose only cause is the keyword (keyword present, `structural_cause` None). It drops every finding, 1.0 included, that fails `performers_cause` from A's row and B's `Track` now, so a report saved before the check can't act on a mismatch.
 
 - **Order**: smallest playlist (YouTube side count), then playlist id, then A's position, as `repoint-playlists`. So `--limit 1` is the smallest first write.
 - **Action**: `a_index` and `a_playlist_item_id` from A's YouTube row (its raw `snippet.position` and `id`). `b_index` = A's YT Music row position: the index of the entry rendering A's item, which for a canonical action is A itself.

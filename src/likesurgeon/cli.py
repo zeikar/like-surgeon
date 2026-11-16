@@ -1231,8 +1231,9 @@ def _canonicalize_apply(*, limit: int | None, yes: bool, include_flagged: bool) 
         # songs read the report was built on.
         lm = get_snapshot_items(session, diag.ytmusic_snapshot_id)
         flagged = canonicalize.flagged_keywords(session, items, lm) if include_flagged else {}
+        bad = canonicalize.performer_mismatches(session, items, lm)
         actions = canonicalize.plan(
-            items,
+            [it for it in items if it.id not in bad],
             resolve_video_ids(session, items),
             lm_position={it.track_id: it.position for it in lm},
             liked_video_ids={it.video_id for it in lm if it.video_id},

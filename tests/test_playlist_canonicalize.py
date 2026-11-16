@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -300,7 +302,7 @@ def test_a_lone_b_by_other_performers_makes_it_report_only(session: Session) -> 
     diagnosis, _ = _reported(session, _duet_mix(), artists=_DUET_ARTISTS)
 
     (item,) = diagnosis.items
-    assert item.confidence == 0.5
+    assert item.confidence == 0.4
     assert item.reason.split("report-only: ")[1] == (
         "different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
     )
@@ -536,3 +538,40 @@ def test_summarize_of_merges_only_has_no_insert_note(session: Session) -> None:
     assert "canonical_repoint: 0" in text
     assert "automatically sorted playlist" not in text
     assert "sort order" not in text
+
+
+def test_a_mismatch_stays_out_when_b_is_later_rewritten_with_matching_credits(
+    session: Session,
+) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(album="Live at Hall"), artists=_DUET_ARTISTS)
+    (item,) = diagnosis.items
+    assert item.confidence == 0.4
+    session.get(Track, item.related_track_id).raw_json = json.dumps(_credited("B", *_DUET_A))
+    session.flush()
+
+    assert plan(session, diagnosis, include_flagged=True) == ([], {})
+
+
+@pytest.mark.parametrize("confidence", [1.0, 0.5])
+def test_a_mismatch_in_a_report_saved_before_the_check_is_dropped(
+    session: Session, confidence: float
+) -> None:
+    diagnosis, _ = _reported(session, _duet_mix(), artists=_DUET_ARTISTS)
+    diagnosis.items[0].confidence = confidence
+    session.flush()
+
+    assert plan(session, diagnosis, include_flagged=True) == ([], {})
+
+
+def test_a_partial_credit_never_matches_a_solo_recording(session: Session) -> None:
+    artists = {"AR1": _page(_credited("B", ("AR1", "Tenor"), album="Album"))}
+    read = _read(
+        "PLa",
+        "Mix",
+        [_credited("A", ("AR1", "Tenor"), (None, "Guest"))],
+        _side("PLa", "A"),
+    )
+    diagnosis, _ = _reported(session, read, artists=artists)
+
+    (item,) = diagnosis.items
+    assert item.confidence == 0.4

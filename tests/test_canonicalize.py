@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from likesurgeon.canonicalize import (
     artist_ids,
     find_candidates,
     flagged_keywords,
+    performer_mismatches,
     persist_report,
     plan,
     summarize,
@@ -481,7 +483,7 @@ def test_persist_report_different_performers_is_report_only(session: Session):
     diagnosis, _ = persist_report(session, snap.id, candidates)
 
     (item,) = diagnosis_items(session, diagnosis.id)
-    assert (item.issue_type, item.confidence) == (ISSUE_CANONICAL_VERSION, 0.5)
+    assert (item.issue_type, item.confidence) == (ISSUE_CANONICAL_VERSION, 0.4)
     assert item.reason.endswith(
         "report-only: different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
     )
@@ -607,14 +609,19 @@ def _plan_report(session: Session, liked, pages, *, include_flagged: bool):
     diagnosis, _ = persist_report(session, snap.id, candidates)
     items = diagnosis_items(session, diagnosis.id)
     lm = get_snapshot_items(session, snap.id)
-    actions = plan(
-        items,
+    actions = _plan_items(session, items, lm, include_flagged=include_flagged)
+    return actions, [(it.issue_type, it.confidence) for it in items]
+
+
+def _plan_items(session: Session, items, lm, *, include_flagged: bool):
+    bad = performer_mismatches(session, items, lm)
+    return plan(
+        [it for it in items if it.id not in bad],
         _vids(items, session),
         lm_position={it.track_id: it.position for it in lm},
         liked_video_ids={it.video_id for it in lm if it.video_id},
         flagged=flagged_keywords(session, items, lm) if include_flagged else None,
     )
-    return actions, [(it.issue_type, it.confidence) for it in items]
 
 
 def test_plan_never_takes_different_performers_even_with_a_keyword(session: Session):
@@ -632,8 +639,71 @@ def test_plan_never_takes_different_performers_even_with_a_keyword(session: Sess
 
     assert _plan_report(session, liked, pages, include_flagged=True) == (
         [],
-        [(ISSUE_CANONICAL_VERSION, 0.5)] * 2,
+        [(ISSUE_CANONICAL_VERSION, 0.4)] * 2,
     )
+
+
+def _mismatched_report(session: Session):
+    a = _duet("vid_a", _TENOR, _SOPRANO, album="Live at the Pier")
+    pages = {"ch_tenor": page(_duet("vid_b", _ALTO, _TENOR)), "ch_soprano": page()}
+    snap, candidates = _report(session, [a], pages)
+    diagnosis, _ = persist_report(session, snap.id, candidates)
+    return snap, diagnosis_items(session, diagnosis.id)
+
+
+def test_plan_does_not_lift_a_mismatch_when_b_is_later_rewritten_with_matching_credits(
+    session: Session,
+):
+    snap, items = _mismatched_report(session)
+    (item,) = items
+    assert item.confidence == 0.4
+    b = session.get(Track, item.related_track_id)
+    b.raw_json = json.dumps(_duet("vid_b", _TENOR, _SOPRANO))
+    session.flush()
+    lm = get_snapshot_items(session, snap.id)
+
+    assert _plan_items(session, items, lm, include_flagged=True) == []
+
+
+@pytest.mark.parametrize("confidence", [1.0, 0.5])
+def test_plan_drops_a_mismatch_in_a_report_saved_before_the_check(
+    session: Session, confidence: float
+):
+    snap, items = _mismatched_report(session)
+    items[0].confidence = confidence
+    session.flush()
+    lm = get_snapshot_items(session, snap.id)
+
+    assert _plan_items(session, items, lm, include_flagged=True) == []
+
+
+def test_plan_checks_b_by_its_stored_credits_even_when_b_is_already_liked(session: Session):
+    a = _duet("vid_a", _TENOR, _SOPRANO, album="Paper Lantern - Single")
+    b_liked = _duet("vid_b", _TENOR, _SOPRANO)  # snapshot credits match A
+    b_page = _duet("vid_b", _ALTO, _TENOR)  # the Show-all row the report stored
+    snap, candidates = _report(
+        session, [a, b_liked], {"ch_tenor": page(b_page), "ch_soprano": page()}
+    )
+    diagnosis, _ = persist_report(session, snap.id, candidates)
+    items = diagnosis_items(session, diagnosis.id)
+    (item,) = items
+    item.confidence = 1.0  # as a report saved before the check
+    session.get(Track, item.related_track_id).raw_json = json.dumps(b_page)
+    session.flush()
+    lm = get_snapshot_items(session, snap.id)
+
+    assert performer_mismatches(session, items, lm) == {item.id}
+    assert _plan_items(session, items, lm, include_flagged=True) == []
+
+
+def test_partial_credit_never_matches_a_solo_recording():
+    a = {**_duet("vid_a", _TENOR, album="Paper Lantern - Single")}
+    a["artists"] = [*a["artists"], {"name": "Guest", "id": None}]
+    b = _duet("vid_b", _TENOR)
+    (c,) = find_candidates([a], {"ch_tenor": page(b)})[0]
+    assert c.report_only_cause.startswith("different performers")
+    (c,) = find_candidates([b | {"videoId": "vid_x"}], {"ch_tenor": page(a)})[0]
+    assert c.report_only_cause.startswith("different performers")
 
 
 def test_plan_keyword_only_finding_needs_include_flagged(session: Session):

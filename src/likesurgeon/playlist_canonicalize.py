@@ -215,11 +215,15 @@ def persist_report(
     session.flush()
     for pair in pairs:
         cause = report_only_cause(pair)
+        if performers_cause(pair.candidate.a, pair.b.song):
+            confidence = canonicalize.CONFIDENCE_DIFFERENT_PERFORMERS
+        else:
+            confidence = 0.5 if cause else 1.0
         session.add(
             DiagnosisItem(
                 diagnosis_id=diagnosis.id,
                 issue_type=ISSUE_PLAYLIST_CANONICAL_VERSION,
-                confidence=0.5 if cause else 1.0,
+                confidence=confidence,
                 reason=_reason(pair, cause),
                 source_track_id=pair.a.track_id,
                 related_track_id=upsert_ytmusic_track(session, pair.b.song).id,
@@ -274,10 +278,15 @@ def plan(
         loaded = playlists[shown.snapshot_id]
         b = b_tracks[it.related_track_id]
         b_video_id = b.video_id
+        # Every finding, 1.0 too: a report saved before the performer check
+        # has no 0.4 to tell it apart.
+        if (
+            performers_cause(json.loads(shown.raw_json or "{}"), json.loads(b.raw_json or "{}"))
+            is not None
+        ):
+            continue
         if it.confidence != 1.0 and (
             _keyword(shown) is None
-            or performers_cause(json.loads(shown.raw_json or "{}"), json.loads(b.raw_json or "{}"))
-            is not None
             or structural_cause(loaded, a.video_id or "", b_video_id or "") is not None
         ):
             continue
