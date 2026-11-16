@@ -24,7 +24,7 @@ Dead items that never become findings are counted in the report: ones YT Music s
 
 ## Action flow
 
-For A at YouTube index *p* (item id *a*), shown by YT Music as B at index *j*, in playlist P. Every write is committed to `sync_attempts` at once, before any wait. The module docstring of `playlist_dispatch.py` is the authority; this is its summary.
+For A at YouTube index *p* (item id *a*), shown by YT Music as B at index *j*, in playlist P. Every write is committed to `sync_attempts` at once, before any wait. The module docstring of `playlist_dispatch.py` is the authority; this is its summary. The same dispatcher runs `canonicalize-playlists` actions: a playable A shown as itself, with a canonical precheck, this repoint flow when B isn't in the playlist and a delete-only merge when it is ([playlist-canonicalize.md](playlist-canonicalize.md)).
 
 **One check form.** Every check except the one after removing B has the same shape (`_only_change(got, expected without x, x, at)`): the read holds one moving element *x*, and with that occurrence removed it is exactly the expected list, order included. Nothing else may move, appear or disappear. In a positional playlist *x* must also sit at index `at`; in a sorted playlist it may sit anywhere. The YouTube side is compared by `(item id, video id)`, YT Music by video id.
 
@@ -98,7 +98,7 @@ Only an applied `playlist_check` (B in, A out, both sides confirmed) or an appli
 - **Order.** Playlists with the fewest items first, then by playlist id and A's position, so `--limit 1` is the smallest possible first write.
 - **`--limit N`** caps findings per run. **`--yes`** skips the prompt.
 - **Quota.** Insert and delete cost 50 units each, `playlistItems.list` 1 per page of 50. The plan's estimate is, per playlist, one read of its YouTube side, and per action 2 writes plus a read with one more item and one with the original count (about 100 units plus the reads). Re-reads, undo calls (50 each), the refused positional insert of each automatically sorted playlist (50) and YT Music reads (free) aren't estimated. Running out stops the run after the action in flight settles; exit 1.
-- **Unsettled actions.** `repoint-playlists --apply` lists, per playlist title, position, A and B, every action with a write row after its last settling row. An entry drops off once a YT Music and a YouTube scan of that playlist are both newer than its last write row. Playlist rows are not in `sync_preflight`'s `_WRITE_KINDS` or `_SETTLING_KINDS`: they never block `sync`, and they never count toward the stranded-likes list.
+- **Unsettled actions.** `repoint-playlists --apply` (and `canonicalize-playlists --apply`) lists, per playlist title, position, A and B, every playlist action of either command with a write row after its last settling row. B comes from the finding's related `Track`. An entry drops off once a YT Music and a YouTube scan of that playlist are both newer than its last write row. Playlist rows are not in `sync_preflight`'s `_WRITE_KINDS` or `_SETTLING_KINDS`: they never block `sync`, and they never count toward the stranded-likes list.
 - **YT Music reads refresh stale cookies** once (`YTMusicClient.fetch_playlist`), as the likes checks do.
 
 ## Evidence
@@ -125,20 +125,20 @@ The first real `--apply` (2026-11-15) worked on a manually sorted playlist. On a
 1. **Command**: a new `repoint-playlists` (report) with `--apply [--limit N] [--yes]`, shaped like `canonicalize`. Alternative: flags on the existing `playlists` command.
 2. **Edit path**: YouTube Data API. Alternative: ytmusicapi playlist edits keyed by `setVideoId`. The probe above showed the API edits this account's playlists, so there was no reason to switch.
 3. **Deleted / private A**: report-only. No metadata to run the same-recording check on, and a deleted video can't be inserted again, so a restore is impossible. Alternative: act on them without the check; rejected because the delete is then irreversible.
-4. **B already in the playlist, or shown more than once**: report-only. Alternative: a delete-only action (the `unlike_shadow` analog), left for later.
+4. **B already in the playlist, or shown more than once**: report-only for a dead A. Alternative: a delete-only action (the `unlike_shadow` analog). That flow now exists, but only for a playable A shown as itself: the `canonicalize-playlists` merge ([playlist-canonicalize.md](playlist-canonicalize.md)).
 5. **Storage**: reuse `Diagnosis` (`kind = 'playlists'`), `DiagnosisItem` (`playlist_relinked`) and `SyncAttempt`, plus three nullable columns (`diagnoses.playlist_scan_id`, `diagnosis_items.source_item_id` / `related_item_id`), so `issues`, `skip` / `unskip` and `carry_over_skipped` work unchanged. Alternative: separate playlist tables.
 6. **Stale scans**: `--apply` exits 1 when a newer playlist scan exists than the report's, and each playlist gets writes only if both live sides equal the scan exactly. Alternative: also refuse the whole run after any earlier playlist write, as `sync` does; it would force a full re-scan between `--limit` slices for playlists nothing touched.
 7. **Proof before the delete**: A's item is deleted only after both sides confirm B at A's position, so most failures need only B removed. Alternative: check only after the delete, as likes do; a mismatch would then always depend on re-inserting a region-blocked video.
 8. **Order**: playlists with the fewest items first, then by position. Alternative: a `--playlist` filter.
 9. **Automatically sorted playlists**: handled without a flag. B goes where the sort order puts it, the checks accept it anywhere with everything else unchanged, and the run names those playlists. Alternatives: skip them (report-only), or have the user switch them to manual sorting first (that changes how their playlist orders new items).
 
-Out of scope: a playable A shown as another video (the user added that video on purpose), saved playlists (the scan gives them no YouTube side, so they produce no findings), any change to likes.
+Out of scope: a playable A shown as another video (the user added that video on purpose); a playable A shown as itself whose artist page lists another release (that is `canonicalize-playlists`, [playlist-canonicalize.md](playlist-canonicalize.md)); saved playlists (the scan gives them no YouTube side, so they produce no findings), any change to likes.
 
 ## Known limits
 
 - **A wrong B that renders as itself passes every check.** If YT Music shows B as B, the post-check can't tell a right pair from a wrong one. The same-recording check and the review before `--apply` are the guards; `skip` anything doubtful.
 - **Skips carry per playlist.** A skip carries over by (issue type, A, B, playlist), so the same pair in another playlist is a separate finding.
-- **Playable A's and delete-only duplicates are out of scope.** Report-only findings stay in the report and are never acted on.
+- **Report-only findings are never acted on.** That includes a dead A whose B is already in the playlist. Playable A's shown as themselves and their delete-only duplicates are `canonicalize-playlists`' business ([playlist-canonicalize.md](playlist-canonicalize.md)); a playable A shown as another video is nobody's.
 - **Coincidental equal-size gaps.** If YT Music shows an entry the Data API doesn't list, a gap can pair the wrong items while its two sides still have equal counts. Only the same-recording check and the both-sides-before-delete rule guard this.
 - **Sorted playlists move B.** In an automatically sorted playlist B ends up at its sort place, not A's index; that is the playlist's own rule. A sort order that reorders other items between our reads, such as popularity, fails the checks and the action is undone.
 - **Stale reads.** A YT Music read served from before the insert would pass the post-check, as with the likes repoint's "LM unchanged" check.

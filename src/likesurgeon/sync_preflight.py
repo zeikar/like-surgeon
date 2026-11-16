@@ -157,9 +157,12 @@ _PLAYLIST_WRITE_KINDS = (
 
 
 def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, str]]:
-    """Playlist repoints an earlier run left possibly half-done.
+    """Playlist actions (``repoint-playlists`` and ``canonicalize-playlists``)
+    an earlier run left possibly half-done.
 
-    Each is (playlist title, A's 1-based position, A, B).
+    Each is (playlist title, A's 1-based position, A, B); B comes from the
+    finding's related ``Track`` (its related item is A's rendering for a
+    canonical finding).
 
     Per item, in row order, only an applied ``playlist_check`` or
     ``playlist_rollback_verify`` settles it. An item is listed when, after its
@@ -169,6 +172,8 @@ def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, st
     verifies and reads change nothing, so they never settle. An action is
     dropped once a YT Music and a YouTube scan of the same playlist are both
     newer than its last write row: the next report shows what the playlist holds.
+    A merge whose A was put back has no settling row, so it stays listed until
+    that re-scan (which the restore's stop calls for anyway).
     """
     last_write: dict[int, datetime | None] = {}
     for item_id, kind, status, reason, at in session.execute(
@@ -196,7 +201,7 @@ def unsettled_playlist_actions(session: Session) -> list[tuple[str, int, str, st
         a = session.get(SnapshotItem, item.source_item_id) if item.source_item_id else None
         if a is None:
             continue
-        b = session.get(SnapshotItem, item.related_item_id) if item.related_item_id else None
+        b = session.get(Track, item.related_track_id) if item.related_track_id else None
         snap = session.get(Snapshot, a.snapshot_id)
         rescanned = set(
             session.scalars(

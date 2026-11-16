@@ -2,13 +2,16 @@
 
 Every command only reads the providers and writes the local DB, except
 ``sync`` and ``canonicalize --apply``, which write likes on YouTube, and
-``repoint-playlists --apply``, which edits playlists on YouTube.
+``repoint-playlists --apply`` and ``canonicalize-playlists --apply``, which
+edit playlists on YouTube.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -33,10 +36,13 @@ from .diagnosis import (
     ALIGNMENT_ISSUE_TYPES,
     CANONICAL_ISSUE_TYPES,
     DIAGNOSIS_KIND_CANONICALIZE,
+    DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE,
     DIAGNOSIS_KIND_PLAYLISTS,
     ISSUE_CANONICAL_AMBIGUOUS,
     ISSUE_CANONICAL_VERSION,
+    ISSUE_PLAYLIST_CANONICAL_VERSION,
     ISSUE_PLAYLIST_RELINKED,
+    PLAYLIST_CANONICAL_ISSUE_TYPES,
     PLAYLIST_ISSUE_TYPES,
     diagnosis_items,
     latest_diagnosis,
@@ -78,6 +84,12 @@ from .ytmusic_client import (
     YTMusicClient,
     write_browser_json_from_browser,
 )
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from .models import Diagnosis, DiagnosisItem
+    from .playlist_repoint import PlaylistAction, PlaylistState
 
 # All option/argument metadata is attached via ``Annotated[...]`` rather than
 # ``typer.Option(...)`` defaults so that ruff's ``B008`` (function call in
@@ -927,11 +939,16 @@ _REPORTS: dict[str | None, tuple[str, str]] = {
     None: ("Diagnosis", "compare-likes"),
     DIAGNOSIS_KIND_CANONICALIZE: ("Canonicalize report", "canonicalize"),
     DIAGNOSIS_KIND_PLAYLISTS: ("Playlist repoint report", "repoint-playlists"),
+    DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE: (
+        "Playlist canonicalize report",
+        "canonicalize-playlists",
+    ),
 }
 # Issue types that live in a report other than the compare-likes diagnosis.
 _KIND_BY_ISSUE_TYPE: dict[str, str] = {
     **dict.fromkeys(CANONICAL_ISSUE_TYPES, DIAGNOSIS_KIND_CANONICALIZE),
     **dict.fromkeys(PLAYLIST_ISSUE_TYPES, DIAGNOSIS_KIND_PLAYLISTS),
+    **dict.fromkeys(PLAYLIST_CANONICAL_ISSUE_TYPES, DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE),
 }
 
 
@@ -944,8 +961,10 @@ def issues(
             help=(
                 "Filter findings by issue type. One of: "
                 f"{' | '.join(ALIGNMENT_ISSUE_TYPES)}; from the latest canonicalize "
-                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}; or, from the latest "
-                f"repoint-playlists report, {' | '.join(PLAYLIST_ISSUE_TYPES)}."
+                f"report, {' | '.join(CANONICAL_ISSUE_TYPES)}; from the latest "
+                f"repoint-playlists report, {' | '.join(PLAYLIST_ISSUE_TYPES)}; or, from "
+                "the latest canonicalize-playlists report, "
+                f"{' | '.join(PLAYLIST_CANONICAL_ISSUE_TYPES)}."
             ),
         ),
     ] = None,
@@ -961,14 +980,19 @@ def issues(
         typer.Option("--format", "-f", help="Output format: 'table' (default) or 'json'."),
     ] = "table",
 ) -> None:
-    """List issues from the latest diagnosis (or canonicalize / repoint-playlists report,
-    for their types)."""
+    """List issues from the latest diagnosis (or canonicalize, repoint-playlists or
+    canonicalize-playlists report, for their types)."""
     import json as jsonlib
 
     fmt = format.lower()
     if fmt not in {"table", "json"}:
         _fail(f"Unsupported format: {format!r}. Use 'table' or 'json'.", code=2)
-    known = ALIGNMENT_ISSUE_TYPES + CANONICAL_ISSUE_TYPES + PLAYLIST_ISSUE_TYPES
+    known = (
+        ALIGNMENT_ISSUE_TYPES
+        + CANONICAL_ISSUE_TYPES
+        + PLAYLIST_ISSUE_TYPES
+        + PLAYLIST_CANONICAL_ISSUE_TYPES
+    )
     if type is not None and type not in known:
         _fail(f"Unknown issue type: {type!r}. One of: {', '.join(known)}.", code=2)
     kind = _KIND_BY_ISSUE_TYPE.get(type) if type is not None else None
@@ -1002,6 +1026,47 @@ def issues(
 
 
 _ARTIST_WARNINGS_SHOWN = 10
+
+
+def _artist_progress(done: int, total: int) -> None:
+    """Artist-page read progress on stderr."""
+    # Overwrite in place on a terminal; a log or pipe gets only the last line.
+    if err_console.is_terminal:
+        end = "\r" if done < total else "\n"
+    elif done == total:
+        end = "\n"
+    else:
+        return
+    err_console.print(f"Reading artist pages: {done}/{total}", end=end, highlight=False)
+
+
+def _warn_unreadable_artists(
+    out: Console,
+    artist_errors: Mapping[str, str],
+    songs: Sequence[dict[str, Any]],
+    *,
+    full_list: str | None,
+    rerun: str,
+) -> None:
+    """One line per unreadable artist (named from ``songs``), capped; past the
+    cap, a count and, if there is one, where ``full_list`` lists them all."""
+    from .canonicalize import artist_name
+
+    # Capped: when YT Music drops the songs shelf for most artists, one line
+    # each would bury the report.
+    for artist_id, message in list(artist_errors.items())[:_ARTIST_WARNINGS_SHOWN]:
+        out.print(
+            f"[yellow]⚠[/yellow] artist {escape(artist_name(artist_id, *songs))} "
+            f"({artist_id}) couldn't be read ({escape(message)}); its songs get no finding."
+        )
+    if len(artist_errors) > _ARTIST_WARNINGS_SHOWN:
+        where = f"; {full_list} lists them all" if full_list else ""
+        out.print(
+            f"[yellow]⚠[/yellow] … and {len(artist_errors) - _ARTIST_WARNINGS_SHOWN} more "
+            f"unreadable artist(s){where}."
+        )
+    if any(m.startswith(f"{MissingSongsShelfError.__name__}:") for m in artist_errors.values()):
+        out.print(f"YT Music sometimes omits artist songs lists; re-run {rerun} later.")
 
 
 @app.command("canonicalize")
@@ -1055,7 +1120,7 @@ def canonicalize_cmd(
     import json as jsonlib
     from dataclasses import asdict
 
-    from .canonicalize import artist_ids, artist_name, find_candidates, persist_report
+    from .canonicalize import artist_ids, find_candidates, persist_report
 
     if apply and json_output:
         _fail("--json can't be combined with --apply.", code=2)
@@ -1083,19 +1148,8 @@ def canonicalize_cmd(
     )
 
     ids = artist_ids(liked)
-
-    def _progress(done: int, total: int) -> None:
-        # Overwrite in place on a terminal; a log or pipe gets only the last line.
-        if err_console.is_terminal:
-            end = "\r" if done < total else "\n"
-        elif done == total:
-            end = "\n"
-        else:
-            return
-        err_console.print(f"Reading artist pages: {done}/{total}", end=end, highlight=False)
-
     try:
-        artists, artist_errors = client.fetch_artist_songs(ids, on_progress=_progress)
+        artists, artist_errors = client.fetch_artist_songs(ids, on_progress=_artist_progress)
     except AuthFileMissingError as e:
         _fail(escape(str(e)), code=2)
     candidates, summary = find_candidates(liked, artists)
@@ -1104,21 +1158,14 @@ def canonicalize_cmd(
         diag_id = diag.id
         rows = _finding_rows(session, diagnosis_items(session, diag.id))
 
-    # Capped: when YT Music drops the songs shelf for most artists, one line
-    # each would bury the report. --json keeps every error.
-    for artist_id, message in list(artist_errors.items())[:_ARTIST_WARNINGS_SHOWN]:
-        out.print(
-            f"[yellow]⚠[/yellow] artist {escape(artist_name(artist_id, *liked))} "
-            f"({artist_id}) couldn't be read ({escape(message)}); its songs get no finding."
-        )
-    if len(artist_errors) > _ARTIST_WARNINGS_SHOWN:
-        full_list = "the JSON report" if json_output else "`canonicalize --json`"
-        out.print(
-            f"[yellow]⚠[/yellow] … and {len(artist_errors) - _ARTIST_WARNINGS_SHOWN} more "
-            f"unreadable artist(s); {full_list} lists them all."
-        )
-    if any(m.startswith(f"{MissingSongsShelfError.__name__}:") for m in artist_errors.values()):
-        out.print("YT Music sometimes omits artist songs lists; re-run canonicalize later.")
+    # --json keeps every error.
+    _warn_unreadable_artists(
+        out,
+        artist_errors,
+        liked,
+        full_list="the JSON report" if json_output else "`canonicalize --json`",
+        rerun="canonicalize",
+    )
     if carried:
         out.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
     if json_output:
@@ -1360,7 +1407,7 @@ def repoint_playlists_cmd(
     if not apply and (limit is not None or yes):
         _fail("--limit and --yes only apply with --apply.", code=2)
     if apply:
-        _repoint_playlists_apply(limit=limit, yes=yes)
+        _playlist_apply(_repoint_command(), limit=limit, yes=yes)
         return
 
     cfg, factory = _bootstrap()
@@ -1416,23 +1463,213 @@ def repoint_playlists_cmd(
     )
 
 
-def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
-    """``repoint-playlists --apply``: act on the latest playlists report, behind
-    the same gates as ``canonicalize --apply``. Every action re-reads both
-    sides of its playlist before writing, so a playlist that changed since the
-    scan only gets no writes."""
-    from sqlalchemy import select
+@app.command("canonicalize-playlists")
+def canonicalize_playlists_cmd(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help=(
+                "Instead of a new report, move each open write-eligible "
+                "playlist_canonical_version item of the latest report to the release its "
+                "artist page lists (or remove it when the playlist already holds that release)."
+            ),
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option(
+            "--limit",
+            min=0,
+            help="With --apply: act on at most the first N findings (smallest playlists first).",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="With --apply: skip the interactive confirmation prompt."),
+    ] = False,
+    include_flagged: Annotated[
+        bool,
+        typer.Option(
+            "--include-flagged",
+            help=(
+                "With --apply: also act on playlist_canonical_version findings that are "
+                "report-only only because A's album has a version keyword (Live, Remix, ...). "
+                "Off by default — the album may hold a different recording; keep individual "
+                "findings out with `likesurgeon skip`."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Find playlist songs whose artist page lists another release of them.
 
-    from . import playlist_dispatch, playlist_repoint
-    from .models import PlaylistScan, SnapshotItem
+    Reads the latest playlist scan and, once each, the artist pages of the
+    audio tracks in your own playlists that have a YouTube side, and saves a
+    playlist_canonical_version finding for each playable song YT Music shows
+    as itself that none of its artists' song lists has while exactly one
+    same-title, same-length track there does. Nothing is written to YouTube,
+    except by --apply, which replaces each open write-eligible finding's item
+    with that release, or removes it when the playlist already holds the
+    release, smallest playlists first.
+    """
+    from .playlist_canonicalize import (
+        artist_ids,
+        eligible_playlists,
+        find,
+        persist_report,
+        raw_tracks,
+    )
+    from .playlists import load_scan
+
+    if not apply and (limit is not None or yes or include_flagged):
+        _fail("--limit, --yes and --include-flagged only apply with --apply.", code=2)
+    if apply:
+        _playlist_apply(_canonical_command(include_flagged), limit=limit, yes=yes)
+        return
 
     cfg, factory = _bootstrap()
     with session_scope(factory) as session:
-        diag = latest_diagnosis(session, kind=DIAGNOSIS_KIND_PLAYLISTS)
+        scan = load_scan(session)
+        if scan is None:
+            _fail("No playlist scan yet. Run `likesurgeon scan playlists` first.")
+        client = _ytmusic_client(cfg)
+        # Stale browser cookies are refreshed here, once, before the artist reads.
+        try:
+            client.fetch_liked_songs(limit=1)
+        except (AuthFileMissingError, UnexpectedResponseError) as e:
+            _fail(escape(str(e)), code=2)
+        ids = artist_ids(scan)
+        try:
+            artists, artist_errors = client.fetch_artist_songs(ids, on_progress=_artist_progress)
+        except AuthFileMissingError as e:
+            _fail(escape(str(e)), code=2)
+        found = find(scan, artists)
+        diag, carried = persist_report(session, scan.scan.id, found.pairs)
+        diag_id = diag.id
+        rows = _finding_rows(session, diagnosis_items(session, diag.id))
+        eligible = eligible_playlists(scan)
+        songs = [t for p in eligible for t in raw_tracks(p)]
+        own_count = sum(p.ytmusic.playlist_owned is True for p in scan.playlists)
+
+    _warn_unreadable_artists(
+        console, artist_errors, songs, full_list=None, rerun="canonicalize-playlists"
+    )
+    if carried:
+        console.print(f"Kept {carried} finding(s) 'skipped' from the previous report")
+    console.print(f"[green]✓[/green] Playlist canonicalize report [bold]#{diag_id}[/bold] saved.")
+    # What `--apply` would act on: carried-over skips don't count.
+    write_eligible = sum(r["confidence"] == 1.0 and r["status"] == "open" for r in rows)
+    # Counts are per playlist: a song in two playlists counts twice.
+    table = Table(title="canonicalize-playlists summary")
+    table.add_column("Bucket")
+    table.add_column("Count", justify="right")
+    table.add_row("Own playlists with a YouTube side / own", f"{len(eligible)} / {own_count}")
+    table.add_row("Artist pages read / total", f"{len(ids) - len(artist_errors)} / {len(ids)}")
+    table.add_row("Audio tracks already listed by their artist", str(found.listed))
+    table.add_row("Audio tracks with an unreadable artist (no finding)", str(found.unreadable))
+    table.add_row(
+        f"{ISSUE_PLAYLIST_CANONICAL_VERSION} (open write-eligible / total)",
+        f"{write_eligible} / {len(rows)}",
+    )
+    table.add_row(
+        "Audio tracks with two or more listed releases (no finding)", str(found.ambiguous)
+    )
+    table.add_row("Not shown as their own playable item (no finding)", str(found.not_own_item))
+    console.print(table)
+    if not rows:
+        console.print("[dim]No findings.[/dim]")
+        return
+    console.print(
+        _findings_table(f"Playlist canonicalize report #{diag_id} — findings ({len(rows)})", rows)
+    )
+    console.print(
+        "Review them, keep any out with [cyan]likesurgeon skip <id>[/cyan], then run "
+        "[cyan]likesurgeon canonicalize-playlists --apply[/cyan]."
+    )
+
+
+@dataclass(frozen=True)
+class _PlaylistCommand:
+    """What differs between the two playlist commands' ``--apply``."""
+
+    name: str  # "<name> report", "<name> result"
+    command: str  # the CLI command, e.g. "repoint-playlists"
+    kind: str  # ``Diagnosis.kind`` of its report
+    issue_type: str
+    plan: Callable[[Session, Diagnosis], tuple[list[PlaylistAction], dict[str, PlaylistState]]]
+    summarize: Callable[[Sequence[PlaylistAction], Mapping[str, PlaylistState]], str]
+    # Plan-table columns after ID, Playlist and Position, and an action's cells there.
+    columns: tuple[str, ...]
+    cells: Callable[[Session, PlaylistAction, DiagnosisItem], tuple[str, ...]]
+
+
+def _repoint_command() -> _PlaylistCommand:
+    from . import playlist_repoint
+    from .models import SnapshotItem
+
+    def cells(session: Session, a: PlaylistAction, item: DiagnosisItem) -> tuple[str, ...]:
+        # The scan-time row YT Music showed in A's place: B itself.
+        b_title = session.get_one(SnapshotItem, item.related_item_id).title
+        return (a.a_video_id, a.b_video_id, escape(b_title))
+
+    return _PlaylistCommand(
+        name="Playlist repoint",
+        command="repoint-playlists",
+        kind=DIAGNOSIS_KIND_PLAYLISTS,
+        issue_type=ISSUE_PLAYLIST_RELINKED,
+        plan=playlist_repoint.plan,
+        summarize=playlist_repoint.summarize,
+        columns=("A", "B", "B's title"),
+        cells=cells,
+    )
+
+
+def _canonical_command(include_flagged: bool) -> _PlaylistCommand:
+    from . import playlist_canonicalize
+    from .canonicalize import version_keyword
+    from .models import SnapshotItem, Track
+
+    def cells(session: Session, a: PlaylistAction, item: DiagnosisItem) -> tuple[str, ...]:
+        # The related item is A's own rendering here; B is the related Track.
+        b_title = session.get_one(Track, item.related_track_id).title
+        out = (a.kind, a.a_video_id, a.b_video_id, escape(b_title))
+        if include_flagged:
+            album = session.get_one(SnapshotItem, item.related_item_id).album
+            out += (version_keyword(album or "") or "",)
+        return out
+
+    return _PlaylistCommand(
+        name="Playlist canonicalize",
+        command="canonicalize-playlists",
+        kind=DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE,
+        issue_type=ISSUE_PLAYLIST_CANONICAL_VERSION,
+        plan=lambda session, diag: playlist_canonicalize.plan(
+            session, diag, include_flagged=include_flagged
+        ),
+        summarize=playlist_canonicalize.summarize,
+        columns=("Kind", "A", "B", "B's title", *(("Keyword",) if include_flagged else ())),
+        cells=cells,
+    )
+
+
+def _playlist_apply(cmd: _PlaylistCommand, *, limit: int | None, yes: bool) -> None:
+    """``--apply`` of a playlist command: act on its latest report, behind the
+    same gates as ``canonicalize --apply``. Every action re-reads both sides
+    of its playlist before writing, so a playlist that changed since the scan
+    only gets no writes."""
+    from sqlalchemy import select
+
+    from . import playlist_dispatch
+    from .models import PlaylistScan
+
+    report = f"{cmd.name} report"
+    cfg, factory = _bootstrap()
+    with session_scope(factory) as session:
+        diag = latest_diagnosis(session, kind=cmd.kind)
         if diag is None:
             console.print(
-                "[yellow]No playlist repoint report yet.[/yellow] "
-                "Run [cyan]likesurgeon repoint-playlists[/cyan] first."
+                f"[yellow]No {report.lower()} yet.[/yellow] "
+                f"Run [cyan]likesurgeon {cmd.command}[/cyan] first."
             )
             raise typer.Exit(1)
         latest_scan = session.scalars(
@@ -1442,10 +1679,10 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
             console.print(
                 f"[yellow]Playlist scan #{latest_scan} is newer than the scan "
                 f"(#{diag.playlist_scan_id}) report #{diag.id} was built on.[/yellow] "
-                "Re-run [cyan]likesurgeon repoint-playlists[/cyan] first."
+                f"Re-run [cyan]likesurgeon {cmd.command}[/cyan] first."
             )
             raise typer.Exit(1)
-        actions, states = playlist_repoint.plan(session, diag)
+        actions, states = cmd.plan(session, diag)
         if limit is not None and limit < len(actions):
             console.print(
                 f"[yellow]--limit {limit}: applying the first {limit} of "
@@ -1453,29 +1690,24 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
             )
             actions = actions[:limit]
         if actions:
-            related = {it.id: it.related_item_id for it in diag.items}
-            table = Table(
-                title=f"Playlist repoint report #{diag.id} — plan, smallest playlists first"
-            )
-            for column in ("ID", "Playlist", "Position", "A", "B", "B's title"):
+            items = {it.id: it for it in diag.items}
+            table = Table(title=f"{report} #{diag.id} — plan, smallest playlists first")
+            for column in ("ID", "Playlist", "Position", *cmd.columns):
                 table.add_column(
                     column, justify="right" if column in ("ID", "Position") else "left"
                 )
             for a in actions:
-                b_title = session.get_one(SnapshotItem, related[a.item_id]).title
                 table.add_row(
                     str(a.item_id),
                     escape(a.playlist_title),
                     str(a.a_index + 1),
-                    a.a_video_id,
-                    a.b_video_id,
-                    escape(b_title),
+                    *cmd.cells(session, a, items[a.item_id]),
                 )
             console.print(table)
-        console.print(playlist_repoint.summarize(actions, states))
+        console.print(cmd.summarize(actions, states))
         if unsettled := unsettled_playlist_actions(session):
             console.print(
-                f"[bold red]{len(unsettled)} playlist repoint(s) an earlier run left unsettled, "
+                f"[bold red]{len(unsettled)} playlist action(s) an earlier run left unsettled, "
                 "so B may sit next to A or A may be gone:[/bold red] "
                 + "; ".join(
                     f"{escape(title)} position {pos}: {a} → {b}" for title, pos, a, b in unsettled
@@ -1516,7 +1748,7 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
         result = playlist_dispatch.execute(session, actions, states, ytm=ytm, yt=yt)
 
     console.print(
-        f"[bold]Playlist repoint result:[/bold] "
+        f"[bold]{cmd.name} result:[/bold] "
         f"applied=[green]{result.applied}[/green] "
         f"failed=[red]{result.failed}[/red] "
         f"skipped=[yellow]{result.skipped}[/yellow] "
@@ -1526,7 +1758,7 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
         console.print(
             f"[yellow]{result.skipped} action(s) were undone:[/yellow] YT Music didn't show "
             "the playlist as expected, so the change was reverted and the finding marked "
-            f"'skipped'. See [cyan]likesurgeon issues --type {ISSUE_PLAYLIST_RELINKED}[/cyan]."
+            f"'skipped'. See [cyan]likesurgeon issues --type {cmd.issue_type}[/cyan]."
         )
     if result.reordered:
         console.print(
@@ -1561,7 +1793,7 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
         )
     if result.left_removed:
         console.print(
-            "[bold red]A repoint deleted A and it may not be back (B stays in); "
+            "[bold red]A was deleted and it may not be back (B stays in); "
             "add A back by hand at its position:[/bold red] "
             + "; ".join(f"{escape(t)} position {pos}: {a}" for t, pos, a in result.left_removed)
         )
@@ -1577,8 +1809,8 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
             "from the playlist, and remove it if not."
         )
     console.print(
-        "Before the next [cyan]repoint-playlists --apply[/cyan], run "
-        "[cyan]likesurgeon scan playlists[/cyan] and [cyan]likesurgeon repoint-playlists[/cyan] "
+        f"Before the next [cyan]{cmd.command} --apply[/cyan], run "
+        f"[cyan]likesurgeon scan playlists[/cyan] and [cyan]likesurgeon {cmd.command}[/cyan] "
         "again: the report no longer matches the playlists this run changed."
     )
     if result.failed or result.aborted or result.quota_exhausted or result.stale_playlists:
@@ -1588,11 +1820,11 @@ def _repoint_playlists_apply(*, limit: int | None, yes: bool) -> None:
 def _set_findings_status(item_ids: list[int], *, to: str) -> None:
     """Flip findings between 'open' and 'skipped'.
 
-    Ids must belong to the latest alignment diagnosis, canonicalize report or
-    repoint-playlists report. All-or-nothing: every id is validated first, so
+    Ids must belong to the latest alignment diagnosis or the latest report of
+    a command in ``_REPORTS``. All-or-nothing: every id is validated first, so
     a typo changes nothing. 'skipped' carries over to later diagnoses
-    (``carry_over_skipped``), so this is the durable way to keep ``sync``,
-    ``canonicalize --apply`` or ``repoint-playlists --apply`` off a finding.
+    (``carry_over_skipped``), so this is the durable way to keep ``sync`` or
+    an ``--apply`` off a finding.
     """
     from .models import DiagnosisItem
 
@@ -1634,7 +1866,7 @@ def _set_findings_status(item_ids: list[int], *, to: str) -> None:
 
 _FINDING_IDS_HELP = (
     "Finding ids from `likesurgeon issues`: the latest compare-likes diagnosis, "
-    "canonicalize report or repoint-playlists report."
+    "canonicalize, repoint-playlists or canonicalize-playlists report."
 )
 
 
@@ -1642,8 +1874,8 @@ _FINDING_IDS_HELP = (
 def skip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Keep `sync`, `canonicalize --apply` or `repoint-playlists --apply` off these findings,
-    across future runs too."""
+    """Keep `sync`, `canonicalize --apply`, `repoint-playlists --apply` or
+    `canonicalize-playlists --apply` off these findings, across future runs too."""
     _set_findings_status(item_ids, to="skipped")
 
 
@@ -1651,8 +1883,8 @@ def skip(
 def unskip(
     item_ids: Annotated[list[int], typer.Argument(help=_FINDING_IDS_HELP)],
 ) -> None:
-    """Re-open skipped findings so the next `sync`, `canonicalize --apply` or
-    `repoint-playlists --apply` acts on them."""
+    """Re-open skipped findings so the next `sync`, `canonicalize --apply`,
+    `repoint-playlists --apply` or `canonicalize-playlists --apply` acts on them."""
     _set_findings_status(item_ids, to="open")
 
 

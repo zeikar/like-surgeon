@@ -1,4 +1,4 @@
-"""Dispatcher for playlist repoints: runs the actions ``playlist_repoint.plan`` made.
+"""Dispatcher for playlist actions: runs the actions the playlist planners made.
 
 ``execute`` takes mock-friendly client objects and is the only thing that
 mutates a playlist finding's ``DiagnosisItem.status`` and emits its
@@ -12,11 +12,39 @@ write is followed by a read of both sides, compared with the baseline the
 action started from: YouTube by ``(item id, video id)``, YT Music by video id
 against its own baseline (it shows B where YouTube lists A).
 
-Every check but the one after removing B (the baseline again, exactly) has
-one form, ``_only_change``: the read holds one moving element — B's item on
-YouTube, one more or one moved B on YT Music, A's new item after putting A
-back — and with that occurrence removed it is exactly the expected list,
-order included, so nothing else may move, appear or go. A playlist is
+A canonical action (``canonical_repoint`` / ``canonical_merge``, a forecast)
+moves a playable A that YT Music shows as itself to the release B its artist
+page lists. Its precheck wants A, not B, at A's YT Music index, and B on both
+sides of the baseline or on neither; B on one side only stands for another
+item (or for nothing), so its playlist gets no writes this run. The baseline
+then picks the flow: B on neither side is a repoint, with the checks below
+unchanged (YT Music shows B at A's index and A one further, then B where A
+was); B on both sides is a merge.
+
+B must also be available on the YT Music side (its track isn't marked
+``isAvailable=False``), or A's playable item would be replaced by one that
+doesn't play. A merge whose live baseline shows B unavailable gets no writes
+(a failed ``playlist_precheck`` row, the item stays ``open``; only that action
+is skipped, the playlist isn't stale). A repoint whose inserted B YT Music
+shows unavailable fails its ``playlist_ytm_verify`` like a B it doesn't show:
+B is removed, A stays, the item is ``skipped`` and the run stops.
+
+A merge deletes A's item only; B, the entry being kept, is never touched.
+Nothing moves in, so ``playlist_delete_verify`` (the YouTube baseline without
+A's item) and ``playlist_check`` (the YT Music baseline without A's entry)
+are exact lists in positional and sorted playlists alike. A delete the
+YouTube side can't confirm undoes nothing, as below. With A's item gone but
+either side off, or YT Music unreadable, A is put back (at its index, or
+where a sorted playlist puts it) and the run stops; an A that isn't confirmed
+back is reported in ``left_removed``. A merge that passes moves later indices
+in its playlist up past the removed slot.
+
+Every check but the exact ones (after removing B, the baseline again; a
+merge's two checks) has one form, ``_only_change``: the read holds one moving
+element — B's item on YouTube, one more or one moved B on YT Music, A's new
+item after putting A back — and with that occurrence removed it is exactly
+the expected list, order included, so nothing else may move, appear or go.
+A playlist is
 ``positional`` (the default), where that element must also sit at the index
 the step puts it (B at A's index; on YT Music next to or at B's index), or
 ``sorted``, where it may sit anywhere: YouTube puts it where the playlist's
@@ -27,10 +55,10 @@ An automatically sorted playlist refuses an insert with a position (HTTP 400
 (``MANUAL_SORT_REJECTED``, like a quota rejection), the playlist is
 ``sorted`` for the rest of the run, and the insert is sent again without a
 position; later inserts there, B's or A's when putting it back, go without
-one at once. Each confirmed repoint's post-check reads become its playlist's
+one at once. Each confirmed action's post-check reads become its playlist's
 next baseline, and its removed and landed indices on both sides (equal in a
-positional playlist, so nothing shifts) move a later action's A and B
-indices before that action's precheck.
+positional repoint, so nothing shifts; nothing lands in a merge) move a later
+action's A and B indices before that action's precheck.
 
 Until A's delete is sent, a check that fails removes B again — only the item
 this action added, by its item id (found by reading the YouTube side when the
@@ -55,7 +83,7 @@ with both checks passing, is not ``applied`` (a call failed) but lets the
 run go on.
 
 Without such reads (a playlist's first action) both sides are read and must
-equal the planning scan plus this run's applied repoints, and A and B must sit
+equal the planning scan plus this run's applied actions, and A and B must sit
 where the action says. A playlist that fails this gets no writes this run (its
 items stay ``open``) and the run moves on to other playlists. A side that
 can't be read stops the run, as does YouTube's daily quota.
@@ -64,8 +92,12 @@ Row kinds: ``playlist_precheck``; ``playlist_insert`` (two rows when a sorted
 playlist refused the position), ``playlist_insert_verify``,
 ``playlist_ytm_verify``; ``playlist_delete``, ``playlist_delete_verify``,
 ``playlist_check``; ``playlist_rollback``, ``playlist_rollback_verify``
-(removing B); ``playlist_restore``, ``playlist_restore_verify`` (putting A
-back); ``playlist_interrupted``.
+(removing B); ``playlist_restore`` (two rows when a sorted playlist refused
+the position), ``playlist_restore_verify`` (putting A back);
+``playlist_interrupted``. A merge writes ``playlist_delete``,
+``playlist_delete_verify``, ``playlist_check`` and, to put A back, the two
+restore kinds, after a ``playlist_precheck`` when its baseline was read (not
+when the playlist's previous action just confirmed it).
 
 Invariants:
   * ``DiagnosisItem.reason`` is never modified; sync-side detail lives on
@@ -114,9 +146,9 @@ _RECHECKED = f"also after a {_RECHECK_WAIT_SECONDS}s re-read"
 # insert with a position: definitively not sent, like ``QUOTA_REJECTED``.
 MANUAL_SORT_REJECTED = "not sent, the playlist is sorted automatically"
 
-# ``PlaylistExecResult.aborted`` after a repoint didn't go as planned.
+# ``PlaylistExecResult.aborted`` after a playlist action didn't go as planned.
 PLAYLIST_STOP = (
-    "a playlist repoint didn't go as planned, so the playlists may differ from the "
+    "a playlist action didn't go as planned, so the playlists may differ from the "
     "report — re-scan playlists before applying more"
 )
 
@@ -125,7 +157,9 @@ PLAYLIST_STOP = (
 class PlaylistExecResult:
     applied: int
     failed: int
-    skipped: int  # YT Music didn't show the inserted B (B removed again), or A was put back
+    # YT Music didn't show the inserted B (B removed again), or A was put back
+    # after its delete.
+    skipped: int
     # Of ``skipped``: actions undone by putting A back.
     restored: int = 0
     # Actions left 'open' without any call: the run stopped early, or their
@@ -137,9 +171,9 @@ class PlaylistExecResult:
     aborted: str | None = None
     # Playlists whose live sides differed from the scan: no writes this run.
     stale_playlists: tuple[str, ...] = ()
-    # Repoints whose checks passed in a sorted playlist (``applied``, or
-    # ``failed`` when the delete call errored but landed): B sits where the
-    # playlist's sort order puts it, not at A's old position.
+    # Repoints (never merges) whose checks passed in a sorted playlist
+    # (``applied``, or ``failed`` when the delete call errored but landed): B
+    # sits where the playlist's sort order puts it, not at A's old position.
     reordered: int = 0
     # Titles of the playlists found sorted automatically this run.
     sorted_playlists: tuple[str, ...] = ()
@@ -148,11 +182,12 @@ class PlaylistExecResult:
     # the user removes it by hand.
     left_inserted: tuple[tuple[str, int, str], ...] = ()
     # (playlist title, A's 1-based position, A): A deleted and possibly not
-    # back; B stays in. The user adds A back by hand.
+    # back; B stays in (a repoint's inserted B, or a merge's kept one). The
+    # user adds A back by hand.
     left_removed: tuple[tuple[str, int, str], ...] = ()
     # (playlist title, A's 1-based position, A, B): A's delete was sent but the
     # YouTube side still lists A's item or couldn't be read. The delete may
-    # still land, so nothing was undone: B stays in.
+    # still land, so nothing was undone: B stays in, whichever the flow.
     delete_unconfirmed: tuple[tuple[str, int, str, str], ...] = ()
 
 
@@ -190,7 +225,10 @@ def execute(
                 outcomes["failed"] += 1
             session.commit()
             continue
-        outcome = run.repoint(*taken)
+        action, base = taken
+        # A canonical action's B already listed: the planned kind is only a forecast.
+        merge = action.kind != "relinked" and action.b_video_id in {v for _, v in base.youtube}
+        outcome = run.merge(action, base) if merge else run.repoint(action, base)
         outcomes[outcome] += 1
         if outcome in ("applied", "skipped"):
             item.status = outcome
@@ -231,17 +269,28 @@ def _difference(expected: Sequence[object], got: Sequence[object], label: str) -
 
 
 def _misplaced(action: PlaylistAction, base: _Sides) -> list[str]:
-    """Why ``base`` doesn't hold A at ``a_index`` and B at ``b_index``, if it doesn't."""
+    """Why ``base`` doesn't fit ``action``, if it doesn't: A's item at
+    ``a_index`` and, at ``b_index``, B for a relinked action, or A shown as
+    itself for a canonical one, whose B must then be on both sides or on
+    neither (B on one side only stands for another item, or for nothing)."""
     problems = []
     p, j = action.a_index, action.b_index
     a = (action.a_playlist_item_id, action.a_video_id)
     if p >= len(base.youtube) or base.youtube[p] != a:
         held = repr(base.youtube[p]) if p < len(base.youtube) else "nothing"
         problems.append(f"YouTube side: position {p + 1} holds {held}, not A {a!r}")
-    if j >= len(base.ytmusic) or base.ytmusic[j] != action.b_video_id:
+    canonical = action.kind != "relinked"
+    label, at_j = ("A", action.a_video_id) if canonical else ("B", action.b_video_id)
+    if j >= len(base.ytmusic) or base.ytmusic[j] != at_j:
         shown = repr(base.ytmusic[j]) if j < len(base.ytmusic) else "nothing"
+        problems.append(f"YT Music side: position {j + 1} holds {shown}, not {label} {at_j!r}")
+    b = action.b_video_id
+    listed = canonical and b in {video_id for _, video_id in base.youtube}
+    if canonical and listed != (b in base.ytmusic):
         problems.append(
-            f"YT Music side: position {j + 1} holds {shown}, not B {action.b_video_id!r}"
+            f"B {b!r} is listed on the YouTube side but not shown by YT Music"
+            if listed
+            else f"B {b!r} is shown by YT Music but not listed on the YouTube side"
         )
     return problems
 
@@ -302,12 +351,13 @@ def _added_item(base: _YouTube, got: _YouTube, video_id: str) -> tuple[str, str 
     return None
 
 
-def _shifted(index: int, removed: int, landed: int) -> int:
+def _shifted(index: int, removed: int, landed: int | None) -> int:
     """Where the entry at ``index`` sits once the one at ``removed`` left and
-    one landed at ``landed`` (an index in the new list). The identity when
-    ``removed == landed``, as in a positional repoint."""
+    one landed at ``landed`` (an index in the new list; None: nothing landed,
+    as in a merge). The identity when ``removed == landed``, as in a
+    positional repoint."""
     kept = index - (index > removed)
-    return kept + (kept >= landed)
+    return kept if landed is None else kept + (kept >= landed)
 
 
 class _ReadFailed(Exception):
@@ -326,14 +376,16 @@ class _PlaylistRun:
         self.yt = yt
         self.ytm = ytm
         # Per playlist: both sides as expected now — the scan plus this run's
-        # applied repoints (the reads that confirmed the last one).
+        # applied actions (the reads that confirmed the last one).
         self.expected: dict[str, _Sides] = {}
-        # Per playlist, each applied repoint's indices: (YouTube removed,
-        # landed, YT Music removed, landed).
-        self.moves: dict[str, list[tuple[int, int, int, int]]] = {}
+        # Per playlist, each applied action's indices: (YouTube removed,
+        # landed, YT Music removed, landed); landed is None for a merge.
+        self.moves: dict[str, list[tuple[int, int | None, int, int | None]]] = {}
         # Playlists found sorted automatically: id -> title, in the order found.
         self.sorted: dict[str, str] = {}
         self.reordered = 0
+        # Per playlist: video ids the latest YT Music read marked unavailable.
+        self.ytm_unavailable: dict[str, set[str]] = {}
         # Playlists whose last action's checks just read them as expected.
         self.confirmed: set[str] = set()
         self.stale: list[str] = []
@@ -351,11 +403,11 @@ class _PlaylistRun:
     def take_baseline(
         self, action: PlaylistAction, scanned: PlaylistState
     ) -> tuple[PlaylistAction, _Sides] | None:
-        """``action`` with its indices moved by this run's repoints in its
+        """``action`` with its indices moved by this run's actions in its
         playlist, and the sides it is checked against; or None: the playlist
-        differs from the scan plus those repoints, or A or B isn't where the
-        moved action says (either way added to ``stale``), or a side couldn't
-        be read (the run stops).
+        differs from the scan plus those actions, or the moved action doesn't
+        fit it (``_misplaced``; either way added to ``stale``), or a side
+        couldn't be read (the run stops).
 
         Both sides are read unless the playlist's previous action just
         confirmed them; taking the baseline marks them unconfirmed again.
@@ -374,7 +426,7 @@ class _PlaylistRun:
                 youtube = self._read_youtube(pid)
                 ytmusic = self._read_ytmusic(pid)
             except _ReadFailed as exc:
-                self._read_failed(action, exc, "before its next repoint")
+                self._read_failed(action, exc, "before its next action")
                 return None
             if youtube != base.youtube:
                 problems.append(f"YouTube side: {_difference(base.youtube, youtube, 'scan')}")
@@ -440,8 +492,14 @@ class _PlaylistRun:
         # YT Music shows B at j already; in a positional playlist one more B
         # there reads the same on either side of it, so ``at`` j covers both.
         shown = _Change(base.ytmusic, b, self._at(action, j))
-        ytmusic = self._check_ytmusic(action, "playlist_ytm_verify", shown.mismatch)
-        if ytmusic is None or shown.index(ytmusic) is None:
+
+        def shown_mismatch(got: _YTMusic) -> str | None:
+            return shown.mismatch(got) or (
+                self._b_unavailable(action) if action.kind != "relinked" else None
+            )
+
+        ytmusic = self._check_ytmusic(action, "playlist_ytm_verify", shown_mismatch)
+        if ytmusic is None or shown_mismatch(ytmusic) is not None:
             removed = self._remove_b(action, base, new_id)
             self._halt()
             # Terminal only when YT Music was read: the pair shows wrong, retrying repeats it.
@@ -460,6 +518,13 @@ class _PlaylistRun:
         self._remove_b(action, base, new_id)
         return "failed"
 
+    def _b_unavailable(self, action: PlaylistAction) -> str | None:
+        """Why a canonical action's B can't replace A: the latest YT Music read
+        of its playlist marks B unavailable."""
+        if action.b_video_id in self.ytm_unavailable.get(action.playlist_id, ()):
+            return f"YT Music marks B {action.b_video_id!r} unavailable"
+        return None
+
     def _settle_delete(
         self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str], *, sent_ok: bool
     ) -> _Outcome:
@@ -473,11 +538,8 @@ class _PlaylistRun:
         replaced = _Change(base.youtube[:p] + base.youtube[p + 1 :], b_item, self._at(action, p))
         time.sleep(_VERIFY_WAIT_SECONDS)
         youtube = self._check_youtube(action, "playlist_delete_verify", replaced.mismatch)
-        if youtube is None or action.a_playlist_item_id in {item_id for item_id, _ in youtube}:
-            self.delete_unconfirmed.append(
-                (action.playlist_title, p + 1, action.a_video_id, action.b_video_id)
-            )
-            return self._halt()
+        if youtube is None or action.a_playlist_item_id in {i for i, _ in youtube}:
+            return self._report_unconfirmed(action)
         landed = replaced.index(youtube)
         if landed is None:
             return self._restore(action, base, b_item)
@@ -501,12 +563,62 @@ class _PlaylistRun:
             self.reordered += 1
         return "applied" if sent_ok else "failed"
 
-    def _restore(self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str]) -> _Outcome:
+    def merge(self, action: PlaylistAction, base: _Sides) -> _Outcome:
+        """B is already in the playlist: delete A's item, then check each side
+        is its baseline without A, exactly (nothing moves in, so positional
+        and sorted playlists alike).
+
+        B is never touched: it is the entry being kept. A delete the YouTube
+        side can't confirm undoes nothing; with A's item gone but a side off,
+        or YT Music unreadable, A is put back (``_restore``)."""
+        pid, p, j = action.playlist_id, action.a_index, action.b_index
+        if (problem := self._b_unavailable(action)) is not None:
+            self._record(action.item_id, "playlist_precheck", "failed", problem)
+            return "failed"
+        with self._interrupt_marks_delete(action):
+            result, _ = self._write(
+                action.item_id,
+                "playlist_delete",
+                lambda: self.yt.delete_playlist_item(action.a_playlist_item_id),
+                lambda _: f"deleted item {action.a_playlist_item_id} ({action.a_video_id})",
+            )
+            if result == "quota":
+                return "failed"  # nothing was sent
+            time.sleep(_VERIFY_WAIT_SECONDS)
+            without_a = base.youtube[:p] + base.youtube[p + 1 :]
+            youtube = self._check_youtube(action, "playlist_delete_verify", _unchanged(without_a))
+            if youtube is None or action.a_playlist_item_id in {i for i, _ in youtube}:
+                return self._report_unconfirmed(action)
+            if youtube != without_a:
+                return self._restore(action, base, None)
+            without_j = base.ytmusic[:j] + base.ytmusic[j + 1 :]
+            ytmusic = self._check_ytmusic(action, "playlist_check", _unchanged(without_j))
+            if ytmusic != without_j:
+                return self._restore(action, base, None)
+            self.expected[pid] = _Sides(without_a, without_j)
+            self.moves.setdefault(pid, []).append((p, None, j, None))
+            self.confirmed.add(pid)
+            return "applied" if result == "ok" else "failed"
+
+    def _report_unconfirmed(self, action: PlaylistAction) -> _Outcome:
+        """A's sent delete is unconfirmed (the YouTube side still lists A's
+        item, or couldn't be read): it may yet land, so nothing is undone.
+        Report the pair and stop the run."""
+        self.delete_unconfirmed.append(
+            (action.playlist_title, action.a_index + 1, action.a_video_id, action.b_video_id)
+        )
+        return self._halt()
+
+    def _restore(
+        self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str] | None
+    ) -> _Outcome:
         """Insert A again and, once it is confirmed back with every other item
-        unchanged, remove B. A comes back under a new item id. In a positional
-        playlist A must be back at its index with B right after it; in a
-        sorted one each may sit anywhere. An A not confirmed back keeps B in
-        and is reported in ``left_removed``. Always stops the run."""
+        unchanged, remove the B item this action added (``b_item``; None for
+        a merge, which added none and keeps B). A comes back under a new item
+        id. In a positional playlist A must be back at its index (with B
+        right after it after a repoint); in a sorted one it, and B, may sit
+        anywhere. An A not confirmed back keeps B in and is reported in
+        ``left_removed``. Always stops the run."""
         p, a = action.a_index, action.a_video_id
         result, _ = self._insert(action, "playlist_restore", a, p)
         if result in ("ok", "error"):  # an errored insert may have landed too
@@ -516,11 +628,14 @@ class _PlaylistRun:
 
             def mismatch(got: _YouTube) -> str | None:
                 """None when ``got`` holds one new item of A (at ``at``) and,
-                that set aside, is ``without_a`` plus B's item (at ``at``,
-                i.e. right after A, in a positional playlist)."""
+                that set aside, is ``without_a`` plus, after a repoint, B's
+                item (at ``at``, i.e. right after A, in a positional
+                playlist)."""
                 new = [it for it in got if it[1] == a and it not in base.youtube]
                 if len(new) != 1:
                     return f"{len(new)} new items of A {a!r} listed (expected 1)"
+                if b_item is None:
+                    return _Change(without_a, new[0], at).mismatch(got)
                 i = got.index(new[0])
                 if at is not None and i != at:
                     return f"A's new item {new[0]!r} is at position {i + 1}, not {at + 1}"
@@ -528,6 +643,10 @@ class _PlaylistRun:
 
             youtube = self._check_youtube(action, "playlist_restore_verify", mismatch)
             if youtube is not None and mismatch(youtube) is None:
+                if b_item is None:
+                    self._halt()
+                    self.restored += 1
+                    return "skipped"
                 # The baseline with A's new item id (and, if sorted, A's new place).
                 restored = tuple(it for it in youtube if it != b_item)
                 removed = self._remove_b(action, _Sides(restored, base.ytmusic), b_item[0])
@@ -642,16 +761,20 @@ class _PlaylistRun:
                     action.item_id,
                     "playlist_interrupted",
                     "failed",
-                    f"{type(exc).__name__} after A's delete call started — A may be missing "
-                    "or B may be extra; re-scan playlists",
+                    f"{type(exc).__name__} after A's delete call started — it may or may "
+                    "not land; re-scan playlists",
                 )
                 self.session.commit()
             except BaseException:
                 # The row is lost (e.g. the DB itself failed): name A somewhere.
+                # Never advise taking B out: in a merge B is the entry being
+                # kept, and with A's delete pending that could lose both.
                 print(
-                    f"likesurgeon: stopped after deleting YouTube video {action.a_video_id} "
-                    f"from playlist {action.playlist_title!r}, unrecorded — if it is missing, "
-                    f"add it back by hand; if it is there, remove {action.b_video_id} next to it",
+                    f"likesurgeon: stopped, unrecorded, after sending the delete of YouTube "
+                    f"video {action.a_video_id} from playlist {action.playlist_title!r} "
+                    f"— the delete may still land, so change nothing yet and leave "
+                    f"{action.b_video_id} as it is: re-scan playlists, and add "
+                    f"{action.a_video_id} back by hand only if it is missing",
                     file=sys.stderr,
                 )
             raise
@@ -761,7 +884,7 @@ class _PlaylistRun:
                 got = read()
             except _ReadFailed as exc:
                 self._record(action.item_id, kind, "failed", f"read failed: {exc}")
-                self._read_failed(action, exc, "to check a repoint")
+                self._read_failed(action, exc, "to check an action")
                 return None
             if accept(got):
                 break
@@ -794,6 +917,9 @@ class _PlaylistRun:
                 )
         except (UnexpectedResponseError, AuthFileMissingError) as exc:
             raise _ReadFailed(f"YT Music: {exc}") from exc
+        self.ytm_unavailable[playlist_id] = {
+            t.get("videoId") for t in tracks if t.get("isAvailable") is False
+        }
         return tuple(t.get("videoId") for t in tracks)
 
     def _read_failed(self, action: PlaylistAction, exc: _ReadFailed, when: str) -> None:

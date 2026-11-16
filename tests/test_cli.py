@@ -4103,3 +4103,436 @@ def test_repoint_playlists_apply_lists_unsettled_actions_before_the_prompt(
     assert "an earlier run left unsettled" in out
     assert "[Mix] PLmix position 2: A → B" in out
     assert out.index("unsettled") < out.index("Proceed?")
+
+
+# ---------------------------------------------------------------------------
+# canonicalize-playlists. Every playlist item is playable and shown as itself;
+# "A*" and "B*" videos are "Paper Lantern" by ``ch_art``, whose page lists B
+# (titled "PAPER LANTERN", the same title key) and none of the A's.
+# ---------------------------------------------------------------------------
+
+
+def _pl_atv(video_id: str, *, album: str = "Paper Lantern - Single") -> dict[str, Any]:
+    """A playlist's YT Music track: an ATV of 200 s by ``ch_art`` (``ch_two``
+    for ``w*`` videos); A's and B's are "Paper Lantern", the rest unique."""
+    track = _atv(video_id, album, artist="ch_two" if video_id.startswith("w") else "ch_art")
+    if not video_id.startswith(("A", "B")):
+        track["title"] = f"Track {video_id}"
+    return track
+
+
+def _artist_page_with_b() -> dict[str, Any]:
+    from likesurgeon.ytmusic_client import ArtistSongs
+
+    b = {**_pl_atv("B", album="Paper Lantern"), "title": "PAPER LANTERN"}
+    return {"ch_art": ArtistSongs(top_video_ids=(), songs=(b,)), "ch_two": None}
+
+
+def _seed_canonical_scan(
+    home: Path, playlists: dict[str, list[str]], albums: dict[str, str] | None = None
+) -> FakePlaylistAccount:
+    """An account holding ``playlists`` (id → video ids, all playable) and a
+    playlist scan of it. Playlist ``X`` is titled ``[Mix] X``."""
+    from likesurgeon.snapshot import PlaylistRead, create_playlist_scan
+
+    albums = albums or {}
+    account = FakePlaylistAccount(
+        {pid: [(f"pi_{v}", v) for v in videos] for pid, videos in playlists.items()}
+    )
+
+    def track(v: str) -> dict[str, Any]:
+        return _pl_atv(v, album=albums[v]) if v in albums else _pl_atv(v)
+
+    reads = [
+        PlaylistRead(
+            playlist_id=pid,
+            title=f"[Mix] {pid}",
+            ytmusic={
+                "id": pid,
+                "title": f"[Mix] {pid}",
+                "owned": True,
+                "tracks": [track(v) for v in videos],
+            },
+            youtube_items=[_pl_yt(v, i, True) for i, v in enumerate(videos)],
+        )
+        for pid, videos in playlists.items()
+    ]
+    s = _open_db(home)
+    try:
+        create_playlist_scan(s, reads)
+        s.commit()
+    finally:
+        s.close()
+    return account
+
+
+def _canonical_findings(home: Path) -> list[tuple[int, int, float, str]]:
+    """Every playlist canonicalize finding as (diagnosis id, item id, confidence, status)."""
+    from sqlalchemy import select
+
+    from likesurgeon.diagnosis import DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE
+    from likesurgeon.models import Diagnosis, DiagnosisItem
+
+    s = _open_db(home)
+    try:
+        return [
+            (it.diagnosis_id, it.id, it.confidence, it.status)
+            for it in s.scalars(
+                select(DiagnosisItem)
+                .join(Diagnosis)
+                .where(Diagnosis.kind == DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE)
+                .order_by(DiagnosisItem.id)
+            )
+        ]
+    finally:
+        s.close()
+
+
+def _canonicalize_playlists(*args: str, input: str | None = None) -> Any:
+    from likesurgeon.cli import app
+
+    return CliRunner().invoke(
+        app, ["canonicalize-playlists", *args], input=input, env={"COLUMNS": "400"}
+    )
+
+
+@pytest.fixture
+def patch_canonical_report(
+    monkeypatch: pytest.MonkeyPatch, patch_discovery_client: type[_FakeYTMusicDiscovery]
+) -> type[_FakeYTMusicDiscovery]:
+    """The discovery fake with the playlist artist pages; any YouTube client
+    is counted in ``_FakePlaylistYouTube.constructed``."""
+    patch_discovery_client.artists = _artist_page_with_b()
+    _FakePlaylistYouTube.constructed = 0
+    monkeypatch.setattr(_yt_mod, "YouTubeClient", _FakePlaylistYouTube)
+    return patch_discovery_client
+
+
+def test_canonicalize_playlists_without_a_scan_exits_one(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    result = _canonicalize_playlists()
+
+    assert result.exit_code == 1, result.output
+    assert "likesurgeon scan playlists" in _out(result)
+    assert patch_canonical_report.artist_reads == []
+
+
+def test_canonicalize_playlists_reports_findings_reading_each_artist_once(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    _seed_canonical_scan(fake_home, {"PL1": ["v1", "A1", "w1"], "PL2": ["A2", "v2"]})
+
+    result = _canonicalize_playlists()
+
+    assert result.exit_code == 0, result.output
+    assert patch_canonical_report.artist_reads == [["ch_art", "ch_two"]]
+    assert _FakePlaylistYouTube.constructed == 0
+    findings = _canonical_findings(fake_home)
+    assert [(conf, st) for _, _, conf, st in findings] == [(1.0, "open"), (1.0, "open")]
+    diag_id = findings[0][0]
+    out = _cells(result)
+    assert f"Playlist canonicalize report #{diag_id} saved" in out
+    assert "Own playlists with a YouTube side / own 2 / 2" in out
+    assert "Artist pages read / total 2 / 2" in out
+    assert "playlist_canonical_version (open write-eligible / total) 2 / 2" in out
+    assert f"Playlist canonicalize report #{diag_id} — findings (2)" in out
+    assert "[Mix] PL1" in out  # in the reason, printed literally
+    assert "likesurgeon skip <id>" in out
+    assert "likesurgeon canonicalize-playlists --apply" in out
+
+
+def test_canonicalize_playlists_failing_ytmusic_probe_exits_two(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    from likesurgeon.ytmusic_client import UnexpectedResponseError
+
+    _seed_canonical_scan(fake_home, {"PL1": ["A1"]})
+    patch_canonical_report.liked_error = UnexpectedResponseError("cookies expired")
+
+    result = _canonicalize_playlists()
+
+    assert result.exit_code == 2, result.output
+    assert "cookies expired" in _out(result)
+    assert patch_canonical_report.artist_reads == []
+
+
+def test_canonicalize_playlists_rejects_apply_only_flags_without_apply(fake_home: Path) -> None:
+    for args in (["--limit", "1"], ["--yes"], ["--include-flagged"]):
+        result = _canonicalize_playlists(*args)
+        assert result.exit_code == 2, result.output
+        assert "only apply with --apply" in _out(result)
+
+
+def test_canonicalize_playlists_unreadable_artist_is_a_warning(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    _seed_canonical_scan(fake_home, {"PL1": ["A1"]})
+    patch_canonical_report.artist_errors = {"ch_art": "HTTP 500"}
+
+    result = _canonicalize_playlists()
+
+    assert result.exit_code == 0, result.output
+    out = _out(result)
+    assert "artist Name ch_art (ch_art) couldn't be read (HTTP 500)" in out
+    assert "Audio tracks with an unreadable artist (no finding) 1" in _cells(result)
+    assert _canonical_findings(fake_home) == []
+
+
+def test_canonicalize_playlists_second_run_keeps_a_skipped_finding_skipped(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_canonical_scan(fake_home, {"PL1": ["A1"]})
+    assert _canonicalize_playlists().exit_code == 0
+    [(_, item_id, _, _)] = _canonical_findings(fake_home)
+    assert CliRunner().invoke(app, ["skip", str(item_id)]).exit_code == 0
+
+    result = _canonicalize_playlists()
+
+    assert result.exit_code == 0, result.output
+    assert "Kept 1 finding(s) 'skipped' from the previous report" in _out(result)
+    assert [st for *_, st in _canonical_findings(fake_home)] == ["skipped", "skipped"]
+    assert "playlist_canonical_version (open write-eligible / total) 0 / 1" in _cells(result)
+
+
+def test_issues_type_playlist_canonical_version_lists_the_latest_report(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    import json
+
+    from likesurgeon.cli import app
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["issues", "--type", "playlist_canonical_version"])
+    assert result.exit_code == 0, result.output
+    assert "No playlist canonicalize report yet" in _out(result)
+    assert "Run likesurgeon canonicalize-playlists first" in _out(result)
+
+    _seed_canonical_scan(fake_home, {"PL1": ["A1"]})
+    assert _canonicalize_playlists().exit_code == 0
+    [(diag_id, item_id, _, _)] = _canonical_findings(fake_home)
+
+    result = runner.invoke(
+        app, ["issues", "--type", "playlist_canonical_version", "--format", "json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["diagnosis_id"] == diag_id
+    assert [
+        (it["id"], it["source_video_id"], it["related_video_id"]) for it in payload["items"]
+    ] == [(item_id, "A1", "B")]
+    assert "playlist_canonical_version" in _out(runner.invoke(app, ["issues", "--help"]))
+
+
+def test_skip_and_unskip_accept_ids_from_the_latest_playlist_canonicalize_report(
+    fake_home: Path, patch_canonical_report: type[_FakeYTMusicDiscovery]
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_canonical_scan(fake_home, {"PL1": ["A1"]})
+    assert _canonicalize_playlists().exit_code == 0
+    [(_, item_id, _, _)] = _canonical_findings(fake_home)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["skip", str(item_id)]).exit_code == 0
+    assert [st for *_, st in _canonical_findings(fake_home)] == ["skipped"]
+    assert runner.invoke(app, ["unskip", str(item_id)]).exit_code == 0
+    assert [st for *_, st in _canonical_findings(fake_home)] == ["open"]
+    for command in ("skip", "unskip"):
+        assert "canonicalize-playlists" in _out(runner.invoke(app, [command, "--help"]))
+
+
+# --- canonicalize-playlists --apply -----------------------------------------
+
+
+def _seed_playlist_canonical(
+    home: Path, playlists: dict[str, list[str]], albums: dict[str, str] | None = None
+) -> FakePlaylistAccount:
+    """``_seed_canonical_scan`` plus the report built on it through
+    ``playlist_canonicalize``; wires the account into both client fakes."""
+    from likesurgeon.playlist_canonicalize import find, persist_report
+    from likesurgeon.playlists import load_scan
+
+    account = _seed_canonical_scan(home, playlists, albums)
+    s = _open_db(home)
+    try:
+        scan = load_scan(s)
+        persist_report(s, scan.scan.id, find(scan, _artist_page_with_b()).pairs)
+        s.commit()
+    finally:
+        s.close()
+    _FakePlaylistYouTube.account = account
+    _FakePlaylistYTMusic.account = account
+    return account
+
+
+def _apply_canonical(*args: str, input: str | None = None) -> Any:
+    return _canonicalize_playlists("--apply", *args, input=input)
+
+
+def test_canonicalize_playlists_apply_without_a_report_exits_one(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    result = _apply_canonical("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert "No playlist canonicalize report yet" in _out(result)
+    assert "likesurgeon canonicalize-playlists" in _out(result)
+
+
+def test_canonicalize_playlists_apply_refuses_a_report_older_than_the_latest_scan(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.snapshot import create_playlist_scan
+
+    account = _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1"]})
+    s = _open_db(fake_home)
+    try:
+        create_playlist_scan(s, [])
+        s.commit()
+    finally:
+        s.close()
+
+    result = _apply_canonical("--yes")
+
+    assert result.exit_code == 1, result.output
+    assert "Re-run likesurgeon canonicalize-playlists first" in _out(result)
+    assert account.write_calls == []
+    assert _FakePlaylistYouTube.constructed == 0
+
+
+def test_canonicalize_playlists_apply_with_nothing_to_apply_builds_no_youtube_client(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.cli import app
+
+    _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1"]})
+    [(_, item_id, _, _)] = _canonical_findings(fake_home)
+    assert CliRunner().invoke(app, ["skip", str(item_id)]).exit_code == 0
+
+    result = _apply_canonical()
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to apply" in _out(result)
+    assert _FakePlaylistYouTube.constructed == 0
+
+
+def test_canonicalize_playlists_apply_declined_prompt_writes_nothing(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1"]})
+
+    result = _apply_canonical(input="n\n")
+
+    assert result.exit_code == 1, result.output
+    assert "Proceed?" in result.output
+    assert account.write_calls == []
+
+
+def test_canonicalize_playlists_apply_repoints_a_to_b_and_shows_bs_title(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1", "v3"]})
+    [(diag_id, item_id, _, _)] = _canonical_findings(fake_home)
+
+    result = _apply_canonical("--yes")
+
+    assert result.exit_code == 0, result.output
+    assert [v for _, v in account.playlists["PL1"]] == ["v1", "B", "v3"]
+    assert [st for *_, st in _canonical_findings(fake_home)] == ["applied"]
+    out = _cells(result)
+    assert f"Playlist canonicalize report #{diag_id} — plan" in out
+    # id, playlist (markup printed literally), A's position, forecast, A, B, B's title
+    assert f"{item_id} [Mix] PL1 2 canonical_repoint A1 B PAPER LANTERN" in out
+    assert "canonical_repoint: 1" in out
+    assert "Playlist canonicalize result: applied=1 failed=0 skipped=0 restored=0" in out
+    assert "run likesurgeon scan playlists and likesurgeon canonicalize-playlists again" in out
+
+
+def test_canonicalize_playlists_apply_merge_sends_one_delete(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1", "B"]})
+
+    result = _apply_canonical("--yes")
+
+    assert result.exit_code == 0, result.output
+    assert account.write_calls == [("delete", "pi_A1")]
+    assert [v for _, v in account.playlists["PL1"]] == ["v1", "B"]
+    assert "canonical_merge: 1" in _cells(result)
+
+
+def test_canonicalize_playlists_apply_include_flagged_adds_a_keyword_only_finding(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(
+        fake_home, {"PL1": ["v1", "A1"]}, albums={"A1": "Paper Lantern (Live)"}
+    )
+    [(_, item_id, confidence, _)] = _canonical_findings(fake_home)
+    assert confidence == 0.5
+
+    assert "Nothing to apply" in _out(_apply_canonical("--yes"))
+    result = _apply_canonical("--yes", "--include-flagged")
+
+    assert result.exit_code == 0, result.output
+    assert f"{item_id} [Mix] PL1 2 canonical_repoint A1 B PAPER LANTERN Live" in _cells(result)
+    assert [v for _, v in account.playlists["PL1"]] == ["v1", "B"]
+
+
+def test_canonicalize_playlists_apply_limit_takes_the_smallest_playlist_first(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(
+        fake_home, {"PLbig": ["v1", "A1", "v3", "v4"], "PLsmall": ["v5", "A2"]}
+    )
+
+    result = _apply_canonical("--yes", "--limit", "1")
+
+    assert result.exit_code == 0, result.output
+    assert "--limit 1: applying the first 1 of 2 actions" in _out(result)
+    assert [v for _, v in account.playlists["PLsmall"]] == ["v5", "B"]
+    assert [v for _, v in account.playlists["PLbig"]] == ["v1", "A1", "v3", "v4"]
+
+
+def test_canonicalize_playlists_apply_lists_unsettled_actions_before_the_prompt(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    from likesurgeon.models import SyncAttempt
+
+    _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1"]})
+    [(_, item_id, _, _)] = _canonical_findings(fake_home)
+    s = _open_db(fake_home)
+    try:
+        s.add(
+            SyncAttempt(
+                diagnosis_item_id=item_id, kind="playlist_delete", status="applied", reason=""
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+    result = _apply_canonical(input="n\n")
+
+    out = _out(result)
+    assert "an earlier run left unsettled" in out
+    assert "[Mix] PL1 position 2: A1 → B" in out
+    assert out.index("unsettled") < out.index("Proceed?")
+
+
+def test_canonicalize_playlists_apply_merge_put_back_names_no_repoint(
+    fake_home: Path, patch_playlist_apply: None
+) -> None:
+    account = _seed_playlist_canonical(fake_home, {"PL1": ["v1", "A1", "B"]})
+    account.ytm_reads_returning = {2: ["v1", "A1", "B"], 3: ["v1", "A1", "B"]}  # A still shown
+    account.insert_errors = {"A1"}  # and A can't be put back
+
+    result = _apply_canonical("--yes")
+
+    assert result.exit_code == 1, result.output
+    out = _out(result)
+    assert "may not be back" in out
+    assert "[Mix] PL1 position 2: A1" in out
+    assert "A repoint deleted A" not in out

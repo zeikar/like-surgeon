@@ -197,7 +197,7 @@ def find_candidates(
     return candidates, summary
 
 
-def _describe(video_id: str, song: dict[str, Any]) -> str:
+def describe(video_id: str, song: dict[str, Any]) -> str:
     album = (song.get("album") or {}).get("name") or "none"
     duration = song.get("duration_seconds")
     return f"{video_id} {song.get('title')!r} (album {album!r}, {duration} s)"
@@ -218,10 +218,10 @@ def _yes_no(flag: bool) -> str:
 
 def _reason(c: Candidate) -> str:
     a_vid = c.a["videoId"]
-    parts = [f"A={_describe(a_vid, c.a)}"]
+    parts = [f"A={describe(a_vid, c.a)}"]
     for m in c.matches:
         parts.append(
-            f"B={_describe(m.song['videoId'], m.song)}; "
+            f"B={describe(m.song['videoId'], m.song)}; "
             f"artist {artist_name(m.artist_id, c.a, m.song)!r} lists B; "
             f"B in Top songs: {_yes_no(m.in_top)}; B already liked: {_yes_no(m.liked)}"
         )

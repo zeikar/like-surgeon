@@ -52,6 +52,7 @@ class FakePlaylistAccount:
         self.ytm_read_errors: dict[int, BaseException] = {}  # 1-based read number -> raised
         # Reads that repeat that playlist's previous one (if any).
         self.ytm_stale_reads: set[int] = set()
+        self.ytm_unavailable: set[str] = set()  # shown, but marked isAvailable=False
         self.ytm_reads_returning: dict[int, list[str | None]] = {}  # reads that return this list
         # Recordings.
         self.write_calls: list[tuple[str, ...]] = []
@@ -157,4 +158,10 @@ class FakePlaylistAccount:
         else:
             shown = self.ytmusic(playlist_id)
         self._last_ytm_read[playlist_id] = shown
-        return {"id": playlist_id, "tracks": [{"videoId": v} for v in shown]}
+        return {
+            "id": playlist_id,
+            "tracks": [
+                {"videoId": v, **({"isAvailable": False} if v in self.ytm_unavailable else {})}
+                for v in shown
+            ],
+        }
