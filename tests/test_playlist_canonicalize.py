@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy.orm import Session
 
 from likesurgeon.diagnosis import (
@@ -153,6 +154,14 @@ def test_artist_ids_list_each_artist_once_across_playlists(session: Session) -> 
     assert artist_ids(scan) == ["AR1", "AR2"]
 
 
+def test_artist_ids_come_from_audio_tracks_only(session: Session) -> None:
+    """Only an audio track can be an A, so a video's artists aren't read."""
+    video = {**_atv("M", artist="AR9"), "videoType": OMV}
+    scan, _ = _found(session, _mix(video, extra_youtube=("M",)))
+
+    assert artist_ids(scan) == ["AR1"]
+
+
 def test_a_dead_unchecked_or_not_self_backed_a_is_counted_not_a_finding(session: Session) -> None:
     _, found = _found(
         session,
@@ -259,6 +268,15 @@ def test_b_on_one_side_only_makes_it_report_only(session: Session) -> None:
 def test_b_listed_more_than_once_makes_it_report_only(session: Session) -> None:
     cause = _cause(session, _mix(_B, _B, extra_youtube=("B", "B")))
     assert cause == "B listed 2 times on the YouTube side, shown 2 times by YT Music"
+
+
+@pytest.mark.parametrize("available", [False, None], ids=["dead", "unchecked"])
+def test_b_in_the_playlist_without_a_playable_item_makes_it_report_only(
+    session: Session, available: bool | None
+) -> None:
+    """A merge would delete the playable A and keep a B that may not play."""
+    cause = _cause(session, _mix(_B, extra_youtube=(("B", available),)))
+    assert cause == "B's item in the playlist isn't playable"
 
 
 def test_b_already_in_the_playlist_once_is_write_eligible_and_named(session: Session) -> None:
@@ -368,10 +386,17 @@ def test_include_flagged_adds_a_keyword_only_finding_and_nothing_else(session: S
         ),
         # B on one side only, no keyword
         _read("PLc", "Three", [_atv("A"), _B], _side("PLc", "A", ("D", False))),
+        # keyword and B's item in the playlist dead
+        _read(
+            "PLd",
+            "Four",
+            [_atv("A", album="Live at Hall"), _B],
+            _side("PLd", "A", ("B", False)),
+        ),
     )
     diagnosis, (actions, _) = _planned(session, *reads)
     assert actions == []
-    assert [it.confidence for it in diagnosis.items] == [0.5, 0.5, 0.5]
+    assert [it.confidence for it in diagnosis.items] == [0.5, 0.5, 0.5, 0.5]
 
     flagged, _ = plan(session, diagnosis, include_flagged=True)
 
@@ -437,3 +462,14 @@ def test_summarize_counts_kinds_and_estimates_quota(session: Session) -> None:
     # One read of 3 items; a repoint 100 + reads of 4 and 3; a merge 50 + a read of 2.
     assert "Estimated YouTube quota: 154 units" in text
     assert "automatically sorted playlist" in text and "50 units" in text
+
+
+def test_summarize_of_merges_only_has_no_insert_note(session: Session) -> None:
+    _, (actions, states) = _planned(session, _mix(_B, extra_youtube=("B",)))
+    assert [a.kind for a in actions] == ["canonical_merge"]
+
+    text = summarize(actions, states)
+
+    assert "canonical_repoint: 0" in text
+    assert "automatically sorted playlist" not in text
+    assert "sort order" not in text

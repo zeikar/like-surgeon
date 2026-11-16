@@ -43,15 +43,23 @@ def eligible_playlists(scan: LoadedScan) -> list[LoadedPlaylist]:
     return [p for p in scan.playlists if p.ytmusic.playlist_owned and p.youtube_items is not None]
 
 
-def _tracks(playlist: LoadedPlaylist) -> list[dict[str, Any]]:
+def raw_tracks(playlist: LoadedPlaylist) -> list[dict[str, Any]]:
     """The YT Music side as the raw ytmusicapi track dicts it was scanned as."""
     return [json.loads(it.raw_json or "{}") for it in playlist.ytmusic_items]
 
 
 def artist_ids(scan: LoadedScan) -> list[str]:
-    """Distinct artist ids over every eligible playlist, first-seen order: each
-    artist page is read once however many playlists credit it."""
-    return canonicalize.artist_ids([t for p in eligible_playlists(scan) for t in _tracks(p)])
+    """Distinct artist ids of the audio tracks (only those can be an A) over
+    every eligible playlist, first-seen order: each artist page is read once
+    however many playlists credit it."""
+    return canonicalize.artist_ids(
+        [
+            t
+            for p in eligible_playlists(scan)
+            for t in raw_tracks(p)
+            if t.get("videoType") == canonicalize.ATV
+        ]
+    )
 
 
 @dataclass(frozen=True)
@@ -86,7 +94,7 @@ def find(scan: LoadedScan, artists: Mapping[str, ArtistSongs | None]) -> Playlis
     pairs: list[CanonicalPair] = []
     listed = unreadable = ambiguous = not_own = 0
     for playlist in eligible_playlists(scan):
-        candidates, summary = canonicalize.find_candidates(_tracks(playlist), artists)
+        candidates, summary = canonicalize.find_candidates(raw_tracks(playlist), artists)
         listed += summary.listed
         unreadable += summary.unreadable
         ambiguous += summary.ambiguous
@@ -130,7 +138,8 @@ def structural_cause(playlist: LoadedPlaylist, a_video_id: str, b_video_id: str)
     """Why the pair is report-only from the playlist's shape, or None: A in it
     more than once on either side, or B not either absent from both sides or
     listed once and shown once (B shown only as another item's rendering, or
-    listed but hidden, stands for something a check can't follow)."""
+    listed but hidden, stands for something a check can't follow), or B's item
+    not known to play (a merge would keep it and delete the playable A)."""
     youtube = Counter(it.video_id for it in playlist.youtube_items or ())
     ytmusic = Counter(it.video_id for it in playlist.ytmusic_items)
     causes = []
@@ -144,6 +153,11 @@ def structural_cause(playlist: LoadedPlaylist, a_video_id: str, b_video_id: str)
             f"B listed {youtube[b_video_id]} times on the YouTube side, "
             f"shown {ytmusic[b_video_id]} times by YT Music"
         )
+    elif any(
+        it.video_id == b_video_id and it.is_available is not True
+        for it in playlist.youtube_items or ()
+    ):
+        causes.append("B's item in the playlist isn't playable")
     return "; ".join(causes) or None
 
 
@@ -301,9 +315,10 @@ def summarize(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistSt
         )
     if by_kind["canonical_merge"]:
         lines.append("  note: each merge removes one entry from its playlist")
-    lines += [
-        *quota_lines(estimate_quota(actions, states)),
-        "  An automatically sorted playlist refuses the first insert with a position: "
-        "one more insert (50 units) per such playlist, not in the estimate",
-    ]
+    lines += quota_lines(estimate_quota(actions, states))
+    if by_kind["canonical_repoint"]:  # a merge inserts nothing
+        lines.append(
+            "  An automatically sorted playlist refuses the first insert with a position: "
+            "one more insert (50 units) per such playlist, not in the estimate"
+        )
     return "\n".join(lines)
