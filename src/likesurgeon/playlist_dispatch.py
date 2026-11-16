@@ -21,6 +21,14 @@ then picks the flow: B on neither side is a repoint, with the checks below
 unchanged (YT Music shows B at A's index and A one further, then B where A
 was); B on both sides is a merge.
 
+B must also be available on the YT Music side (its track isn't marked
+``isAvailable=False``), or A's playable item would be replaced by one that
+doesn't play. A merge whose live baseline shows B unavailable gets no writes
+(a failed ``playlist_precheck`` row, the item stays ``open``; only that action
+is skipped, the playlist isn't stale). A repoint whose inserted B YT Music
+shows unavailable fails its ``playlist_ytm_verify`` like a B it doesn't show:
+B is removed, A stays, the item is ``skipped`` and the run stops.
+
 A merge deletes A's item only; B, the entry being kept, is never touched.
 Nothing moves in, so ``playlist_delete_verify`` (the YouTube baseline without
 A's item) and ``playlist_check`` (the YT Music baseline without A's entry)
@@ -376,6 +384,8 @@ class _PlaylistRun:
         # Playlists found sorted automatically: id -> title, in the order found.
         self.sorted: dict[str, str] = {}
         self.reordered = 0
+        # Per playlist: video ids the latest YT Music read marked unavailable.
+        self.ytm_unavailable: dict[str, set[str]] = {}
         # Playlists whose last action's checks just read them as expected.
         self.confirmed: set[str] = set()
         self.stale: list[str] = []
@@ -482,8 +492,14 @@ class _PlaylistRun:
         # YT Music shows B at j already; in a positional playlist one more B
         # there reads the same on either side of it, so ``at`` j covers both.
         shown = _Change(base.ytmusic, b, self._at(action, j))
-        ytmusic = self._check_ytmusic(action, "playlist_ytm_verify", shown.mismatch)
-        if ytmusic is None or shown.index(ytmusic) is None:
+
+        def shown_mismatch(got: _YTMusic) -> str | None:
+            return shown.mismatch(got) or (
+                self._b_unavailable(action) if action.kind != "relinked" else None
+            )
+
+        ytmusic = self._check_ytmusic(action, "playlist_ytm_verify", shown_mismatch)
+        if ytmusic is None or shown_mismatch(ytmusic) is not None:
             removed = self._remove_b(action, base, new_id)
             self._halt()
             # Terminal only when YT Music was read: the pair shows wrong, retrying repeats it.
@@ -501,6 +517,13 @@ class _PlaylistRun:
         # Rejected outright: nothing was sent, so A is in place and B can go.
         self._remove_b(action, base, new_id)
         return "failed"
+
+    def _b_unavailable(self, action: PlaylistAction) -> str | None:
+        """Why a canonical action's B can't replace A: the latest YT Music read
+        of its playlist marks B unavailable."""
+        if action.b_video_id in self.ytm_unavailable.get(action.playlist_id, ()):
+            return f"YT Music marks B {action.b_video_id!r} unavailable"
+        return None
 
     def _settle_delete(
         self, action: PlaylistAction, base: _Sides, b_item: tuple[str, str], *, sent_ok: bool
@@ -549,6 +572,9 @@ class _PlaylistRun:
         side can't confirm undoes nothing; with A's item gone but a side off,
         or YT Music unreadable, A is put back (``_restore``)."""
         pid, p, j = action.playlist_id, action.a_index, action.b_index
+        if (problem := self._b_unavailable(action)) is not None:
+            self._record(action.item_id, "playlist_precheck", "failed", problem)
+            return "failed"
         with self._interrupt_marks_delete(action):
             result, _ = self._write(
                 action.item_id,
@@ -891,6 +917,9 @@ class _PlaylistRun:
                 )
         except (UnexpectedResponseError, AuthFileMissingError) as exc:
             raise _ReadFailed(f"YT Music: {exc}") from exc
+        self.ytm_unavailable[playlist_id] = {
+            t.get("videoId") for t in tracks if t.get("isAvailable") is False
+        }
         return tuple(t.get("videoId") for t in tracks)
 
     def _read_failed(self, action: PlaylistAction, exc: _ReadFailed, when: str) -> None:

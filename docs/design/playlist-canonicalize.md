@@ -47,7 +47,7 @@ Confidence 1.0 is write-eligible. 0.5 is report-only, and the reason ends with e
 - a version keyword in A's album (`Version`, `Ver.`, `Live`, `Remix`, ...; the likes list), read from A's YT Music row. Only this cause can be lifted by `--include-flagged`.
 - A listed more than once on the YouTube side, or shown more than once by YT Music.
 - B not either absent from both sides or listed once and shown once. Examples: B shown only as the rendering of a dead item, B listed but hidden, B twice.
-- B's item in the playlist isn't playable (listed once and shown once, but its availability is dead or unknown). A merge would delete the playable A and keep a B that may not play.
+- B's item in the playlist isn't playable (listed once and shown once, but its availability is dead or unknown, or YT Music marks its track `isAvailable=False` in the scan). A merge would delete the playable A and keep a B that may not play. `--apply` re-checks this live: a merge whose YT Music baseline marks B unavailable gets no writes (a failed `playlist_precheck` row, the item stays open, the playlist isn't stale), and a repoint whose inserted B YT Music shows unavailable fails `playlist_ytm_verify` like a B it doesn't show (B removed, A kept, item skipped, run stops). A is never deleted for an unavailable B.
 
 All causes except the keyword come from the playlist's shape (`structural_cause`). The planner recomputes them from the report's scan and never parses `reason`.
 

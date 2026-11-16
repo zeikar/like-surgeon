@@ -156,6 +156,9 @@ def structural_cause(playlist: LoadedPlaylist, a_video_id: str, b_video_id: str)
     elif any(
         it.video_id == b_video_id and it.is_available is not True
         for it in playlist.youtube_items or ()
+    ) or any(
+        it.video_id == b_video_id and json.loads(it.raw_json or "{}").get("isAvailable") is False
+        for it in playlist.ytmusic_items
     ):
         causes.append("B's item in the playlist isn't playable")
     return "; ".join(causes) or None

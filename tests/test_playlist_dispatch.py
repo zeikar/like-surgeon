@@ -1339,6 +1339,46 @@ def test_a_canonical_action_whose_b_is_on_one_side_only_gets_no_writes(
     assert _status(session, action) == "open"
 
 
+def test_a_merge_whose_b_ytmusic_marks_unavailable_gets_no_writes(session: Session) -> None:
+    acct = _with_b()
+    acct.ytm_unavailable = {"B"}
+    action, states = _canonical(session, acct, "canonical_merge")
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=0, failed=1, skipped=0)
+    assert acct.write_calls == []
+    assert [(r.kind, r.status) for r in _attempts(session, action.item_id)][-1] == (
+        "playlist_precheck",
+        "failed",
+    )
+    assert _status(session, action) == "open"
+
+
+def test_a_canonical_repoint_whose_inserted_b_shows_unavailable_removes_b_and_keeps_a(
+    session: Session,
+) -> None:
+    acct = _plain_playlist()
+    acct.ytm_unavailable = {"B"}
+    action, states = _canonical(session, acct)
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=0, failed=0, skipped=1, aborted=PLAYLIST_STOP)
+    assert acct.write_calls == [("insert", "PL1", "B", "1"), ("delete", "new1")]
+    assert acct.playlists["PL1"] == list(states["PL1"].youtube)
+    assert _status(session, action) == "skipped"
+
+
+def test_an_unavailable_marker_does_not_affect_a_relinked_action(session: Session) -> None:
+    acct, actions, states = _prepared(session)
+    acct.ytm_unavailable = {v for v in acct.renders.values() if v is not None}
+
+    res = execute(session, actions, states, ytm=acct, yt=acct)
+
+    assert res == PlaylistExecResult(applied=3, failed=0, skipped=0)
+
+
 def test_a_merge_deletes_a_only(session: Session, sleeps: list[float]) -> None:
     acct = _with_b()
     action, states = _canonical(session, acct, "canonical_merge")
