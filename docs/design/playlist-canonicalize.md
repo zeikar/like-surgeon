@@ -147,3 +147,11 @@ If the `playlist_interrupted` row itself can't be committed, a stderr line names
 - **About 150 songs per Show-all list.** For a large catalog, A may sit past the cap (a finding although listed further down) or B may be missed (canonicalize.md §7).
 - **Duplicates not covered.** Two releases the artist page lists both or neither of, and the same video listed twice, stay as they are.
 - **Stale reads.** A YT Music read served from before a write would pass a check, as in playlist-repoint.
+
+## First live run (2026-11-16)
+
+- **Report:** 189 artist pages read (4 unreadable, YT Music omitted their songs list), 16 findings, 15 write-eligible. The one report-only finding had a version keyword in A's album.
+- **One action first:** a repoint in a 10-item manually sorted playlist. All seven rows were `applied`. After a re-scan the finding was gone, and the playlist still held 10 items with B in A's slot.
+- **The rest:** 14 actions in 6 playlists, 12 repoints and 2 merges. All applied, with no failure, skip or restore. 11 of the repoints were in playlists sorted by date added (newest first), so their B went to the top. The 12th was in a manually sorted playlist and kept A's position. Each merge removed exactly one entry, and the two playlists it touched shrank by one.
+- **After the run:** a re-scan and report showed 0 write-eligible findings (only the report-only one remained). Audio tracks already listed by their artist went from 456 to 469.
+- **Quota:** the plan estimated 1,375 units for the 14. The report itself used none.
