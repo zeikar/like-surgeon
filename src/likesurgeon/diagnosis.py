@@ -38,6 +38,10 @@ DIAGNOSIS_KIND_CANONICALIZE = "canonicalize"
 DIAGNOSIS_KIND_PLAYLISTS = "playlists"
 ISSUE_PLAYLIST_RELINKED = "playlist_relinked"
 PLAYLIST_ISSUE_TYPES = (ISSUE_PLAYLIST_RELINKED,)
+# A ``canonicalize-playlists`` report: ``Diagnosis.kind`` and its one issue type.
+DIAGNOSIS_KIND_PLAYLIST_CANONICALIZE = "playlist_canonicalize"
+ISSUE_PLAYLIST_CANONICAL_VERSION = "playlist_canonical_version"
+PLAYLIST_CANONICAL_ISSUE_TYPES = (ISSUE_PLAYLIST_CANONICAL_VERSION,)
 # The findings that pair an LL video A with the LM entry B rendering it.
 PAIR_ISSUE_TYPES = (ISSUE_RELINKED, ISSUE_RENDERED_AS_OTHER, ISSUE_SHADOW_DUPLICATE)
 

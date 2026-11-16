@@ -153,13 +153,16 @@ class SnapshotItem(Base):
 
 
 class Diagnosis(Base):
-    """A persisted ``compare-likes``, ``canonicalize`` or ``repoint-playlists`` run.
+    """A persisted ``compare-likes``, ``canonicalize``, ``repoint-playlists`` or
+    ``canonicalize-playlists`` run.
 
     ``kind`` is ``None`` for a ``compare-likes`` (alignment) run,
-    ``'canonicalize'`` for a ``canonicalize`` report and ``'playlists'`` for a
-    ``repoint-playlists`` report, so ``sync`` and ``doctor`` never mistake one
-    for another. A playlists report sets ``playlist_scan_id`` to the scan it
-    was built from (a plain integer, no FK, like ``snapshots.playlist_scan_id``).
+    ``'canonicalize'`` for a ``canonicalize`` report, ``'playlists'`` for a
+    ``repoint-playlists`` report and ``'playlist_canonicalize'`` for a
+    ``canonicalize-playlists`` report, so ``sync`` and ``doctor`` never mistake
+    one for another. A playlist report (either of the last two) sets
+    ``playlist_scan_id`` to the scan it was built from (a plain integer, no FK,
+    like ``snapshots.playlist_scan_id``).
     """
 
     __tablename__ = "diagnoses"
@@ -203,8 +206,14 @@ class DiagnosisItem(Base):
     A playlists report (``Diagnosis.kind == 'playlists'``) uses
     ``playlist_relinked`` (see ``diagnosis.PLAYLIST_ISSUE_TYPES``): A is a dead
     YouTube playlist item and B the video YT Music shows in its place.
-    ``source_item_id`` / ``related_item_id`` are the ``SnapshotItem`` ids of
-    A's ``youtube_playlist`` row and B's ``ytmusic_playlist`` row.
+    A playlist canonicalize report (``Diagnosis.kind ==
+    'playlist_canonicalize'``) uses ``playlist_canonical_version`` (see
+    ``diagnosis.PLAYLIST_CANONICAL_ISSUE_TYPES``): A is a playable playlist
+    item YT Music shows as itself and B the release its artist page lists.
+    For both, ``source_item_id`` is A's ``youtube_playlist`` row and
+    ``related_item_id`` the ``ytmusic_playlist`` row rendering A's item (B for
+    ``playlist_relinked``, A itself for ``playlist_canonical_version``);
+    ``related_track_id`` is B's ``Track``.
 
     Rows written before the LL → LM alignment redesign may carry legacy
     values (``possibly_missing_from_ytmusic``, ``possible_pointer_drift``,
@@ -256,7 +265,8 @@ class SyncAttempt(Base):
     ``lm_check`` / ``restore_*`` rows; or the action kind
     (``repoint`` / ``unlike_shadow`` / ``relike``) for a plan-time skip, and ``interrupted`` when an
     action stopped after A's unlike call started. See ``sync_dispatch.py`` for the
-    authoritative list. Playlist repoints (``playlist_dispatch.py``) write
+    authoritative list. Playlist actions (``playlist_dispatch.py``: repoints and,
+    for ``canonicalize-playlists``, merges) write
     ``playlist_precheck``, ``playlist_insert``, ``playlist_insert_verify``,
     ``playlist_ytm_verify``, ``playlist_delete``, ``playlist_delete_verify``,
     ``playlist_check``, ``playlist_rollback``, ``playlist_rollback_verify``,

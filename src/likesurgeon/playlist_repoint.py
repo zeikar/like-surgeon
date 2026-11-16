@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from typing import Literal
 
@@ -250,35 +250,48 @@ def plan(
         )
     actions.sort(key=lambda x: (x[0], x[1].playlist_id, x[1].a_index))
     ordered = [a for _, a in actions]
-    wanted = {a.playlist_id for a in ordered}
-    states = {
+    return ordered, playlist_states(scan, {a.playlist_id for a in ordered})
+
+
+def playlist_states(scan: LoadedScan, playlist_ids: Set[str]) -> dict[str, PlaylistState]:
+    """Each playlist in ``playlist_ids`` as ``scan`` saw it, for the
+    dispatcher to verify live reads against."""
+    return {
         p.ytmusic.playlist_id: PlaylistState(
             youtube=tuple(playlist_item_key(json.loads(i.raw_json)) for i in p.youtube_items or ()),
             ytmusic=tuple(i.video_id for i in p.ytmusic_items),
         )
         for p in scan.playlists
-        if p.ytmusic.playlist_id in wanted
+        if p.ytmusic.playlist_id in playlist_ids
     }
-    return ordered, states
 
 
 def _list_calls(items: int) -> int:
     return max(1, -(-items // _PAGE_SIZE))
 
 
-def summarize(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistState]) -> str:
-    """Human-readable plan summary with the clean-path quota estimate.
-
-    Each action is an insert and a delete plus a read after each; each playlist
-    is read once as its baseline. Re-reads, undo calls and the positional
-    insert an automatically sorted playlist refuses aren't estimated.
-    """
+def estimate_quota(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistState]) -> int:
+    """Clean-path YouTube quota of ``actions``: each playlist is read once as
+    its baseline; a ``canonical_merge`` is a delete and one read, any other
+    action an insert and a delete plus a read after each. Re-reads, undo
+    calls and the positional insert an automatically sorted playlist refuses
+    aren't estimated."""
     quota = 0
     for playlist_id in {a.playlist_id for a in actions}:
         quota += _list_calls(len(states[playlist_id].youtube))
     for a in actions:
         n = len(states[a.playlist_id].youtube)
-        quota += 2 * _WRITE_COST + _list_calls(n + 1) + _list_calls(n)
+        if a.kind == "canonical_merge":
+            quota += _WRITE_COST + _list_calls(n - 1)
+        else:
+            quota += 2 * _WRITE_COST + _list_calls(n + 1) + _list_calls(n)
+    return quota
+
+
+def summarize(actions: Sequence[PlaylistAction], states: Mapping[str, PlaylistState]) -> str:
+    """Human-readable plan summary with the clean-path quota estimate
+    (``estimate_quota``)."""
+    quota = estimate_quota(actions, states)
     lines = [
         "Playlist repoint plan:",
         f"  Actions: {len(actions)}",

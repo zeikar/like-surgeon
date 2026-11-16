@@ -34,8 +34,9 @@ in its playlist up past the removed slot.
 Every check but the exact ones (after removing B, the baseline again; a
 merge's two checks) has one form, ``_only_change``: the read holds one moving
 element — B's item on YouTube, one more or one moved B on YT Music, A's new
-item after putting A back — and with that occurrence removed it is exactly the expected list,
-order included, so nothing else may move, appear or go. A playlist is
+item after putting A back — and with that occurrence removed it is exactly
+the expected list, order included, so nothing else may move, appear or go.
+A playlist is
 ``positional`` (the default), where that element must also sit at the index
 the step puts it (B at A's index; on YT Music next to or at B's index), or
 ``sorted``, where it may sit anywhere: YouTube puts it where the playlist's
@@ -85,9 +86,10 @@ playlist refused the position), ``playlist_insert_verify``,
 ``playlist_check``; ``playlist_rollback``, ``playlist_rollback_verify``
 (removing B); ``playlist_restore`` (two rows when a sorted playlist refused
 the position), ``playlist_restore_verify`` (putting A back);
-``playlist_interrupted``. A merge writes ``playlist_precheck``,
-``playlist_delete``, ``playlist_delete_verify``, ``playlist_check`` and, to
-put A back, the two restore kinds.
+``playlist_interrupted``. A merge writes ``playlist_delete``,
+``playlist_delete_verify``, ``playlist_check`` and, to put A back, the two
+restore kinds, after a ``playlist_precheck`` when its baseline was read (not
+when the playlist's previous action just confirmed it).
 
 Invariants:
   * ``DiagnosisItem.reason`` is never modified; sync-side detail lives on
@@ -744,8 +746,8 @@ class _PlaylistRun:
                 print(
                     f"likesurgeon: stopped, unrecorded, after sending the delete of YouTube "
                     f"video {action.a_video_id} from playlist {action.playlist_title!r} "
-                    f"(its target {action.b_video_id} stays as it is) — the delete may still "
-                    f"land, so change nothing yet: re-scan playlists, and add "
+                    f"— the delete may still land, so change nothing yet and leave "
+                    f"{action.b_video_id} as it is: re-scan playlists, and add "
                     f"{action.a_video_id} back by hand only if it is missing",
                     file=sys.stderr,
                 )

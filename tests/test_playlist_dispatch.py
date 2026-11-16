@@ -1467,16 +1467,24 @@ def test_a_merge_delete_youtube_cannot_confirm_undoes_nothing(session: Session, 
 
 
 @pytest.mark.parametrize(
-    "knob",
+    ("knob", "aborted"),
     [
-        lambda acct: acct.ytm_reads_returning.update(
-            {2: ["v0", "A", "v2", "B"], 3: ["v0", "A", "v2", "B"]}
+        (
+            lambda acct: acct.ytm_reads_returning.update(
+                {2: ["v0", "A", "v2", "B"], 3: ["v0", "A", "v2", "B"]}
+            ),
+            PLAYLIST_STOP,
         ),
-        lambda acct: acct.ytm_read_errors.update({2: UnexpectedResponseError("shape changed")}),
+        (
+            lambda acct: acct.ytm_read_errors.update({2: UnexpectedResponseError("shape changed")}),
+            "could not read playlist 'T PL1' to check an action: YT Music: shape changed",
+        ),
     ],
     ids=["differs", "unreadable"],
 )
-def test_ytmusic_off_after_a_merge_puts_a_back_and_keeps_b(session: Session, knob) -> None:
+def test_ytmusic_off_after_a_merge_puts_a_back_and_keeps_b(
+    session: Session, knob, aborted: str
+) -> None:
     acct = _with_b()
     action, states = _canonical(session, acct, "canonical_merge")
     knob(acct)
@@ -1484,7 +1492,7 @@ def test_ytmusic_off_after_a_merge_puts_a_back_and_keeps_b(session: Session, kno
     res = execute(session, [action], states, ytm=acct, yt=acct)
 
     assert (res.applied, res.failed, res.skipped, res.restored) == (0, 0, 1, 1)
-    assert res.aborted is not None
+    assert res.aborted == aborted
     assert acct.write_calls == [("delete", "i1"), ("insert", "PL1", "A", "1")]
     assert acct.playlists["PL1"] == [("i0", "v0"), ("new1", "A"), ("i2", "v2"), ("i3", "B")]
     assert _steps(session, action.item_id)[-4:] == [
@@ -1495,14 +1503,40 @@ def test_ytmusic_off_after_a_merge_puts_a_back_and_keeps_b(session: Session, kno
     assert _status(session, action) == "skipped"
 
 
-def test_ytmusic_differing_after_a_merge_stops_with_playlist_stop(session: Session) -> None:
-    acct = _with_b()
-    action, states = _canonical(session, acct, "canonical_merge")
-    acct.ytm_reads_returning = {2: ["v0", "A", "v2", "B"], 3: ["v0", "A", "v2", "B"]}
+def _duplicate_a() -> FakePlaylistAccount:
+    """A listed twice; the merge acts on the second copy (item i2) only."""
+    return FakePlaylistAccount(
+        {"PL1": [("i0", "A"), ("i1", "v1"), ("i2", "A"), ("i3", "B")]},
+    )
+
+
+def test_a_merge_of_a_duplicate_a_deletes_only_its_own_item(session: Session) -> None:
+    acct = _duplicate_a()
+    action = _canonical_action(session, _diagnosis(session), acct, "PL1", 2, "B", "canonical_merge")
+    states = _states(acct)
+    session.commit()
 
     res = execute(session, [action], states, ytm=acct, yt=acct)
 
-    assert res.aborted == PLAYLIST_STOP
+    assert res == PlaylistExecResult(applied=1, failed=0, skipped=0)
+    assert acct.write_calls == [("delete", "i2")]
+    assert acct.playlists["PL1"] == [("i0", "A"), ("i1", "v1"), ("i3", "B")]
+
+
+def test_a_merge_of_a_duplicate_a_puts_back_only_its_own_copy(session: Session) -> None:
+    acct = _duplicate_a()
+    action = _canonical_action(session, _diagnosis(session), acct, "PL1", 2, "B", "canonical_merge")
+    states = _states(acct)
+    session.commit()
+    acct.ytm_reads_returning = {2: ["A", "v1", "A", "B"], 3: ["A", "v1", "A", "B"]}
+
+    res = execute(session, [action], states, ytm=acct, yt=acct)
+
+    assert (res.skipped, res.restored, res.left_removed) == (1, 1, ())
+    assert acct.write_calls == [("delete", "i2"), ("insert", "PL1", "A", "2")]
+    # The other copy keeps its item id; only the new item counts as A's put-back.
+    assert acct.playlists["PL1"] == [("i0", "A"), ("i1", "v1"), ("new1", "A"), ("i3", "B")]
+    assert _steps(session, action.item_id)[-2:] == _RESTORE
 
 
 def test_a_youtube_side_otherwise_off_after_a_merge_puts_a_back(session: Session) -> None:
@@ -1657,3 +1691,45 @@ def test_an_unrecorded_interrupt_names_a_and_b_and_never_advises_removing_b(
     assert "'T PL1'" in err and "vidA" in err and "vidB" in err
     assert "remove" not in err.lower()
     assert "re-scan" in err
+
+
+@pytest.mark.parametrize(
+    ("rule", "after"),
+    [
+        # Newest first: X1 lands at the top, so A3 only moves up for the two removals.
+        ("top", ["X3", "X1", "v1", "B2"]),
+        # Oldest first: X1 lands at the end, past A2 and A3.
+        ("end", ["v1", "B2", "X1", "X3"]),
+    ],
+)
+def test_a_merge_in_a_sorted_playlist_between_repoints(
+    session: Session, rule: str, after: list[str]
+) -> None:
+    acct = FakePlaylistAccount(
+        {"PL1": [("i0", "A1"), ("i1", "v1"), ("i2", "A2"), ("i3", "B2"), ("i4", "A3")]}
+    )
+    acct.auto_sorted = {"PL1": rule}
+    diag = _diagnosis(session)
+    first = _canonical_action(session, diag, acct, "PL1", 0, "X1")
+    merge = _canonical_action(session, diag, acct, "PL1", 2, "B2", "canonical_merge")
+    last = _canonical_action(session, diag, acct, "PL1", 4, "X3")
+    states = _states(acct)
+    session.commit()
+
+    res = execute(session, [first, merge, last], states, ytm=acct, yt=acct)
+
+    # The merge isn't counted as reordered: nothing of it lands anywhere.
+    assert res == PlaylistExecResult(
+        applied=3, failed=0, skipped=0, reordered=2, sorted_playlists=_SORTED
+    )
+    assert acct.write_calls == [
+        ("insert", "PL1", "X1", "0"),
+        ("insert", "PL1", "X1"),
+        ("delete", "i0"),
+        ("delete", "i2"),
+        ("insert", "PL1", "X3"),
+        ("delete", "i4"),
+    ]
+    assert [v for _, v in acct.playlists["PL1"]] == after
+    assert _steps(session, merge.item_id) == _MERGED[1:]
+    assert _steps(session, last.item_id) == _WRITES_AND_CHECKS

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from likesurgeon.models import (
@@ -559,11 +560,16 @@ def _pl_snapshot(
     return snap
 
 
-def _pl_item(session: Session, *, playlist_id: str = "PL1", position: int = 2) -> DiagnosisItem:
-    """A playlist finding: A on the YouTube side at ``position`` (0-based), B on YT Music."""
+def _pl_item(
+    session: Session, *, playlist_id: str = "PL1", position: int = 2, canonical: bool = False
+) -> DiagnosisItem:
+    """A playlist finding: A on the YouTube side at ``position`` (0-based) and
+    the YT Music entry rendering it: B for ``playlist_relinked``, A itself for
+    a ``canonical`` one. B's video id is on the related ``Track`` either way."""
     track = _ytm_track(session, f"a-{playlist_id}-{position}", source="youtube_playlist")
     rows = []
-    for source, vid in (("youtube_playlist", "A"), ("ytmusic_playlist", "B")):
+    shown = "A" if canonical else "B"
+    for source, vid in (("youtube_playlist", "A"), ("ytmusic_playlist", shown)):
         snap = _pl_snapshot(session, source, playlist_id, T0 - timedelta(days=1))
         row = SnapshotItem(
             snapshot_id=snap.id,
@@ -577,14 +583,16 @@ def _pl_item(session: Session, *, playlist_id: str = "PL1", position: int = 2) -
         session.add(row)
         rows.append(row)
     session.flush()
-    diag = Diagnosis(kind="playlists")
+    diag = Diagnosis(kind="playlist_canonicalize" if canonical else "playlists")
     session.add(diag)
     session.flush()
+    b = session.scalar(select(Track).where(Track.dedupe_key == "B")) or _ytm_track(session, "B")
     item = DiagnosisItem(
         diagnosis_id=diag.id,
-        issue_type="playlist_relinked",
+        issue_type="playlist_canonical_version" if canonical else "playlist_relinked",
         confidence=1.0,
         reason="r",
+        related_track_id=b.id,
         source_item_id=rows[0].id,
         related_item_id=rows[1].id,
     )
@@ -676,6 +684,46 @@ def test_unsettled_playlist_action_is_listed(session: Session, rows: list) -> No
 def test_settled_playlist_action_is_not_listed(session: Session, rows: list) -> None:
     item = _pl_item(session)
     _rows(session, item, *rows)
+    assert unsettled_playlist_actions(session) == []
+
+
+def test_a_canonical_findings_unsettled_entry_names_b(session: Session) -> None:
+    item = _pl_item(session, canonical=True)
+    _rows(session, item, *CLEAN[:5])
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+
+
+_MERGE = [
+    ("playlist_precheck", "applied"),
+    ("playlist_delete", "applied"),
+    ("playlist_delete_verify", "applied"),
+    ("playlist_check", "applied"),
+]
+
+
+def test_an_applied_check_after_a_lone_delete_settles_a_merge(session: Session) -> None:
+    item = _pl_item(session, canonical=True)
+    _rows(session, item, *_MERGE)
+    assert unsettled_playlist_actions(session) == []
+
+
+def test_a_merge_put_back_stays_listed_until_both_sides_are_rescanned(session: Session) -> None:
+    """No row settles it: an applied ``playlist_restore_verify`` would also
+    settle a repoint whose B removal was refused."""
+    item = _pl_item(session, canonical=True)
+    _rows(
+        session,
+        item,
+        *_MERGE[:3],
+        ("playlist_check", "failed"),
+        ("playlist_restore", "applied"),
+        ("playlist_restore_verify", "applied"),
+    )  # last write at T0 + 4 min
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+    after = T0 + timedelta(hours=1)
+    _pl_snapshot(session, "ytmusic_playlist", "PL1", after)
+    assert unsettled_playlist_actions(session) == [("Mix", 3, "A", "B")]
+    _pl_snapshot(session, "youtube_playlist", "PL1", after)
     assert unsettled_playlist_actions(session) == []
 
 
