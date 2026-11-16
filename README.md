@@ -46,6 +46,7 @@ likesurgeon scan youtube-likes --region US        # your country code, so region
 likesurgeon compare-likes                         # what's wrong, and what can be fixed
 likesurgeon sync --dry-run                        # the plan, without writing anything
 likesurgeon canonicalize                          # likes on another release than the artist page lists (review, then --apply)
+likesurgeon canonicalize-playlists                # the same for your playlists, after `scan playlists` (review, then --apply)
 ```
 
 <p align="center">
@@ -72,10 +73,10 @@ Just want a backup? `auth ytmusic`, `scan ytmusic` and `export` are enough — n
 
 ## Safety
 
-- **Read-only until you say so.** Only `sync`, `canonicalize --apply` and `repoint-playlists --apply` write, each after showing its plan and a y/N prompt; `sync --dry-run` writes nothing, `--limit N` ramps up, `skip <id>` keeps a finding out for good.
+- **Read-only until you say so.** Only `sync`, `canonicalize --apply`, `repoint-playlists --apply` and `canonicalize-playlists --apply` write, each after showing its plan and a y/N prompt; `sync --dry-run` writes nothing, `--limit N` ramps up, `skip <id>` keeps a finding out for good.
 - **Only proven pairs.** `sync` acts on a pair only when its gap in the alignment is one-to-one and A's availability is known; repoints also need the same recording (duration within ±3 s and same channel or overlapping titles). The one exception is opt-in: `--relike-unrendered` re-likes a single video that looks like music but isn't shown in YT Music, then checks that Liked songs gained at most that one entry. `canonicalize` pairs differently — exactly one same-title audio track within ±1 s in the artist's own song list — and its Liked songs check can't tell two recordings with the same title and length apart, so review its report and `skip` anything doubtful before `--apply`.
-- **Every unlike is checked.** After each change `sync` and `canonicalize --apply` confirm the rating and re-read your whole Liked songs list. If anything else moved, A is re-liked and the run stops. `repoint-playlists --apply` adds the new video to the playlist first, checks both sides, and only then deletes the dead item.
-- **Writes only on YouTube.** `repoint-playlists --apply` edits playlists there too. YT Music's own like button is never pressed: it shares the same rating, and pressing it duplicates or reverts entries.
+- **Every unlike is checked.** After each change `sync` and `canonicalize --apply` confirm the rating and re-read your whole Liked songs list. If anything else moved, A is re-liked and the run stops. `repoint-playlists --apply` and `canonicalize-playlists --apply` add the new video to the playlist first, check both sides, and only then delete the old item; a `canonicalize-playlists` merge only deletes, then checks that both sides lost exactly that entry and puts it back if not.
+- **Writes only on YouTube.** `repoint-playlists --apply` and `canonicalize-playlists --apply` edit playlists there too. YT Music's own like button is never pressed: it shares the same rating, and pressing it duplicates or reverts entries.
 - **Local credentials.** Cookies and OAuth tokens stay in `~/.like-surgeon/`; the files the tool writes are owner-only (`0600`) on macOS and Linux.
 
 ## Usage
@@ -244,7 +245,7 @@ likesurgeon doctor
 
 `snapshots` lists likes snapshots only, with a line counting the playlist snapshots it leaves out (see `likesurgeon playlists` below). `doctor` summarizes both sources: counts, the latest diagnosis, and how many YT Music songs are traced to the like behind them.
 
-### 8. Playlists (backup and dead items)
+### 8. Playlists (backup, dead items, releases)
 
 ```bash
 likesurgeon scan playlists
@@ -271,6 +272,32 @@ A region-blocked video in one of your playlists is often shown by YT Music as an
 
 `--apply` plans from that report, smallest playlists first, and asks before writing. For each finding it reads both sides of the playlist and compares them with the scan (a playlist that changed since gets no writes), adds B, checks both sides, deletes A's item, and checks both sides again. In a manually sorted playlist B goes to A's position and YT Music must show the playlist exactly as before. A playlist sorted automatically (by date added, popularity, ...) refuses a position, so there B is added without one and goes where the sort order puts it; the checks then accept B at that spot but still require every other item unchanged, and the run lists those playlists. If a check fails, B is removed again (or A is put back first when its delete had already gone through), the finding is marked `skipped` where YT Music's view was the problem, and the run stops. A delete that can't be confirmed stops the run with B left in place, and the run lists anything you may need to fix by hand. `--limit N` caps the findings per run, `--yes` skips the prompt. A newer playlist scan than the report makes `--apply` exit 1: re-run `scan playlists` and `repoint-playlists`. Details: [docs/design/playlist-repoint.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/playlist-repoint.md).
 
+#### Move playlist songs to the artist page's release
+
+```bash
+likesurgeon canonicalize-playlists                       # report: latest playlist scan + each artist page, read once
+likesurgeon issues --type playlist_canonical_version     # review the findings
+likesurgeon skip <id>                                    # keep any doubtful one out
+likesurgeon canonicalize-playlists --apply --limit 1     # smallest playlist first, with confirmation
+likesurgeon canonicalize-playlists --apply --include-flagged   # also findings flagged only for a version word
+```
+
+What [Canonicalize](https://github.com/zeikar/like-surgeon#6-canonicalize-tidy-up-releases-and-duplicates) does for likes, `canonicalize-playlists` does for your own playlists. Each one is checked on its own, against the latest `scan playlists` and the artist pages of its audio tracks (each artist read once, which takes a few minutes for a couple of hundred artists; no YouTube quota). A finding (`playlist_canonical_version`) is a playable audio track **A** that YT Music shows as itself, that none of its artists' song lists has, while exactly one same-title, same-length (±1 s) audio track **B** in them does. A finding is report-only when:
+
+- A's album has a version word (`--include-flagged` acts on these),
+- A is in the playlist more than once,
+- B is in it other than exactly once on both sides,
+- or B's item in the playlist isn't known to play.
+
+The first real report read 189 artist pages and saved 16 findings, 15 of them write-eligible.
+
+`--apply` decides per finding, from the playlist as it reads it live:
+
+- **Repoint** (B not in the playlist): add B at A's position, check both sides, delete A's item, check again, as `repoint-playlists` does. In an automatically sorted playlist B goes where the sort order puts it.
+- **Merge** (B already in the playlist): delete A's item only and check that both sides lost exactly that entry. B, the entry being kept, is never touched. If a check fails after the delete, A is put back and the run stops.
+
+A delete that can't be confirmed stops the run with nothing undone. The run lists anything you may need to fix by hand. The same stale-scan refusal, per-playlist live check, `--limit` and `--yes` apply as for `repoint-playlists`. Details: [docs/design/playlist-canonicalize.md](https://github.com/zeikar/like-surgeon/blob/main/docs/design/playlist-canonicalize.md).
+
 ## Caveats
 
 - **`ytmusicapi` is community-maintained.** YouTube Music has no official public API — if a scan fails, check the [`ytmusicapi` issue tracker](https://github.com/sigma67/ytmusicapi/issues).
@@ -279,6 +306,7 @@ A region-blocked video in one of your playlists is often shown by YT Music as an
 - **Google sign-in may expire weekly.** While your OAuth consent screen is in *Testing* (the setup `auth youtube` prints), Google expires its refresh tokens after 7 days; if YouTube calls start failing with an auth error, run `likesurgeon auth youtube` again.
 - **`scan playlists` quota.** 1 unit per 50 items of each own playlist (saved ones cost nothing; at least 1 per playlist tried, including the ones the Data API can't read), plus 1 unit per 50 distinct videos checked for availability. Twenty playlists of about 100 items each cost roughly 80 units.
 - **`repoint-playlists --apply` quota.** About 100 units per item (an insert and a delete, 50 each) plus the playlist reads (1 unit per 50 items, a few per item); the plan prints the estimate. Undoing a failed item costs about 50 more per call and isn't estimated, nor is the one refused insert (50) per automatically sorted playlist. YT Music reads are free.
+- **`canonicalize-playlists --apply` quota.** A repoint costs as above (about 100 units plus reads); a merge is one delete (50) plus one read. The report itself uses no YouTube quota: it reads the stored scan and YT Music artist pages.
 - **YouTube Data API quota.** A scan of 5000 likes costs about 200 quota units (≈100 `playlistItems.list` + ≈100 `videos.list` calls for availability and region checks); the default daily quota is 10,000. Re-scanning a few times a day is fine.
 - **Music classification is heuristic.** `unrendered_music` relies on title and channel heuristics, so edge cases will misclassify (e.g. covers labelled "tutorial"). It recognises covers, 歌ってみた (sung covers), soundtracks, remasters, remixes and similar; classification is stored at scan time, so re-scan `youtube-likes` after an upgrade. Findings are a starting point for review — `sync` acts only on write-eligible ones.
 

@@ -2,6 +2,8 @@
 
 Status: **implemented** (2026-11-15; proposed the same day). A separate command next to `compare-likes` / `sync`; it reuses their YouTube write machinery (confirm, LM-wide check, restore) and their safety invariants unchanged. Builds on the LL → LM model in [ll-lm-alignment.md](ll-lm-alignment.md).
 
+The same discovery runs per playlist in `canonicalize-playlists`, which moves playlist items rather than likes: [playlist-canonicalize.md](playlist-canonicalize.md).
+
 ## TL;DR
 
 - A song is often published as several identical audio tracks (ATV): on a single, an album, a compilation. The user liked one; YT Music's artist page lists another. `canonicalize` finds liked ATVs (**A**) missing from their artist's "Show all" songs list or its Top songs while **exactly one** ATV in that list (**B**) has the same title and the same length (±1 s).
