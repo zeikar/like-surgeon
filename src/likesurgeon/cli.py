@@ -1230,7 +1230,7 @@ def _canonicalize_apply(*, limit: int | None, yes: bool, include_flagged: bool) 
         # The forecast (repoint or merge) and the order come from the Liked
         # songs read the report was built on.
         lm = get_snapshot_items(session, diag.ytmusic_snapshot_id)
-        flagged = canonicalize.flagged_keywords(lm) if include_flagged else {}
+        flagged = canonicalize.flagged_keywords(session, items, lm) if include_flagged else {}
         actions = canonicalize.plan(
             items,
             resolve_video_ids(session, items),

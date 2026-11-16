@@ -335,6 +335,61 @@ def test_both_causes_are_reported():
     )
 
 
+# --- performers ---------------------------------------------------------------
+
+
+def _duet(video_id: str, *artists: tuple[str, str], album: str = "Night Market") -> dict[str, Any]:
+    """``song`` credited to ``artists`` as (id, name) pairs."""
+    return {
+        **song(video_id, album=album),
+        "artists": [{"name": name, "id": i} for i, name in artists],
+    }
+
+
+_TENOR, _SOPRANO, _ALTO = ("ch_tenor", "Tenor"), ("ch_soprano", "Soprano"), ("ch_alto", "Alto")
+
+
+def test_lone_b_by_other_performers_is_report_only():
+    a = _duet("vid_a", _TENOR, _SOPRANO, album="Paper Lantern - Single")
+    b = _duet("vid_b", _ALTO, _TENOR)
+    candidates, summary = find_candidates([a], {"ch_tenor": page(b), "ch_soprano": page()})
+
+    (c,) = candidates
+    assert c.ambiguous is False
+    assert c.report_only_cause == (
+        "different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
+    )
+    assert summary.candidates == 1
+
+
+def test_same_artist_ids_under_other_names_stay_write_eligible():
+    a = _duet("vid_a", ("ch_k", "Kaze"), _TENOR, album="Paper Lantern - Single")
+    b = _duet("vid_b", _TENOR, ("ch_k", "風"))
+    (c,) = find_candidates([a], {"ch_k": page(b), "ch_tenor": page()})[0]
+    assert c.report_only_cause is None
+
+
+def test_b_without_artist_ids_is_report_only():
+    a = song("vid_a")
+    b = {**_b(), "artists": [{"name": "Name ch_art", "id": None}]}
+    (c,) = find_candidates([a], {"ch_art": page(b)})[0]
+    assert c.report_only_cause == ("different performers: A by 'Name ch_art', B by 'Name ch_art'")
+
+
+def test_several_bs_stay_ambiguous_even_if_only_one_has_as_performers():
+    a = _duet("vid_a", _TENOR, _SOPRANO)
+    same = _duet("vid_b1", _TENOR, _SOPRANO)
+    other = _duet("vid_b2", _ALTO, _TENOR)
+    candidates, summary = find_candidates(
+        [a], {"ch_tenor": page(same, other), "ch_soprano": page()}
+    )
+
+    (c,) = candidates
+    assert c.ambiguous is True
+    assert c.report_only_cause is None
+    assert (summary.candidates, summary.ambiguous) == (0, 1)
+
+
 def test_unplayable_list_row_without_video_id_is_not_a_match():
     a = song("vid_a")
     unplayable = {**_b(), "videoId": None}
@@ -416,6 +471,20 @@ def test_persist_report_report_only_cause_halves_confidence(session: Session):
     (item,) = diagnosis_items(session, diagnosis.id)
     assert item.confidence == 0.5
     assert "version keyword 'Live'" in item.reason
+
+
+def test_persist_report_different_performers_is_report_only(session: Session):
+    a = _duet("vid_a", _TENOR, _SOPRANO, album="Paper Lantern - Single")
+    pages = {"ch_tenor": page(_duet("vid_b", _ALTO, _TENOR)), "ch_soprano": page()}
+    snap, candidates = _report(session, [a], pages)
+
+    diagnosis, _ = persist_report(session, snap.id, candidates)
+
+    (item,) = diagnosis_items(session, diagnosis.id)
+    assert (item.issue_type, item.confidence) == (ISSUE_CANONICAL_VERSION, 0.5)
+    assert item.reason.endswith(
+        "report-only: different performers: A by 'Tenor · Soprano', B by 'Alto · Tenor'"
+    )
 
 
 def test_persist_report_b_already_liked_is_in_reason(session: Session):
@@ -543,9 +612,28 @@ def _plan_report(session: Session, liked, pages, *, include_flagged: bool):
         _vids(items, session),
         lm_position={it.track_id: it.position for it in lm},
         liked_video_ids={it.video_id for it in lm if it.video_id},
-        flagged=flagged_keywords(lm) if include_flagged else None,
+        flagged=flagged_keywords(session, items, lm) if include_flagged else None,
     )
     return actions, [(it.issue_type, it.confidence) for it in items]
+
+
+def test_plan_never_takes_different_performers_even_with_a_keyword(session: Session):
+    pages = {
+        "ch_tenor": page(
+            _duet("vid_b", _ALTO, _TENOR),
+            _duet("vid_d", _ALTO, _TENOR, album="Harbor Lights") | {"title": "Tin Moon"},
+        ),
+        "ch_soprano": page(),
+    }
+    liked = [
+        _duet("vid_a", _TENOR, _SOPRANO, album="Paper Lantern - Single"),
+        _duet("vid_c", _TENOR, _SOPRANO, album="Live at the Pier") | {"title": "Tin Moon"},
+    ]
+
+    assert _plan_report(session, liked, pages, include_flagged=True) == (
+        [],
+        [(ISSUE_CANONICAL_VERSION, 0.5)] * 2,
+    )
 
 
 def test_plan_keyword_only_finding_needs_include_flagged(session: Session):
@@ -562,6 +650,14 @@ def test_plan_keyword_only_finding_needs_include_flagged(session: Session):
         "vid_a",
         "vid_b",
     )
+
+
+def test_plan_keyword_finding_by_one_artist_under_two_names_is_flagged(session: Session):
+    a = _duet("vid_a", ("ch_k", "Kaze"), album="Live at the Pier")
+    pages = {"ch_k": page(_duet("vid_b", ("ch_k", "風")))}
+
+    (action,), _ = _plan_report(session, [a], pages, include_flagged=True)
+    assert (action.a_video_id, action.b_video_id) == ("vid_a", "vid_b")
 
 
 def test_plan_flagged_excludes_an_a_shown_twice(session: Session):
