@@ -14,6 +14,7 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -179,7 +180,10 @@ def persist_report(
 
 @dataclass(frozen=True)
 class PlaylistAction:
-    """Replace dead A with the video B that YT Music shows in its place."""
+    """Replace A with B: a dead A with the video YT Music shows in its place
+    (``relinked``), or a playable A with the release its artist page lists
+    (``canonical_*``, the planner's forecast; the dispatcher picks repoint or
+    merge from the live baseline)."""
 
     item_id: int  # DiagnosisItem id
     playlist_id: str
@@ -188,7 +192,10 @@ class PlaylistAction:
     a_playlist_item_id: str
     a_video_id: str
     b_video_id: str
-    b_index: int  # B's position on the YT Music side
+    # YT Music index of the entry rendering A's item: B for a dead A, A itself
+    # for a canonical action.
+    b_index: int
+    kind: Literal["relinked", "canonical_repoint", "canonical_merge"] = "relinked"
 
 
 @dataclass(frozen=True)
